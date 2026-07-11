@@ -1,0 +1,205 @@
+# FLAC-Chop — prompt log & project notes
+
+Date: 2026-07-11
+
+## Goal (user request)
+Cross-platform cutting tool for RF captures, using Rust + FLAC + SoX, with a
+clean Qt6 GUI base. Based off the old C/Raylib work in
+`/home/harry/Desktop/Lose-files/flac_chop_gui`. Lives in `/home/harry/FLAC-Chop`.
+
+Rationale for Rust (user pointer): vhs-decode PR #260
+(https://github.com/oyvindln/vhs-decode/pull/260, "Rust input file reader
+(u8, s16 and flac supported)") — vhs-decode is porting its FLAC/raw reader to
+Rust (libflac-sys). This tool keeps a Rust core for the same reason: native
+FLAC metadata reading instead of shelling out to soxi/ffprobe.
+
+## Reference extracted (per "extract from reference, then test on real data")
+- Old C tool (`flac_chop_gui.c`): HH:MM:SS IN/Duration/OUT, MSPS-from-filename,
+  decimation, RF /1000 header convention, `-cut` output naming, SoX/ffmpeg.
+- `tape-decode-rust` FLAC reader: uses symphonia 0.6 (`symphonia-bundle-flac`).
+- `ld-analyse` (ld-decode): QtWidgets + CMake, `Qt::Core/Gui/Widgets`,
+  AUTOMOC/AUTOUIC, Qt5/6 dual find_package. Mirrored for the GUI.
+- claxon API (docs.rs verified): `FlacReader::new_ext(file, FlacReaderOptions{
+  metadata_only:true, read_vorbis_comment:false })` reads only STREAMINFO;
+  `StreamInfo{ sample_rate:u32, channels:u32, bits_per_sample:u32,
+  samples:Option<u64> }`. Pure Rust, cross-platform, no C deps.
+
+## Toolchain (verified)
+- rustc/cargo 1.87.0
+- SoX v14.4.2 (`/usr/bin/sox`)
+- Qt 6.2.4 (qt6-base-dev, qt6-widgets; qmake6)
+- cmake 3.22.1, ninja
+- cxx-qt would need cmake>=3.24 + mold/lld/gold → rejected; used the
+  Rust-staticlib + Qt6-C++-Widgets + CMake approach instead (works on current
+  toolchain, mirrors ld-analyse).
+
+## Architecture
+```
+FLAC-Chop/
+├── CMakeLists.txt                 # Qt6 Widgets+Concurrent, AUTOMOC, adds gui/
+├── core/                          # Rust staticlib "flac_chop_core" (C ABI)
+│   ├── Cargo.toml                 # claxon = "0.4", staticlib+rlib, LTO
+│   ├── examples/probe_cli.rs      # headless STREAMINFO probe (validation)
+│   ├── examples/chop_cli.rs       # headless probe->plan->sox cutter
+│   ├── tests/ffi_plan.rs          # fc_plan FFI integration tests
+│   └── src/{lib,probe,msps,chop,ffi}.rs
+└── gui/                           # Qt6 C++ QtWidgets
+    ├── CMakeLists.txt             # cargo custom command + Qt6 link + pthread/dl/m
+    ├── flacchop.h                 # C ABI header mirroring core/src/ffi.rs
+    ├── main.cpp
+    └── mainwindow.{h,cpp}         # code-built UI, QtConcurrent SoX worker
+```
+
+Data flow: `fc_probe` (claxon STREAMINFO) → `fc_plan` (RF sample math) →
+`fc_chop` (SoX `trim <start>s <len>s`). The `s` suffix = sample counts.
+
+## RF /1000 convention
+RF captures store the real 20 MSPS as 20 kHz in the FLAC header. If the filename
+contains `Nmsps`, the plan uses `real_rate = N*1e6` Hz; otherwise it falls back
+to the header rate. Cut samples = `round(seconds * real_rate)`.
+
+## Commands run (this session)
+```bash
+# Rust core
+cd /home/harry/FLAC-Chop/core
+cargo build --release                       # -> target/release/libflac_chop_core.a (20M)
+cargo test --release                        # 9 unit + 5 ffi integration, all pass
+cargo run --release --example probe_cli -- <Tape_15.flac>
+cargo run --release --example chop_cli -- <Tape_15.flac> /tmp/fc_verify_1s.flac 0 1
+
+# GUI
+cd /home/harry/FLAC-Chop
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build                         # -> build/gui/flac-chop (4.5M)
+nohup ./build/gui/flac-chop >/tmp/flacchop.log 2>&1 &   # launched for user test
+```
+
+## Verification (hard data)
+Source: `/media/harry/20TB HDD1/Lukas_etothepiisreal_Europe_2025/Tape_15/VHS_PAL_SP_Tape_15_2026.04.20_19.52.17_video_rf_8-bit_20msps.flac`
+
+`soxi` (reference): Sample Rate 20000, Precision 8-bit, Channels 1,
+49,528,274,364 samples.
+
+Rust `probe_cli` output (matches soxi exactly):
+- header_sample_rate: 20000
+- bits_per_sample: 8
+- channels: 1
+- total_samples: 49,528,274,364 (known=true)
+- msps_from_name: Some(20.0)
+- real_total_seconds: 2476.414 (at real_rate 20,000,000 Hz)
+
+`fc_plan` FFI test: 10 s @ 20 MSPS = exactly 200,000,000 samples (clamps to
+total when request exceeds file; rejects zero rate / non-positive length).
+
+`chop_cli` 1 s cut of Tape_15 → `/tmp/fc_verify_1s.flac`, verified by soxi:
+- Channels 1, Sample Rate 20000 (header preserved), Precision 8-bit,
+  20,000,000 samples. ✓ (engine verified end-to-end on real data)
+
+GUI: builds and links Qt6 (`libQt6Widgets/Core/Gui.so.6`); launches without
+crash (pid confirmed running). **GUI button behavior pending user real-world
+confirmation** (Browse → probe values shown; Process → cut produced) per the
+"don't assume GUI works, ask" rule.
+
+## Build / run
+```bash
+cd /home/harry/FLAC-Chop
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+./build/gui/flac-chop
+```
+Requires: Qt6 dev (Widgets), Rust/cargo, SoX on PATH.
+
+## Headless use
+```bash
+# probe only
+cargo run --release --manifest-path core/Cargo.toml --example probe_cli -- file.flac
+# cut
+cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.flac out.flac <start_sec> <len_sec>
+```
+
+## Status / not done
+- GUI built in code (no Designer .ui) for compile reliability; can be ported to
+  .ui later if desired.
+- Windows/macOS: staticlib extension differs (.lib/.a) — CMake core-lib path is
+  Linux-specific for now.
+- No progress % from sox (busy indicator only); sox doesn't emit sample progress
+  to a captured pipe easily.
+- Decimation factor from the old tool not carried over (SoX cut is at the input
+  rate; decimation is a decode-side concern, not a cut concern).
+
+---
+
+## 2026-07-11 (session 2) — fix: 36-bit total_samples wrap (real HH:MM:SS)
+
+### Problem (user-reported)
+A loaded file did not show its real HH:MM:SS duration. Tape_15 (a ~1h38 VHS
+PAL SP capture) showed ~41:16 instead of 01:38:32. User hint: the FLAC header
+`total_samples` had wrapped by one full 2^36 "base offset".
+
+### Root cause (verified against hard data)
+The FLAC STREAMINFO `total_samples` field is only 36 bits wide (max 2^36 =
+68,719,476,736). Captures longer than 2^36 samples wrap modulo 2^36. vhs-decode
+documents this exact bug at `vhs-decode/vhsdecode/hifi/utils.py:21-25`
+(`FLAC_TOTAL_SAMPLES_FIELD_MOD = 2**36`, `check_flac_header_total_samples`).
+The old probe trusted the wrapped header count; the /1000 MSPS->MHz math was
+already correct.
+
+Tape_15 hard data (soxi + claxon probe agree):
+- header_sample_rate = 20000, bps = 8, channels = 1
+- declared total_samples = 49,528,274,364  (the WRAPPED value)
+- file_size = 115,365,932,987 bytes, audio_offset = 4,718,682 bytes
+- true samples = 49,528,274,364 + 1 * 2^36 = 118,247,751,100
+- real duration @ 20 MSPS = 118,247,751,100 / 20,000,000 = 5912.388 s = 01:38:32
+
+The 115 GB file cannot fit the declared 49.5B 8-bit samples (~49.5 GB
+uncompressed), proving the header count wrapped.
+
+### Fix
+`core/src/probe.rs` now:
+1. stats the file size and walks the FLAC metadata block headers to find the
+   audio offset (claxon's metadata-only reader does not expose where it
+   stopped);
+2. ports `check_flac_header_total_samples` from vhs-decode: if the compressed
+   audio payload exceeds the bytes the declared count could occupy, the field
+   wrapped; recover the true count as `declared + k*2^36` for the unique `k`
+   that fits the frame-size [lower, upper] bounds;
+3. falls back to the smallest `k>=1` with `declared + k*2^36 >= ceil(audio_bytes
+   / bytes_per_sample)` when the frame-size bounds do not yield a unique `k`
+   (happens when a silent block sets `min_frame` tiny — Tape_15 has
+   min_frame=13). Correct for RF noise, which compresses poorly (Tape_15 is
+   97.6% of uncompressed). Marked `estimated` in that case.
+
+New `ProbeResult` / `FcProbe` fields: `declared_total_samples`,
+`total_samples_wraps`, `total_samples_estimated`, `file_size`, `audio_offset`.
+`total_samples` is now the CORRECTED value. Mirrored in `gui/flacchop.h`.
+
+GUI `setProbeInfo()` shows the corrected duration and a
+`(wrap-corrected +N x 2^36, raw <declared>)` tag when wraps > 0; the navigate
+slider range now spans the true full-tape duration.
+
+### Commands run (this session)
+```bash
+cd /home/harry/FLAC-Chop/core
+cargo test --release                     # 12 unit + 5 ffi, all pass
+cargo build --release --example probe_cli
+./target/release/examples/probe_cli <Tape_15.flac>
+# -> total_samples 118,247,751,100 (wraps=1), 01:38:32.39
+
+cd /home/harry/FLAC-Chop
+cmake --build build                      # GUI relinked against new core
+nohup ./build/gui/flac-chop >/tmp/flacchop.log 2>&1 &
+```
+
+### Verification (hard data)
+probe_cli on Tape_15:
+```
+declared_total     : 49528274364 (raw STREAMINFO, pre-correction)
+total_samples      : 118247751100 (known=true, wraps=1, estimated=true)
+real_total_seconds : 5912.388  = 01:38:32.39  (at real_rate 20000000 Hz)
+```
+Matches the user's known real duration 01:38:32. Unit test
+`check_detects_wrap_and_recovers_precisely` asserts the +2^36 recovery on
+synthetic Tape_15-like inputs.
+
+GUI display CONFIRMED by user on Tape_15: "Total (real)" shows ~01:38:32 with
+the wrap-corrected tag; Navigate slider max reaches ~01:38:32 (full tape).

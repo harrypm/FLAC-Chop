@@ -1,0 +1,17 @@
+[package]
+name = "flac_chop_core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core for FLAC-Chop: FLAC STREAMINFO probe (claxon), RF MSPS math, SoX sample-exact trim cutter. Exposed as a C ABI staticlib for the Qt6 GUI."
+
+[lib]
+name = "flac_chop_core"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+claxon = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

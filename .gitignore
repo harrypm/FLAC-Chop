@@ -1,0 +1,11 @@
+# Qt6 / CMake build output
+/build/
+
+# Rust / cargo build output
+/core/target/
+
+# editor / OS cruft
+*.swp
+*.swo
+*~
+.DS_Store
