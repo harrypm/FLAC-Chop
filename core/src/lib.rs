@@ -12,6 +12,9 @@
 //! staticlib directly.
 
 pub mod chop;
+pub mod companions;
 pub mod ffi;
 pub mod msps;
 pub mod probe;
+pub mod rate;
+pub mod vorbis;

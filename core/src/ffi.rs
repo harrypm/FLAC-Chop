@@ -37,10 +37,22 @@ pub struct FcProbe {
     pub total_samples_wraps: u32,
     /// 1 if the wrap count is an estimate (frame-size stats unavailable).
     pub total_samples_estimated: i32,
+    /// 1 if the total was obtained by scanning frame headers (unknown header).
+    pub total_samples_scanned: i32,
+    /// 1 if the total was inferred from a companion .log/.wav file.
+    pub total_samples_from_companion: i32,
+    /// 1 if the total was read from a Vorbis RF_TOTAL_SAMPLES tag.
+    pub total_samples_from_vorbis: i32,
+    /// 1 if the RF rate was confirmed by a Vorbis RF_SAMPLE_RATE tag.
+    pub rate_from_vorbis: i32,
     pub bits_per_sample: u32,
     pub channels: u32,
     pub file_size: u64,
     pub audio_offset: u64,
+    /// Real sample rate in Hz (header * 1000 for RF, or header for audio).
+    pub real_rate_hz: f64,
+    /// 1 if the file is treated as RF (rate was ×1000 or msps hint used).
+    pub is_rf: i32,
     pub msps: f64,
     pub msps_known: i32,
     pub error: [c_char; 256],
@@ -56,10 +68,16 @@ impl Default for FcProbe {
             total_samples_known: 0,
             total_samples_wraps: 0,
             total_samples_estimated: 0,
+            total_samples_scanned: 0,
+            total_samples_from_companion: 0,
+            total_samples_from_vorbis: 0,
+            rate_from_vorbis: 0,
             bits_per_sample: 0,
             channels: 0,
             file_size: 0,
             audio_offset: 0,
+            real_rate_hz: 0.0,
+            is_rf: 0,
             msps: 0.0,
             msps_known: 0,
             error: [0; 256],
@@ -69,6 +87,11 @@ impl Default for FcProbe {
 
 /// Probe a FLAC file's STREAMINFO. Writes into `out`. Safe to call with a null
 /// `out` (no-op) or null `path` (writes an error into `out`).
+///
+/// The probe body is wrapped in `catch_unwind`: the GUI runs this on a
+/// QtConcurrent (C++) thread, where a Rust panic cannot unwind and would abort
+/// the whole process. Catching it turns a panic into a normal error string in
+/// `out.error` so the GUI can show "Probe failed: …" instead of crashing.
 #[no_mangle]
 pub extern "C" fn fc_probe(path: *const c_char, out: *mut FcProbe) {
     unsafe {
@@ -78,38 +101,61 @@ pub extern "C" fn fc_probe(path: *const c_char, out: *mut FcProbe) {
         let out = &mut *out;
         *out = FcProbe::default();
 
-        if path.is_null() {
-            set_str(&mut out.error, "null path");
-            return;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fc_probe_impl(path, out)
+        }));
+        if let Err(payload) = result {
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "probe panicked (unknown cause)".to_string()
+            };
+            set_str(&mut out.error, &format!("probe panicked: {msg}"));
         }
-        let path_str = match CStr::from_ptr(path).to_str() {
-            Ok(s) => s,
-            Err(_) => {
-                set_str(&mut out.error, "path is not valid UTF-8");
-                return;
-            }
-        };
+    }
+}
 
-        let res = probe::probe(std::path::Path::new(path_str));
-        if !res.ok {
-            set_str(&mut out.error, &res.error);
+/// Inner probe body, isolated so `fc_probe` can catch panics around it.
+fn fc_probe_impl(path: *const c_char, out: &mut FcProbe) {
+    if path.is_null() {
+        set_str(&mut out.error, "null path");
+        return;
+    }
+    let path_str = match unsafe { CStr::from_ptr(path) }.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_str(&mut out.error, "path is not valid UTF-8");
             return;
         }
-        out.ok = 1;
-        out.header_sample_rate = res.header_sample_rate;
-        out.declared_total_samples = res.declared_total_samples;
-        out.total_samples = res.total_samples;
-        out.total_samples_known = if res.total_samples_known { 1 } else { 0 };
-        out.total_samples_wraps = res.total_samples_wraps;
-        out.total_samples_estimated = if res.total_samples_estimated { 1 } else { 0 };
+    };
+
+    let res = probe::probe(std::path::Path::new(path_str));
+    if !res.ok {
+        set_str(&mut out.error, &res.error);
+        return;
+    }
+    out.ok = 1;
+    out.header_sample_rate = res.header_sample_rate;
+    out.declared_total_samples = res.declared_total_samples;
+    out.total_samples = res.total_samples;
+    out.total_samples_known = if res.total_samples_known { 1 } else { 0 };
+    out.total_samples_wraps = res.total_samples_wraps;
+    out.total_samples_estimated = if res.total_samples_estimated { 1 } else { 0 };
+        out.total_samples_scanned = if res.total_samples_scanned { 1 } else { 0 };
+        out.total_samples_from_companion = if res.total_samples_from_companion { 1 } else { 0 };
+        out.total_samples_from_vorbis = if res.total_samples_from_vorbis { 1 } else { 0 };
+        out.rate_from_vorbis = if res.rate_from_vorbis { 1 } else { 0 };
         out.bits_per_sample = res.bits_per_sample;
-        out.channels = res.channels;
-        out.file_size = res.file_size;
-        out.audio_offset = res.audio_offset;
-        if let Some(m) = msps::extract_msps(path_str) {
-            out.msps = m;
-            out.msps_known = 1;
-        }
+    out.channels = res.channels;
+    out.file_size = res.file_size;
+    out.audio_offset = res.audio_offset;
+    out.real_rate_hz = res.real_rate_hz;
+    out.is_rf = if res.is_rf { 1 } else { 0 };
+    if let Some(m) = msps::extract_msps(path_str) {
+        out.msps = m;
+        out.msps_known = 1;
     }
 }
 
@@ -138,16 +184,15 @@ impl Default for FcPlan {
     }
 }
 
-/// Compute a sample-exact cut plan from seconds. If `msps_known`, the real rate
-/// is `msps * 1e6` (undoing the RF /1000 header); otherwise the FLAC header rate
-/// is used as-is. When total samples are known, the cut is clamped to the file.
+/// Compute a sample-exact cut plan from seconds. `real_rate_hz` is the already-
+/// resolved real sample rate (from `fc_probe`'s `real_rate_hz` field — header
+/// ×1000 for RF captures, or the header rate for real audio). When total
+/// samples are known, the cut is clamped to the file.
 #[no_mangle]
 pub extern "C" fn fc_plan(
     start_sec: f64,
     len_sec: f64,
-    msps: f64,
-    msps_known: i32,
-    header_rate: u64,
+    real_rate_hz: f64,
     total_samples: u64,
     total_known: i32,
     out: *mut FcPlan,
@@ -159,11 +204,7 @@ pub extern "C" fn fc_plan(
         let out = &mut *out;
         *out = FcPlan::default();
 
-        let real_rate = if msps_known != 0 && msps > 0.0 {
-            msps * 1_000_000.0
-        } else {
-            header_rate as f64
-        };
+        let real_rate = real_rate_hz;
         if !(real_rate > 0.0) {
             set_str(&mut out.error, "sample rate is zero");
             return;

@@ -19,10 +19,16 @@ struct FcProbe {
     int32_t total_samples_known;
     uint32_t total_samples_wraps;    // # of 2^36 blocks added (0 = trusted)
     int32_t total_samples_estimated; // 1 if wrap count is an estimate
+    int32_t total_samples_scanned;   // 1 if total was obtained by scanning frame headers
+    int32_t total_samples_from_companion; // 1 if total was inferred from a sibling .log/.wav
+    int32_t total_samples_from_vorbis;   // 1 if total was read from a Vorbis RF_TOTAL_SAMPLES tag
+    int32_t rate_from_vorbis;            // 1 if RF rate was confirmed by a Vorbis RF_SAMPLE_RATE tag
     uint32_t bits_per_sample;
     uint32_t channels;
     uint64_t file_size;
     uint64_t audio_offset;
+    double real_rate_hz;           // real rate in Hz (header*1000 for RF, or header for audio)
+    int32_t is_rf;                 // 1 if treated as RF (rate was x1000 or msps hint used)
     double msps;
     int32_t msps_known;
     char error[256];
@@ -45,9 +51,8 @@ struct FcChopResult {
 };
 
 void fc_probe(const char* path, FcProbe* out);
-void fc_plan(double start_sec, double len_sec, double msps, int32_t msps_known,
-             uint64_t header_rate, uint64_t total_samples, int32_t total_known,
-             FcPlan* out);
+void fc_plan(double start_sec, double len_sec, double real_rate_hz,
+             uint64_t total_samples, int32_t total_known, FcPlan* out);
 void fc_chop(const char* in_path, const char* out_path,
              uint64_t start_samples, uint64_t length_samples, FcChopResult* out);
 int fc_generate_output_path(const char* in_path, char* out_buf, uintptr_t buf_len);

@@ -34,32 +34,29 @@ fn main() {
         eprintln!("probe error: {}", probe.error);
         std::process::exit(1);
     }
-    let msps = flac_chop_core::msps::extract_msps(in_path);
-    let msps_known = msps.is_some();
-    let msps_val = msps.unwrap_or(0.0);
 
     let mut plan = flac_chop_core::ffi::FcPlan::default();
     flac_chop_core::ffi::fc_plan(
         start_sec,
         len_sec,
-        msps_val,
-        if msps_known { 1 } else { 0 },
-        probe.header_sample_rate,
+        probe.real_rate_hz,
         probe.total_samples,
         if probe.total_samples_known { 1 } else { 0 },
         &mut plan as *mut _,
     );
     if plan.ok == 0 {
         let msg = unsafe {
-            std::ffi::CStr::from_ptr(plan.error.as_ptr()).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(plan.error.as_ptr())
+                .to_string_lossy()
+                .into_owned()
         };
         eprintln!("plan error: {}", msg);
         std::process::exit(1);
     }
 
     println!(
-        "plan: start={} len={} samples (real_rate {:.0} Hz, msps={:?})",
-        plan.start_samples, plan.length_samples, plan.real_sample_rate_hz, msps
+        "plan: start={} len={} samples (real_rate {:.0} Hz, is_rf={})",
+        plan.start_samples, plan.length_samples, plan.real_sample_rate_hz, probe.is_rf
     );
 
     let r = flac_chop_core::chop::chop(in_path, out_path, plan.start_samples, plan.length_samples);

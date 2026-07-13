@@ -203,3 +203,139 @@ synthetic Tape_15-like inputs.
 
 GUI display CONFIRMED by user on Tape_15: "Total (real)" shows ~01:38:32 with
 the wrap-corrected tag; Navigate slider max reaches ~01:38:32 (full tape).
+
+---
+
+GUI display CONFIRMED by user on Tape_15: "Total (real)" shows ~01:38:32 with
+the wrap-corrected tag; Navigate slider max reaches ~01:38:32 (full tape).
+
+---
+
+## 2026-07-13 (session 3) — v1.1.0: robust duration, RF rate, GUI redesign
+
+### Problems (user-reported)
+1. A file loaded with both slider handles stuck at the left (0) — the duration
+   was wrong, so the slider had no range.
+2. The real-time math was broken for some `msps` files: a file showed "hundreds
+   of hours" instead of its real ~35–100 min duration.
+3. The GUI froze (then crashed) when loading a 70 GB file whose STREAMINFO
+   total was unknown.
+4. Loading a new file did not unload the previous file's state.
+5. The IN/OUT dual edit boxes glitched on load (a recompute clobbered the
+   load-time handle positions).
+
+### Root causes (verified against hard data)
+- The `/1000` MSPS->MHz correction was gated on the filename containing an
+  `<n>msps` token; `extract_msps` is strict (no separators), so files whose
+  name didn't match fell back to the raw 20000 Hz header -> 1000x too long.
+- For files with an UNKNOWN STREAMINFO total (piped/streamed captures that
+  couldn't finalize the header), the first attempt guessed the count from
+  `audio_bytes / bytes_per_sample`. That assumed ~1:1 compression and was
+  wrong by 1.74x on Tape_12 (RF noise compresses variably).
+- `fc_probe` ran on the GUI thread; for unknown-total files it now scans the
+  whole file, freezing the window, and a slice-index panic on a C++ thread
+  aborted the process (Rust can't unwind through foreign threads).
+
+### Fixes
+**`core/src/rate.rs` (new):** central rate resolution. RF `/1000` is the
+DEFAULT — `real_rate = header_rate * 1000`. Exception: standard audio rates
+(22050/24000/32000/44100/48000/64000/88200/96000/176400/192000/352800/384000,
+±5% tol) are used as-is. Filename `<n>msps` confirms the MSPS value. So a
+20000 Hz header with no `msps` in the name now correctly resolves to 20 MSPS.
+
+**`core/src/vorbis.rs` (new):** reads the MISRC/DdD pipeline's custom Vorbis
+comment tags `RF_TOTAL_SAMPLES`, `RF_SAMPLE_RATE`, `DURATION_SECONDS` via
+claxon (`metadata_only` + `read_vorbis_comment`). These are the capture tool's
+authoritative in-file record. The tags are self-consistent:
+`RF_TOTAL_SAMPLES / RF_SAMPLE_RATE = DURATION_SECONDS`. The pipeline used two
+schemas (early: `RF_SAMPLE_RATE=20000` the /1000 value; later:
+`RF_SAMPLE_RATE=20000000` the real Hz, with `RF_SAMPLE_RATE_KHZ` for /1000).
+Both work because we divide total by the tag's rate directly — no ×1000
+assumption. When present, the Vorbis total is the HIGHEST-priority source.
+
+**`core/src/companions.rs` (new):** for unknown-total files with no Vorbis
+tags, infers the duration from a sibling file sharing the capture base prefix
+(through the `YYYY.MM.DD_HH.MM.SS` timestamp): a `*.log` with a
+`duration=Ns` line, or a `.wav` RIFF header. Verified on Tape_12: the misrc
+log says `duration=6120.27s` and the baseband WAV agrees at 6120.82s.
+
+**`core/src/probe.rs` — FLAC frame-header scanner:** last-resort exact count
+for unknown-total files with no companion. Walks every FLAC frame header
+(mirrors claxon's `frame.rs` bit layout + CRC-8), summing each frame's block
+size. Robust against false syncs: requires valid field encodings + CRC-8 match
++ sequential frame/sample-number cross-check. Speedup: 8 MiB read buffer +
+skips `min_frame_size` bytes past each accepted frame. Sanity check: the
+scanned count's uncompressed size must be >= the compressed audio payload
+(FLAC never expands data); warns if not.
+
+**Total-resolution priority order:**
+1. Vorbis `RF_TOTAL_SAMPLES` tag (in-file, authoritative)
+2. STREAMINFO header + 36-bit wrap correction (finalized files)
+3. Companion `.log`/`.wav` (unknown-total files with a sibling)
+4. Frame-header scan (unknown-total files, no sibling — slow, exact)
+
+**`core/src/ffi.rs`:** `fc_probe` now wrapped in `catch_unwind` — a Rust panic
+on the QtConcurrent thread becomes an error string instead of aborting the
+process. `fc_plan` signature simplified to take the resolved `real_rate_hz`
+directly (drops msps/msps_known/header_rate params).
+
+**GUI (`gui/mainwindow.{h,cpp}`):**
+- Probe runs async on a `QtConcurrent` worker thread with a busy indicator +
+  "Probing…" status; the window stays responsive (no freeze).
+- `unloadFile()` resets all per-file state at the top of `loadFile`, so
+  dropping/loading a new file clears the old state first.
+- Markers redesigned to one editable time box + Set IN / Set OUT buttons
+  (drops the dual IN/Duration edit boxes that glitched). `m_inSec`/`m_outSec`
+  are the single source of truth, mutated only by explicit actions (button or
+  slider drag) — never by a `textChanged` signal, so load can't be clobbered.
+- On load, IN/OUT handles go to each end of the tape (IN at start, OUT at full
+  duration) with signals blocked so they stick.
+- ld-analyse dark Fusion palette; IN (green) / OUT (red) slider handles.
+- Total label shows provenance: `(vorbis RF_TOTAL_SAMPLES)`,
+  `(companion file)`, `(scanned from frames)`, or `(wrap-corrected +N×2³⁶)`.
+
+### Commands run (this session)
+```bash
+cd /home/harry/FLAC-Chop/core
+cargo test --release                     # 30 unit + 5 ffi, all pass
+cargo build --release --example probe_cli
+./target/release/examples/probe_cli <metadata_test.flac>   # vorbis-tag path
+./target/release/examples/probe_cli <Tape_12.flac>          # companion path
+
+cd /home/harry/FLAC-Chop
+cmake --build build                      # GUI relinked against new core
+nohup ./build/gui/flac-chop >/tmp/flacchop.log 2>&1 &
+```
+
+### Verification (hard data)
+metadata_test `09.19.56` (Vorbis tags: RF_TOTAL_SAMPLES=211811850,
+RF_SAMPLE_RATE=20000000, DURATION_SECONDS=10.590592):
+```
+real_rate_hz       : 20000000  (is_rf=true)
+total_samples      : 211811850 (known=true, provenance=vorbis-tag)
+real_total_seconds : 10.591  = 00:00:10.59
+```
+
+Tape_12 (no Vorbis tags; companion misrc log duration=6120.27s):
+```
+real_rate_hz       : 20000000  (is_rf=true)
+total_samples      : 122405400000 (known=true, provenance=companion-file)
+real_total_seconds : 6120.270  = 01:42:00.27
+```
+Matches the user's absolute 01:42:00. Frame-scan fallback on the same file
+independently gave 01:42:00.77 (29,886,592 frames scanned) — agrees.
+
+Tape_15 (April-20, 115 GB, wrap path, user absolute 01:38:32):
+```
+total_samples      : 118247751100 (wraps=1, provenance=wrap-corrected)
+real_total_seconds : 5912.388  = 01:38:32.39
+```
+
+### Honest caveats
+- The GUI load of these files has NOT been confirmed end-to-end by the user at
+  commit time; only the headless `probe_cli` path is verified above.
+- Companion inference covers sibling `.log` (with `duration=Ns`) and `.wav`
+  (RIFF header). RF64 WAVs and `.tbc.json` companions are not handled — those
+  fall through to the slow frame scan.
+- The frame scan reads the whole file (I/O-heavy); it is the last-resort
+  fallback only when no Vorbis tag and no companion exist.
