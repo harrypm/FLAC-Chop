@@ -1,8 +1,17 @@
 # Qt6 / CMake build output
 /build/
+/build-gha/
 
 # Rust / cargo build output
 /core/target/
+
+# CI / AppImage packaging scratch (produced by .github/workflows/build.yml)
+/AppDir/
+/dist/
+/dmg-stage/
+/stage-*/
+/*.AppImage
+/linuxdeploy*
 
 # editor / OS cruft
 *.swp

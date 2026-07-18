@@ -1,0 +1,46 @@
+name: Tests
+
+# Fast cargo-test feedback on push/PR to master across Linux, macOS, Windows.
+# The full packaging build (build.yml) only runs on tags/PRs and is heavier;
+# this catches Rust-core regressions quickly without Qt6/cmake setup.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-test:
+    name: cargo test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: cargo-test-${{ matrix.os }}-${{ hashFiles('core/Cargo.lock') }}
+
+      - name: Run cargo test
+        run: cargo test --release --manifest-path core/Cargo.toml
+
+      - name: Build probe_cli + chop_cli (smoke check)
+        run: |
+          cargo build --release --manifest-path core/Cargo.toml --example probe_cli
+          cargo build --release --manifest-path core/Cargo.toml --example chop_cli

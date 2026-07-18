@@ -1,0 +1,520 @@
+name: Build and release binary
+
+# Mirrors the structure of harrypm/MISRC/.github/workflows/build.yml, adapted
+# to FLAC-Chop's stack (Rust/cargo core + Qt6/CMake GUI + SoX runtime dep)
+# instead of MISRC's Meson + raylib + hsdaoh toolchain.
+#
+# Triggers: push of a v* tag (release), PRs (build only, no release), and
+# manual workflow_dispatch (optionally create a release from a given tag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create a GitHub release and upload built assets"
+        required: false
+        type: boolean
+        default: false
+      release_tag:
+        description: "Tag to release when manually dispatched (example: v1.2.0)"
+        required: false
+        type: string
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  BUILD_DIR: build-gha
+
+jobs:
+  # --- Preflight: Rust core tests on Linux (fast feedback before packaging) ---
+  cargo-tests:
+    name: Cargo tests
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock') }}
+
+      - name: Run cargo test
+        run: cargo test --release --manifest-path core/Cargo.toml
+
+      - name: Build probe_cli (smoke check)
+        run: cargo build --release --manifest-path core/Cargo.toml --example probe_cli
+
+  # --- Linux AppImage (x86_64 + arm64) ---
+  linux-appimage:
+    name: Linux AppImage (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+            linuxdeploy_arch: x86_64
+            artifact_suffix: x86
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            linuxdeploy_arch: aarch64
+            artifact_suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    needs: cargo-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build version
+        id: version
+        run: |
+          set -eux
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event.inputs.release_tag }}"
+          else
+            VERSION="$(git describe --tags --dirty --match 'v*' 2>/dev/null || true)"
+            if [[ -z "$VERSION" ]]; then
+              VERSION="dev-${GITHUB_SHA::7}"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            pkg-config \
+            qt6-base-dev \
+            qt6-base-dev-tools \
+            qt6-widgets-dev \
+            libgl1-mesa-dev \
+            curl \
+            file \
+            patchelf \
+            zip \
+            unzip
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: cargo-linux-${{ matrix.arch }}-${{ hashFiles('core/Cargo.lock') }}
+
+      - name: Build FLAC-Chop
+        run: |
+          set -eux
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD_DIR"
+          test -x "$BUILD_DIR/gui/flac-chop"
+
+      - name: Package AppImage
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+          LINUXDEPLOY_ARCH: ${{ matrix.linuxdeploy_arch }}
+        run: |
+          set -eux
+          mkdir -p AppDir/usr/bin
+          cp "$BUILD_DIR/gui/flac-chop" AppDir/usr/bin/
+
+          cat > AppDir/flac-chop.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=FLAC-Chop
+          Exec=flac-chop
+          Icon=flac-chop
+          Categories=AudioVideo;Utility;
+          Terminal=false
+          StartupNotify=true
+          EOF
+
+          # Minimal placeholder icon (a 512x512 PNG) so linuxdeploy has one.
+          # A real icon can be dropped in later.
+          printf '\x89PNG\r\n\x1a\n' > AppDir/flac-chop.png
+
+          cat > AppDir/AppRun <<'EOF'
+          #!/usr/bin/env bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/flac-chop" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          curl -L -o linuxdeploy "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage"
+          curl -L -o linuxdeploy-plugin-qt "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${LINUXDEPLOY_ARCH}.AppImage"
+          chmod +x linuxdeploy linuxdeploy-plugin-qt
+
+          # Bundle the Qt6 libs the GUI links against. SoX is NOT bundled —
+          # it is a runtime dep the user must have on PATH (apt install sox).
+          ARCH="$LINUXDEPLOY_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy \
+            --appdir AppDir \
+            -e AppDir/usr/bin/flac-chop \
+            -d AppDir/flac-chop.desktop \
+            -i AppDir/flac-chop.png \
+            --plugin qt \
+            --output appimage
+
+          APPIMAGE_NAME="linux_FLAC-Chop_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.AppImage"
+          mv ./*.AppImage "$APPIMAGE_NAME"
+          test -f "$APPIMAGE_NAME"
+
+          ZIP_NAME="linux_FLAC-Chop_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
+          zip -j "$ZIP_NAME" "$APPIMAGE_NAME"
+          test -f "$ZIP_NAME"
+
+      - name: Upload Linux ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-zip-${{ matrix.arch }}
+          path: linux_FLAC-Chop_*_${{ matrix.artifact_suffix }}.zip
+          if-no-files-found: error
+
+  # --- Windows EXE (x86_64 via MSYS2 MINGW64) ---
+  windows-exe:
+    name: Windows EXE (x86_64)
+    runs-on: windows-2022
+    needs: cargo-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-qt6-base
+            mingw-w64-x86_64-qt6-tools
+
+      - name: Resolve build version
+        id: version
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event.inputs.release_tag }}"
+          else
+            VERSION="$(git describe --tags --dirty --match 'v*' 2>/dev/null || true)"
+            if [[ -z "$VERSION" ]]; then
+              VERSION="dev-${GITHUB_SHA:0:7}"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (MinGW gnu target)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          source ~/.cargo/env
+          rustup target add x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
+
+      - name: Build FLAC-Chop
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          source ~/.cargo/env
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD_DIR"
+          test -x "$BUILD_DIR/gui/flac-chop.exe"
+
+      - name: Bundle Qt6 DLLs with windeployqt
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$BUILD_DIR/gui/flac-chop.exe" dist/
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
+          # SoX is NOT bundled — it is a runtime dep (user installs SoX for Windows).
+
+      - name: Create ZIP artifact
+        shell: pwsh
+        run: |
+          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+
+      - name: Upload Windows ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: windows_FLAC-Chop_*_x86.zip
+          if-no-files-found: error
+
+  # --- macOS APP (arm64 + x86_64, then universal DMG) ---
+  macos-app-build:
+    name: macOS APP (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    needs: cargo-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve build version
+        id: version
+        run: |
+          set -eux
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event.inputs.release_tag }}"
+          else
+            VERSION="$(git describe --tags --dirty --match 'v*' 2>/dev/null || true)"
+            if [[ -z "$VERSION" ]]; then
+              VERSION="dev-${GITHUB_SHA::7}"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        run: |
+          set -eux
+          brew install cmake ninja qt@6 pkg-config
+          # qt@6 is keg-only; link it so cmake finds it
+          brew link --force qt@6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: cargo-macos-${{ matrix.arch }}-${{ hashFiles('core/Cargo.lock') }}
+
+      - name: Build FLAC-Chop
+        run: |
+          set -eux
+          # Make cmake find the keg-only Qt@6.
+          export CMAKE_PREFIX_PATH="$(brew --prefix qt@6):${CMAKE_PREFIX_PATH:-}"
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD_DIR"
+          test -x "$BUILD_DIR/gui/flac-chop"
+
+      - name: Stage .app bundle
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eux
+          APP_ROOT="dist/FLAC-Chop.app/Contents"
+          mkdir -p "$APP_ROOT/MacOS" "$APP_ROOT/Resources"
+          cp "$BUILD_DIR/gui/flac-chop" "$APP_ROOT/MacOS/FLAC-Chop"
+          chmod +x "$APP_ROOT/MacOS/FLAC-Chop"
+
+          cat > "$APP_ROOT/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>FLAC-Chop</string>
+            <key>CFBundleDisplayName</key>
+            <string>FLAC-Chop</string>
+            <key>CFBundleIdentifier</key>
+            <string>dev.flacchop.gui</string>
+            <key>CFBundleVersion</key>
+            <string>${BUILD_VERSION}</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${BUILD_VERSION}</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleExecutable</key>
+            <string>FLAC-Chop</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+          </dict>
+          </plist>
+          EOF
+
+          # Bundle Qt frameworks into the .app so it's self-contained.
+          macdeployqt "dist/FLAC-Chop.app"
+          # SoX is NOT bundled — it is a runtime dep (brew install sox).
+
+          echo "$BUILD_VERSION" > dist/BUILD_VERSION.txt
+
+      - name: Upload macOS architecture stage
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app-stage-${{ matrix.arch }}
+          path: |
+            dist/FLAC-Chop.app
+            dist/BUILD_VERSION.txt
+          if-no-files-found: error
+
+  macos-app-universal:
+    name: macOS APP (universal)
+    runs-on: macos-14
+    needs: macos-app-build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Download arm64 stage
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-app-stage-arm64
+          path: stage-arm64
+      - name: Download x86_64 stage
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-app-stage-x86_64
+          path: stage-x86_64
+
+      - name: Merge universal app and package DMG
+        id: package
+        run: |
+          set -eux
+          BUILD_VERSION="$(cat stage-arm64/BUILD_VERSION.txt)"
+          echo "version=$BUILD_VERSION" >> "$GITHUB_OUTPUT"
+
+          mkdir -p dist
+          cp -R stage-arm64/FLAC-Chop.app dist/FLAC-Chop.app
+
+          # Lipo-merge the Mach-O binaries; copy non-binary files from arm64.
+          while IFS= read -r rel; do
+            ARM_FILE="stage-arm64/${rel}"
+            X86_FILE="stage-x86_64/${rel}"
+            OUT_FILE="dist/${rel}"
+            if file "$ARM_FILE" | grep -q "Mach-O"; then
+              lipo -create "$ARM_FILE" "$X86_FILE" -output "$OUT_FILE"
+            else
+              cp "$ARM_FILE" "$OUT_FILE"
+            fi
+          done < <(cd stage-arm64 && find FLAC-Chop.app -type f | sort)
+          chmod +x dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop
+
+          codesign --force --deep --sign - dist/FLAC-Chop.app
+
+          # Verify both arches are present.
+          LIPO_ARCHS="$(lipo -archs dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop)"
+          echo "$LIPO_ARCHS" | grep -q 'arm64'
+          echo "$LIPO_ARCHS" | grep -q 'x86_64'
+
+          DMG_STAGE_DIR="dmg-stage"
+          rm -rf "$DMG_STAGE_DIR"
+          mkdir -p "$DMG_STAGE_DIR"
+          cp -R dist/FLAC-Chop.app "$DMG_STAGE_DIR/FLAC-Chop.app"
+          ln -s /Applications "$DMG_STAGE_DIR/Applications"
+          DMG_NAME="macos_FLAC-Chop_${BUILD_VERSION}_universal.dmg"
+          hdiutil create \
+            -volname "FLAC-Chop" \
+            -srcfolder "$DMG_STAGE_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_NAME"
+          test -f "$DMG_NAME"
+
+      - name: Upload macOS DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: macos_FLAC-Chop_*_universal.dmg
+          if-no-files-found: error
+
+  # --- Release: publish build assets to a GH release on tag push ---
+  release:
+    name: Publish release assets
+    runs-on: ubuntu-22.04
+    needs:
+      - linux-appimage
+      - windows-exe
+      - macos-app-universal
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          set -eux
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="${{ github.event.inputs.release_tag }}"
+            if [[ -z "$TAG" ]]; then
+              echo "release_tag is required when create_release=true" >&2
+              exit 1
+            fi
+            if ! git rev-parse "refs/tags/$TAG" >/dev/null 2>&1; then
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git tag "$TAG" "$GITHUB_SHA"
+              git push origin "$TAG"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## Runtime requirement: SoX
+
+            FLAC-Chop shells out to **SoX** for the actual sample-exact cut.
+            Install it separately — it is not bundled in these packages:
+
+            - **Linux:** `sudo apt install sox`
+            - **macOS:** `brew install sox`
+            - **Windows:** install SoX for Windows and add it to your PATH.
+          files: |
+            release-assets/**/linux_FLAC-Chop_*_x86.zip
+            release-assets/**/linux_FLAC-Chop_*_arm64.zip
+            release-assets/**/windows_FLAC-Chop_*_x86.zip
+            release-assets/**/macos_FLAC-Chop_*_universal.dmg
