@@ -88,7 +88,18 @@ mod tests {
 
     #[test]
     fn output_path_no_parent_uses_dot() {
+        // When the input has no parent dir, the output is written to the
+        // current dir ("."). The exact separator differs by platform
+        // ("./local-cut.flac" on Unix, ".\\local-cut.flac" on Windows), so
+        // assert on the platform-correct form rather than a hard-coded string.
         let p = generate_output_path("local.flac").unwrap();
-        assert_eq!(p, "./local-cut.flac");
+        let expected = {
+            let mut pb = std::path::PathBuf::from(".");
+            pb.push("local-cut.flac");
+            pb.to_string_lossy().into_owned()
+        };
+        assert_eq!(p, expected);
+        // And it must always end with the stem-cut.flac regardless of platform.
+        assert!(p.ends_with("local-cut.flac"));
     }
 }
