@@ -7,7 +7,12 @@
 # flac_chop_core.lib on MSVC.
 
 set(CORE_DIR "${CMAKE_SOURCE_DIR}/core")
-if(WIN32 AND NOT MINGW)
+# Rust staticlib naming: lib<name>.a for every MinGW-style toolchain (gcc on
+# MINGW64, clang on CLANGARM64/aarch64-pc-windows-gnullvm) and <name>.lib for
+# MSVC. Gate on MSVC (not `WIN32 AND NOT MINGW`) because CMake does not
+# reliably set MINGW for the clang-mingw toolchains, which would wrongly pick
+# .lib and fail to find the gnullvm staticlib (.a).
+if(MSVC)
     set(CORE_LIB "${CORE_DIR}/target/release/flac_chop_core.lib")
 else()
     set(CORE_LIB "${CORE_DIR}/target/release/libflac_chop_core.a")
@@ -66,8 +71,12 @@ else()
     target_link_libraries(flac-chop PRIVATE pthread dl m)
 endif()
 
-# Statically link the C++ runtime on MinGW so the exe doesn't need libgcc DLLs.
-if(WIN32 AND MINGW)
+# Statically link the C++ runtime on MinGW-gcc so the exe itself doesn't need
+# libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 DLLs. Gate on the GNU compiler
+# id (not `WIN32 AND MINGW`) so these gcc-specific flags are never passed to
+# clang on CLANGARM64; for that build the runtime DLLs are bundled into dist/
+# by the ldd-walk step in .github/workflows/build.yml instead.
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_link_options(flac-chop PRIVATE -static-libgcc -static-libstdc++ -static)
 endif()
 
