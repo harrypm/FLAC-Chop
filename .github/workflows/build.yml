@@ -158,10 +158,10 @@ jobs:
           StartupNotify=true
           EOF
 
-          # Minimal valid 1x1 transparent PNG icon so linuxdeploy has one.
-          # Replace with a real 512x512 icon when one is available.
-          printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' \
-            | base64 -d > AppDir/flac-chop.png
+          # Generate a valid 256x256 solid dark-gray PNG icon at runtime so
+          # linuxdeploy can deploy .DirIcon / scaled icons. ImageMagick (convert)
+          # is preinstalled on the Ubuntu runner. Replace with a real branded icon.
+          convert -size 256x256 "xc:#2a2a2a" AppDir/flac-chop.png
 
           cat > AppDir/AppRun <<'EOF'
           #!/usr/bin/env bash
@@ -238,30 +238,20 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust (MinGW gnu target)
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-          # Install rustup into the MSYS2 home ($HOME) so that ~/.cargo/env is
-          # resolvable from later `msys2 {0}` steps. Without this, rustup installs
-          # to the Windows user profile (C:\Users\runneradmin) while `~` inside
-          # MSYS2 resolves to /home/runneradmin, so `source ~/.cargo/env` fails.
-          export CARGO_HOME="$HOME/.cargo"
-          export RUSTUP_HOME="$HOME/.rustup"
-          # Pass the full toolchain spec (stable-x86_64-pc-windows-gnu) to
-          # --default-toolchain so the gnu toolchain is installed as default.
-          # Do NOT use --default-host: the rustup-init shim already injects it
-          # and passing it again triggers "cannot be used multiple times".
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable-x86_64-pc-windows-gnu
-          source "$CARGO_HOME/env"
-          rustup default stable-x86_64-pc-windows-gnu
+      - name: Install Rust (MinGW gnu toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # MinGW gnu toolchain so cargo links against MSYS2's MinGW gcc and
+          # the produced exe matches the MSYS2 Qt6 DLLs bundled by windeployqt.
+          toolchain: stable-x86_64-pc-windows-gnu
 
       - name: Build FLAC-Chop
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          source ~/.cargo/env
+          # cargo/rustc are on PATH via dtolnay/rust-toolchain (GITHUB_PATH);
+          # do NOT `source ~/.cargo/env` here: that env lives in the Windows
+          # user profile, while MSYS2 ~ resolves to /home/runneradmin.
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
