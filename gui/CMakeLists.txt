@@ -55,8 +55,11 @@ target_link_libraries(flac-chop PRIVATE
     "${CORE_LIB}"
 )
 if(WIN32)
-    # MinGW: Rust std needs these Win32 libs.
-    target_link_libraries(flac-chop PRIVATE ws2_32 advapi32 userenv bcrypt)
+    # MinGW/MSVC: Rust std needs these Win32 import libraries when statically
+    # linking a Rust staticlib. ntdll supplies the NT Native API entry points
+    # (NtReadFile/NtCreateFile/NtOpenFile/NtWriteFile/RtlNtStatusToDosError/...)
+    # that newer Rust std (>= ~1.75 gnu target) calls for async I/O/stdin.
+    target_link_libraries(flac-chop PRIVATE ws2_32 advapi32 userenv bcrypt ntdll)
 elseif(APPLE)
     target_link_libraries(flac-chop PRIVATE pthread dl m iconv)
 else()
