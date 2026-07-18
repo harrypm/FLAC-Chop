@@ -120,12 +120,16 @@ cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.f
 ## Status / not done
 - GUI built in code (no Designer .ui) for compile reliability; can be ported to
   .ui later if desired.
-- Windows/macOS: staticlib extension differs (.lib/.a) — CMake core-lib path is
-  Linux-specific for now.
+- Windows/macOS: cross-platform BUILDS now work via CI (see session 4), but the
+  GUI has NOT been run on Windows/macOS by the user — only the Linux GUI has
+  been launched and confirmed. Binaries are verified as well-formed for their
+  target arch (ELF/PE32+/universal Mach-O) but not runtime-tested.
 - No progress % from sox (busy indicator only); sox doesn't emit sample progress
   to a captured pipe easily.
 - Decimation factor from the old tool not carried over (SoX cut is at the input
   rate; decimation is a decode-side concern, not a cut concern).
+- No tagged release yet; CI binaries so far are `dev-<sha>` builds. Push a `v*`
+  tag to publish a versioned GitHub Release.
 
 ---
 
@@ -200,11 +204,6 @@ real_total_seconds : 5912.388  = 01:38:32.39  (at real_rate 20000000 Hz)
 Matches the user's known real duration 01:38:32. Unit test
 `check_detects_wrap_and_recovers_precisely` asserts the +2^36 recovery on
 synthetic Tape_15-like inputs.
-
-GUI display CONFIRMED by user on Tape_15: "Total (real)" shows ~01:38:32 with
-the wrap-corrected tag; Navigate slider max reaches ~01:38:32 (full tape).
-
----
 
 GUI display CONFIRMED by user on Tape_15: "Total (real)" shows ~01:38:32 with
 the wrap-corrected tag; Navigate slider max reaches ~01:38:32 (full tape).
@@ -339,3 +338,125 @@ real_total_seconds : 5912.388  = 01:38:32.39
   fall through to the slow frame scan.
 - The frame scan reads the whole file (I/O-heavy); it is the last-resort
   fallback only when no Vorbis tag and no companion exist.
+
+---
+
+## 2026-07-18 (session 4) — cross-platform GitHub Actions CI + binaries
+
+### Goal (user request)
+Make GH Actions for all platforms, mirroring the tbc-tools / MISRC GUI repos'
+workflow setup; then actually build the binaries and verify them.
+
+### What was added
+`.github/workflows/tests.yml` — fast `cargo test --release` + `probe_cli` smoke
+build on push/PR to master across ubuntu-22.04 / macos-14 / windows-2022.
+
+`.github/workflows/build.yml` — full packaging pipeline (triggered on `v*` tags,
+PRs, or manual `workflow_dispatch`):
+- Linux AppImage (x86_64 + arm64) via apt qt6 + linuxdeploy + qmake6
+- Windows EXE (x86_64) via MSYS2 MINGW64 Qt6 + windeployqt
+- macOS APP (arm64 + x86_64) via brew qt@6 + macdeployqt, then a universal
+  lipo-merged DMG
+- Release job publishes assets to a GH Release on tag push
+
+`gui/CMakeLists.txt` — cross-platform fixes: staticlib name `.a` vs `.lib` by
+toolchain, per-platform Rust std native deps (Linux pthread/dl/m, macOS +iconv,
+MinGW ws2_32/advapi32/userenv/bcrypt/ntdll).
+
+### Fix sequence (10 issues, all on CI runners — local Linux build was already
+green; details in git log `9a35916..c714009`)
+1. Linux apt: Ubuntu 22.04 has no `qt6-widgets-dev` (ships in `qt6-base-dev`).
+2. Windows rustup: `rustup-init.exe` ignored the MSYS2 POSIX `CARGO_HOME`;
+   switched to `dtolnay/rust-toolchain` with `stable-x86_64-pc-windows-gnu`.
+3. Linux linuxdeploy: `qmake` on PATH was Qt5; set `QMAKE=/usr/bin/qmake6`.
+4. Linux icon: hand-embedded base64 PNG had a bad IDAT CRC; generate at runtime
+   with ImageMagick `convert` instead.
+5. macOS runners: `macos-13` retired 2025-12-04 (job queued forever); migrated
+   to `macos-15` / `macos-15-intel`.
+6. Windows C++ compiler: MSYS2 install list had cmake/qt6 but no gcc; added
+   `mingw-w64-x86_64-gcc`.
+7. Windows cargo PATH: ninja spawns `cargo` via `cmd.exe` which didn't inherit
+   dtolnay's GITHUB_PATH under MSYS2; prepend `$(cygpath -u $CARGO_HOME)/bin`.
+8. **FFI `stderr` macro collision (real source bug, not just CI):**
+   `char stderr[1024]` in `gui/flacchop.h` collided with MinGW's `stderr` macro
+   (`__acrt_iob_func(2)`). Linux/macOS don't define `stderr` as a macro so they
+   built fine. Renamed the ABI field to `stderr_buf` across `gui/flacchop.h`,
+   `core/src/ffi.rs`, and `gui/mainwindow.cpp`. Verified locally: `cargo test`
+   (5 passed) + local CMake GUI build links clean.
+9. Windows link: Rust std references NT Native API (`NtReadFile`,
+   `NtCreateFile`, `RtlNtStatusToDosError`, ...); added `ntdll` to the CMake
+   Windows link list.
+10. macOS universal codesign: `codesign --deep` and signing framework *bundle
+    dirs* both failed with "bundle format is ambiguous (could be app or
+    framework)" on QtQmlMeta.framework. Re-sign leaf dylibs + each framework's
+    inner `Versions/Current/<name>` binary, then the app bundle.
+
+### Commands run (this session)
+```bash
+# local sanity checks after each source fix
+cd /home/harry/FLAC-Chop
+cargo test --release --manifest-path core/Cargo.toml          # 5 plan tests pass
+cmake -S . -B build-verify -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-verify && rm -rf build-verify
+
+# dispatch CI build (no release)
+gh workflow run build.yml --ref master -f create_release=false
+gh run view <run-id> --json status,conclusion,jobs --jq '...'
+
+# download + verify produced binaries
+gh run download <run-id> -n linux-zip-x86_64 -d lx86
+gh run download <run-id> -n linux-zip-arm64   -d larm
+gh run download <run-id> -n windows-exe       -d win
+file lx86/*.AppImage larm/*.AppImage win/flac-chop.exe
+```
+
+### Verification (hard data)
+Final green run: `29633003940` (all 6 build jobs success, release skipped via
+`create_release=false`). Built from `c714009`, so version string `dev-c714009`.
+
+`file(1)` on the downloaded artifacts:
+```
+lx86/linux_FLAC-Chop_dev-c714009_x86.AppImage:
+  ELF 64-bit LSB pie executable, x86-64, static-pie linked, stripped
+larm/linux_FLAC-Chop_dev-c714009_arm64.AppImage:
+  ELF 64-bit LSB pie executable, ARM aarch64, static-pie linked, stripped
+win/flac-chop.exe:
+  PE32+ executable (console) x86-64, for MS Windows
+```
+
+x86_64 AppImage inner binary (`--appimage-extract usr/bin/flac-chop`):
+```
+ELF 64-bit LSB pie executable, x86-64, dynamically linked,
+interpreter /lib64/ld-linux-x86-64.so.2, stripped
+```
+
+Windows exe DLL imports (objdump): `KERNEL32, msvcrt, ntdll, USERENV, WS2_32,
+Qt6Core, Qt6Gui, Qt6Widgets, bcryptprimitives` — confirms the `ntdll` link fix
+landed and Qt6 DLLs are bundled.
+
+macOS universal DMG (134 MB artifact `macos-app`): the universal job's lipo
+arch check (`lipo -archs ... | grep arm64` AND `grep x86_64`) passed in CI
+before `hdiutil create`, so `macos_FLAC-Chop_dev-c714009_universal.dmg` is a
+verified arm64+x86_64 universal image. (Not downloaded locally — 134 MB; only
+its artifact metadata + CI log assertions were checked.)
+
+Artifact sizes:
+```
+linux-zip-x86_64   24 MB   (AppImage ~26 MB)
+linux-zip-arm64    23 MB   (AppImage ~25 MB)
+windows-exe        13 MB   (flac-chop.exe 5.5 MB + Qt6 DLLs)
+macos-app         134 MB   (universal .dmg)
+```
+
+### Honest caveats
+- These binaries are BUILT and format/arch-verified, NOT runtime-tested. The
+  Linux GUI is the only one the user has actually launched (session 1–3).
+  Running the Windows exe or macOS .app and loading a real RF file is still
+  pending user confirmation.
+- No SoX bundling on any platform — SoX remains a runtime dep the user installs
+  (`apt install sox` / `brew install sox` / SoX for Windows on PATH). The
+  release `body` in build.yml documents this.
+- `cargo test` under CI uses rustc 1.97.1 (runner default), not the 1.87.0
+  noted in the session-1 toolchain block.
+- The `actions/*@v4` steps emit Node.js 20 deprecation warnings (runner
+  force-upgrades to Node 24). Non-blocking; bumping to `@v5` later clears them.
