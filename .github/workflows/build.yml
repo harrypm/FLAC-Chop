@@ -42,13 +42,13 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -81,7 +81,7 @@ jobs:
     needs: cargo-tests
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve build version
         id: version
@@ -120,7 +120,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -193,7 +193,7 @@ jobs:
           test -f "$ZIP_NAME"
 
       - name: Upload Linux ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: linux-zip-${{ matrix.arch }}
           path: linux_FLAC-Chop_*_${{ matrix.artifact_suffix }}.zip
@@ -206,7 +206,7 @@ jobs:
     needs: cargo-tests
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -279,7 +279,7 @@ jobs:
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
       - name: Upload Windows ZIP
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-exe
           path: windows_FLAC-Chop_*_x86.zip
@@ -300,7 +300,7 @@ jobs:
     needs: cargo-tests
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Resolve build version
         id: version
@@ -321,15 +321,24 @@ jobs:
       - name: Install build dependencies
         run: |
           set -eux
+          # The macOS runner image ships an untrusted `aws/tap` that makes
+          # every brew command print a tap-trust warning. We don't use it —
+          # untap it (best-effort) so brew runs clean.
+          brew untap aws/tap 2>/dev/null || true
           brew install cmake ninja qt@6 pkg-config
-          # qt@6 is keg-only; link it so cmake finds it
-          brew link --force qt@6
+          # qt@6 is keg-only; force-link it so cmake finds qmake6 on the brew
+          # prefix. The runner image now ships qt@6 already force-linked, so
+          # guard the link to avoid the "Already linked" warning — only link
+          # when the qmake6 symlink is missing.
+          if [ ! -x "$(brew --prefix)/bin/qmake6" ]; then
+            brew link --force qt@6
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -388,7 +397,7 @@ jobs:
           echo "$BUILD_VERSION" > dist/BUILD_VERSION.txt
 
       - name: Upload macOS architecture stage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-app-stage-${{ matrix.arch }}
           path: |
@@ -402,14 +411,14 @@ jobs:
     needs: macos-app-build
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
       - name: Download arm64 stage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: macos-app-stage-arm64
           path: stage-arm64
       - name: Download x86_64 stage
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: macos-app-stage-x86_64
           path: stage-x86_64
@@ -478,7 +487,7 @@ jobs:
           test -f "$DMG_NAME"
 
       - name: Upload macOS DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: macos-app
           path: macos_FLAC-Chop_*_universal.dmg
@@ -497,12 +506,12 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
 
@@ -528,7 +537,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
