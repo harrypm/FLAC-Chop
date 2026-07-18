@@ -32,6 +32,9 @@ struct FcProbe {
     double msps;
     int32_t msps_known;
     char error[256];
+    // Non-fatal diagnostics (tag-unit corrections, scan misalignment, vorbis
+    // mismatches), "; "-joined. Empty when everything checked out.
+    char warnings[512];
 };
 
 struct FcPlan {

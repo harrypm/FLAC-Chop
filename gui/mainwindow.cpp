@@ -107,6 +107,8 @@ MainWindow::MainWindow(QWidget* parent)
     m_bitsChLabel = new QLabel(QStringLiteral("—"), infoBox);
     m_mspsLabel = new QLabel(QStringLiteral("—"), infoBox);
     m_totalLabel = new QLabel(QStringLiteral("—"), infoBox);
+    m_totalLabel->setWordWrap(true);
+    m_totalLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     infoLay->addRow(tr("Header rate:"), m_headerRateLabel);
     infoLay->addRow(tr("Bits / Channels:"), m_bitsChLabel);
     infoLay->addRow(tr("MSPS (from name):"), m_mspsLabel);
@@ -293,7 +295,15 @@ void MainWindow::onProbeFinished()
     m_syncing = false;
 
     applyCut();
-    m_statusLabel->setText(tr("Probed OK. Type a time + Set IN/OUT, or drag the slider, then Process."));
+    {
+        // Echo non-fatal probe warnings in the status line too, so they're
+        // visible without hovering the total label. Cleared on the next action.
+        const QString warnings = QString::fromUtf8(m_probe.warnings).trimmed();
+        if (!warnings.isEmpty())
+            m_statusLabel->setText(tr("Probed OK (⚠ warnings): %1 — type a time + Set IN/OUT, then Process.").arg(warnings));
+        else
+            m_statusLabel->setText(tr("Probed OK. Type a time + Set IN/OUT, or drag the slider, then Process."));
+    }
     setControlsEnabled(true);
 }
 
@@ -411,6 +421,8 @@ void MainWindow::setProbeInfo()
         m_bitsChLabel->setText(QStringLiteral("—"));
         m_mspsLabel->setText(QStringLiteral("—"));
         m_totalLabel->setText(QStringLiteral("—"));
+        m_totalLabel->setToolTip(QString());
+        m_totalLabel->setStyleSheet(QString());
         return;
     }
     m_headerRateLabel->setText(tr("%1 Hz (header)").arg(m_probe.header_sample_rate));
@@ -453,6 +465,19 @@ void MainWindow::setProbeInfo()
         m_totalSec = 0.0;
         m_sliderMaxDs = 0;
         m_totalLabel->setText(tr("unknown (no STREAMINFO total)"));
+    }
+
+    // Surface non-fatal probe diagnostics (tag-unit corrections, scan
+    // misalignment, vorbis self-consistency mismatches). Append a ⚠ marker
+    // to the total label, put the full text in the tooltip, and tint it so
+    // it's noticed. Empty when everything checked out.
+    const QString warnings = QString::fromUtf8(m_probe.warnings).trimmed();
+    if (!warnings.isEmpty()) {
+        m_totalLabel->setText(m_totalLabel->text() + QStringLiteral("  ⚠ ") + warnings);
+        m_totalLabel->setToolTip(tr("Probe warnings:\n%1").arg(warnings));
+        m_totalLabel->setStyleSheet("color:#e8a040;");
+    } else {
+        m_totalLabel->setToolTip(QString());
     }
 }
 
