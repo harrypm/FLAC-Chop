@@ -444,8 +444,18 @@ jobs:
           # framework)".
           find "dist/FLAC-Chop.app" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
             | while IFS= read -r -d "" f; do codesign --force --sign - "$f"; done
-          find "dist/FLAC-Chop.app" -type d -name "*.framework" -print0 \
-            | while IFS= read -r -d "" f; do codesign --force --sign - "$f"; done
+          find "dist/FLAC-Chop.app/Contents/Frameworks" -maxdepth 1 -name "*.framework" -type d -print0 \
+            | while IFS= read -r -d "" fw; do
+                name="$(basename "$fw" .framework)"
+                bin="$fw/Versions/Current/$name"
+                # Sign the framework executable directly. Signing the
+                # .framework bundle dir fails on some Qt6 frameworks with
+                # "bundle format is ambiguous"; signing the inner binary
+                # avoids that check. Skip data-only frameworks (no binary).
+                if [ -f "$bin" ]; then
+                  codesign --force --sign - "$bin"
+                fi
+              done
           codesign --force --sign - "dist/FLAC-Chop.app"
 
           # Verify both arches are present.

@@ -246,7 +246,7 @@ pub extern "C" fn fc_plan(
 pub struct FcChopResult {
     pub ok: i32,
     pub exit_code: i32,
-    pub stderr: [c_char; 1024],
+    pub stderr_buf: [c_char; 1024],
 }
 
 impl Default for FcChopResult {
@@ -254,7 +254,7 @@ impl Default for FcChopResult {
         Self {
             ok: 0,
             exit_code: -1,
-            stderr: [0; 1024],
+            stderr_buf: [0; 1024],
         }
     }
 }
@@ -276,20 +276,20 @@ pub extern "C" fn fc_chop(
         *out = FcChopResult::default();
 
         if in_path.is_null() || out_path.is_null() {
-            set_str(&mut out.stderr, "null path");
+            set_str(&mut out.stderr_buf, "null path");
             return;
         }
         let i = match CStr::from_ptr(in_path).to_str() {
             Ok(s) => s,
             Err(_) => {
-                set_str(&mut out.stderr, "input path is not valid UTF-8");
+                set_str(&mut out.stderr_buf, "input path is not valid UTF-8");
                 return;
             }
         };
         let o = match CStr::from_ptr(out_path).to_str() {
             Ok(s) => s,
             Err(_) => {
-                set_str(&mut out.stderr, "output path is not valid UTF-8");
+                set_str(&mut out.stderr_buf, "output path is not valid UTF-8");
                 return;
             }
         };
@@ -297,7 +297,7 @@ pub extern "C" fn fc_chop(
         let r = chop::chop(i, o, start_samples, length_samples);
         out.ok = if r.ok { 1 } else { 0 };
         out.exit_code = r.exit_code;
-        set_str(&mut out.stderr, &r.stderr);
+        set_str(&mut out.stderr_buf, &r.stderr);
     }
 }
 

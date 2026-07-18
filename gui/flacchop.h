@@ -47,7 +47,7 @@ struct FcPlan {
 struct FcChopResult {
     int32_t ok;
     int32_t exit_code;
-    char stderr[1024];
+    char stderr_buf[1024];
 };
 
 void fc_probe(const char* path, FcProbe* out);

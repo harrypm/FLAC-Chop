@@ -553,7 +553,7 @@ void MainWindow::onChopFinished()
     if (r.ok) {
         m_statusLabel->setText(tr("Done. Output: %1").arg(m_outPath));
     } else {
-        QString err = QString::fromUtf8(r.stderr).trimmed();
+        QString err = QString::fromUtf8(r.stderr_buf).trimmed();
         if (err.isEmpty())
             err = tr("(no stderr) sox exit code %1").arg(r.exit_code);
         m_statusLabel->setText(tr("FAILED (exit %1): %2").arg(r.exit_code).arg(err));
