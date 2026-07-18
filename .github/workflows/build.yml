@@ -250,9 +250,15 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          # cargo/rustc are on PATH via dtolnay/rust-toolchain (GITHUB_PATH);
-          # do NOT `source ~/.cargo/env` here: that env lives in the Windows
-          # user profile, while MSYS2 ~ resolves to /home/runneradmin.
+          # cargo/rustc are installed by dtolnay/rust-toolchain into the Windows
+          # CARGO_HOME (C:\Users\runneradmin\.cargo). The cmake custom command
+          # runs `cargo build` via cmd.exe (spawned by ninja), which does NOT
+          # inherit dtolnay's GITHUB_PATH under the MSYS2 shell, so cargo is not
+          # found. Convert CARGO_HOME to an MSYS2 path and prepend its bin so
+          # cargo resolves both in bash and in the cmd.exe child (MSYS2 converts
+          # the POSIX PATH back to Windows for native children).
+          export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
+          cargo --version
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
@@ -431,7 +437,16 @@ jobs:
           done < <(cd stage-arm64 && find FLAC-Chop.app -type f | sort)
           chmod +x dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop
 
-          codesign --force --deep --sign - dist/FLAC-Chop.app
+          # lipo-merging invalidates the per-arch code signatures that
+          # macdeployqt applied. Re-sign leaf code (dylibs/so + frameworks)
+          # then the bundle. Avoid `codesign --deep`: it fails on the Qt
+          # frameworks with "bundle format is ambiguous (could be app or
+          # framework)".
+          find "dist/FLAC-Chop.app" -type f \( -name "*.dylib" -o -name "*.so" \) -print0 \
+            | while IFS= read -r -d "" f; do codesign --force --sign - "$f"; done
+          find "dist/FLAC-Chop.app" -type d -name "*.framework" -print0 \
+            | while IFS= read -r -d "" f; do codesign --force --sign - "$f"; done
+          codesign --force --sign - "dist/FLAC-Chop.app"
 
           # Verify both arches are present.
           LIPO_ARCHS="$(lipo -archs dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop)"
