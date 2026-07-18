@@ -95,9 +95,12 @@ cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.f
 The CLIs run the exact same probe → plan → SoX path as the GUI.
 
 ## Status & limitations
-- The GUI has been launched and confirmed on **Linux** only. The Windows and
+- The GUI has been launched and confirmed on **Linux** and on **Windows x86_64**
+  (the MinGW-runtime-DLL bundling step in `.github/workflows/build.yml` makes the
+  CI-built exe start without a missing-DLL error). The **Windows arm64** and
   macOS binaries are built by CI and verified as well-formed for their target
-  architecture, but have **not** been runtime-tested yet — feedback welcome.
+  architecture (arm64 PE Machine 0xAA64), but have **not** been runtime-tested
+  yet — feedback welcome.
 - No progress percentage during a cut (SoX doesn't emit sample progress to a
   captured pipe easily); the GUI shows a busy indicator instead.
 - The cut is at the input sample rate. Decimation is a decode-side concern and

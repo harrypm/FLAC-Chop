@@ -565,18 +565,39 @@ zipped at C:\Users\Harry\fc-restore-points\2026-07-18_windows-x86_64-runtime-fix
 (working dist + changed source + this log).
 
 ### Honest caveats
-- arm64 NOT verified: no arm64 machine locally. The `windows-arm64` job is
-  implemented but needs a CI run (or an arm64 device) to confirm it builds and
-  the exe runs. Risks to watch on first CI run: `windows-11-arm` runner
-  availability/queue; setup-msys2 CLANGARM64 on an arm64 host; whether
-  `dtolnay/rust-toolchain` accepts `toolchain: stable-aarch64-pc-windows-gnullvm`
-  and the gnullvm rustc/cargo run under the CLANGARM64 shell PATH; whether the
-  gnullvm Rust std's link deps are fully covered by the CMakeLists Windows lib
-  list (ws2_32/advapi32/userenv/bcrypt/ntdll — same as x86_64).
+- arm64 CI-VERIFIED green on the first run (windows-11-arm + CLANGARM64 +
+  gnullvm Rust linked cleanly, no iteration needed; see "CI verification" below).
+  Still NOT runtime-tested on an arm64 device — only arch + dep-bundling
+  verified. The risks flagged below (runner availability, dtolnay gnullvm
+  toolchain spec, gnullvm link deps) did NOT materialize.
 - The x86_64 run-test confirmed the GUI STARTS. An end-to-end cut (Process →
   sox trim) still needs SoX on PATH + a real RF file; not re-tested here.
 - x86_64 dist grew: root ~82 MB uncompressed (dominated by libicudt78 ~32 MB),
   so the zip is now ~35-40 MB (was ~14 MB when it was broken/missing DLLs).
   Exact compressed size to be confirmed from the CI artifact.
-- No commit pushed yet; changes are in the working tree (branch name set:
-  fix/windows-x86_64-runtime-and-arm64, uncommitted).
+- Committed as 22751a8 on fix/windows-x86_64-runtime-and-arm64, pushed to
+  origin, and verified via CI run 29641872959 (create_release=false) — see
+  "CI verification (hard data)" below.
+
+### CI verification (hard data)
+Dispatched build.yml on fix/windows-x86_64-runtime-and-arm64 (run 29641872959,
+create_release=false). Result: run completed success; all 8 build jobs green
+(Cargo tests, Windows EXE x86_64, Windows EXE arm64, macOS APP arm64/x86_64/
+universal, Linux AppImage arm64/x86_64); Publish release assets correctly
+skipped.
+
+Downloaded both Windows artifacts (gh run download 29641872959) and inspected:
+- windows-exe (x86_64): flac-chop.exe PE Machine 0x8664 (x86-64); 32 root
+  DLLs = the 28 MinGW/third-party runtime DLLs + 4 Qt6 — matches the local
+  build exactly. The fix landed on CI.
+- windows-exe-arm64 (arm64): flac-chop.exe PE Machine 0xAA64 (a genuine
+  aarch64 Windows PE); 25 root DLLs bundled, including libc++.dll (the
+  LLVM-mingw C++ runtime — CLANGARM64 uses libc++, not libstdc++) plus
+  ICU/freetype/harfbuzz/glib/pcre2/zlib/zstd/brotli. The fixpoint ldd-walk
+  captured the arm64 dep tree (which differs from x86_64: no
+  libgcc_s/libwinpthread/libstdc++-6; libc++.dll instead) correctly.
+
+arm64 is CI-built + arch/dep-verified but NOT runtime-tested on an arm64
+device locally. The windows-11-arm runner provisioned with no queue issue;
+the dtolnay stable-aarch64-pc-windows-gnullvm toolchain + CLANGARM64 Qt6
+linked cleanly on the first run.
