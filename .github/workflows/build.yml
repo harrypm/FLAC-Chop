@@ -139,6 +139,9 @@ jobs:
         env:
           BUILD_VERSION: ${{ steps.version.outputs.version }}
           LINUXDEPLOY_ARCH: ${{ matrix.linuxdeploy_arch }}
+          # ubuntu-22.04's default `qmake` on PATH is Qt5; point the linuxdeploy
+          # Qt plugin at Qt6's qmake6 so it bundles Qt6 (not Qt5) libraries.
+          QMAKE: /usr/bin/qmake6
         run: |
           set -eux
           mkdir -p AppDir/usr/bin
@@ -155,9 +158,10 @@ jobs:
           StartupNotify=true
           EOF
 
-          # Minimal placeholder icon (a 512x512 PNG) so linuxdeploy has one.
-          # A real icon can be dropped in later.
-          printf '\x89PNG\r\n\x1a\n' > AppDir/flac-chop.png
+          # Minimal valid 1x1 transparent PNG icon so linuxdeploy has one.
+          # Replace with a real 512x512 icon when one is available.
+          printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==' \
+            | base64 -d > AppDir/flac-chop.png
 
           cat > AppDir/AppRun <<'EOF'
           #!/usr/bin/env bash
@@ -244,9 +248,12 @@ jobs:
           # MSYS2 resolves to /home/runneradmin, so `source ~/.cargo/env` fails.
           export CARGO_HOME="$HOME/.cargo"
           export RUSTUP_HOME="$HOME/.rustup"
+          # Pass the full toolchain spec (stable-x86_64-pc-windows-gnu) to
+          # --default-toolchain so the gnu toolchain is installed as default.
+          # Do NOT use --default-host: the rustup-init shim already injects it
+          # and passing it again triggers "cannot be used multiple times".
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal \
-                 --default-host x86_64-pc-windows-gnu
+            | sh -s -- -y --profile minimal --default-toolchain stable-x86_64-pc-windows-gnu
           source "$CARGO_HOME/env"
           rustup default stable-x86_64-pc-windows-gnu
 
