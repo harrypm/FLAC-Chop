@@ -10,9 +10,6 @@ files: the RF "20 kHz header = 20 MSPS real" convention, the 36-bit
 `total_samples` wrap that long captures hit, and unfinalized/piped captures
 whose FLAC header total is unknown.
 
-<img width="743" height="686" alt="Screenshot from 2026-07-11 05-42-59" src="https://github.com/user-attachments/assets/475a3359-25fd-415d-b662-0b70e896599c" />
-
-
 ## Features
 - Real-time HH:MM:SS duration for RF captures, not the 1000×-wrong header value.
 - Handles `total_samples` wrapping past 2³⁶ (recovers the true sample count).
