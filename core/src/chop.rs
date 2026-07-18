@@ -57,7 +57,9 @@ pub fn sox_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Build a sibling output path: `<dir>/<stem>-cut.<ext>` (ext defaults to flac).
+/// Build a sibling output path: `<dir>/<stem>-cut.<ext>` (ext defaults to
+/// flac). If that file already exists, `-cut-2`, `-cut-3`, … are tried so an
+/// earlier cut is never silently overwritten by SoX.
 pub fn generate_output_path(in_path: &str) -> Option<String> {
     let p = Path::new(in_path);
     let stem = p.file_stem()?.to_str()?;
@@ -66,7 +68,12 @@ pub fn generate_output_path(in_path: &str) -> Option<String> {
         Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
         _ => PathBuf::from("."),
     };
-    let out = parent.join(format!("{}-cut.{}", stem, ext));
+    let mut out = parent.join(format!("{}-cut.{}", stem, ext));
+    let mut n = 2u32;
+    while out.exists() && n < 10_000 {
+        out = parent.join(format!("{}-cut-{}.{}", stem, n, ext));
+        n += 1;
+    }
     Some(out.to_string_lossy().into_owned())
 }
 
@@ -101,5 +108,21 @@ mod tests {
         assert_eq!(p, expected);
         // And it must always end with the stem-cut.flac regardless of platform.
         assert!(p.ends_with("local-cut.flac"));
+    }
+
+    #[test]
+    fn output_path_avoids_clobbering_existing_cut() {
+        let dir = std::env::temp_dir().join("fc_test_chop");
+        let _ = std::fs::create_dir_all(&dir);
+        let input = dir.join("tape.flac");
+        std::fs::write(&input, b"").unwrap();
+        // First call: no existing cut → plain -cut.flac.
+        let first = generate_output_path(input.to_str().unwrap()).unwrap();
+        assert!(first.ends_with("tape-cut.flac"));
+        // Simulate an existing previous cut → must pick -cut-2.flac.
+        std::fs::write(&first, b"").unwrap();
+        let second = generate_output_path(input.to_str().unwrap()).unwrap();
+        assert!(second.ends_with("tape-cut-2.flac"), "got {second}");
+        let _ = std::fs::remove_file(&first);
     }
 }

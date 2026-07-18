@@ -16,6 +16,18 @@
 //! three are self-consistent and cross-checkable. We prefer `RF_TOTAL_SAMPLES`
 //! (exact integer count) over `DURATION_SECONDS` (float, rounding) for the
 //! sample count, and use `RF_SAMPLE_RATE` to confirm the RF /1000 intent.
+//!
+//! ## Units caveat (important)
+//!
+//! In the early tag schema shown above, `RF_SAMPLE_RATE` is the /1000 "kHz"
+//! header value (20000), and therefore `RF_TOTAL_SAMPLES` is a count *at that
+//! rate* — i.e. the on-disk sample count divided by 1000 (a 4403.98 s capture
+//! at 20 MSPS holds ~88 *billion* samples on disk, not 88 million). In the
+//! later schema `RF_SAMPLE_RATE` holds the real Hz value (20000000) and
+//! `RF_TOTAL_SAMPLES` is the true on-disk count. This module returns the raw
+//! tag values; [`crate::probe`] detects which schema is in play (rate < 1 MHz
+//! ⇒ /1000 schema) and rescales both to on-disk units, cross-checking the
+//! result against the compressed payload size.
 
 use claxon::{FlacReader, FlacReaderOptions};
 use std::fs::File;
@@ -46,6 +58,17 @@ fn tag_f64(reader: &FlacReader<File>, name: &str) -> Option<f64> {
     reader.get_tag(name).next().and_then(|v| v.parse::<f64>().ok())
 }
 
+/// Read the RF metadata tags out of an already-open claxon reader (which must
+/// have been created with `read_vorbis_comment: true`). Lets the probe reuse
+/// its own STREAMINFO reader instead of opening and re-parsing the file.
+pub fn rf_tags_from_reader(reader: &FlacReader<File>) -> RfTags {
+    RfTags {
+        total_samples: tag_u64(reader, "RF_TOTAL_SAMPLES"),
+        sample_rate: tag_u64(reader, "RF_SAMPLE_RATE"),
+        duration_seconds: tag_f64(reader, "DURATION_SECONDS"),
+    }
+}
+
 /// Open `path` and read the RF metadata Vorbis comment tags. Returns an empty
 /// `RfTags` (all `None`) if the file can't be opened, isn't FLAC, or has no
 /// Vorbis comment — the caller falls back to other sources. Reads only the
@@ -64,11 +87,7 @@ pub fn read_rf_tags(path: &Path) -> RfTags {
         Ok(r) => r,
         Err(_) => return RfTags::default(),
     };
-    RfTags {
-        total_samples: tag_u64(&reader, "RF_TOTAL_SAMPLES"),
-        sample_rate: tag_u64(&reader, "RF_SAMPLE_RATE"),
-        duration_seconds: tag_f64(&reader, "DURATION_SECONDS"),
-    }
+    rf_tags_from_reader(&reader)
 }
 
 #[cfg(test)]

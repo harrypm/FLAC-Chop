@@ -12,16 +12,36 @@ use std::ptr;
 use crate::{chop, msps, probe};
 
 /// Copy `s` (truncated) into a NUL-terminated fixed `[c_char; N]` buffer.
+/// If truncation is needed, it backs off to a UTF-8 character boundary so the
+/// C++ side never receives a half character (QString::fromUtf8 would render a
+/// replacement glyph).
 fn set_str(buf: &mut [c_char], s: &str) {
     if buf.is_empty() {
         return;
     }
     let bytes = s.as_bytes();
-    let n = bytes.len().min(buf.len() - 1);
+    let mut n = bytes.len().min(buf.len() - 1);
+    if n < bytes.len() {
+        // Truncated: step back past any continuation bytes (10xxxxxx).
+        while n > 0 && (bytes[n] & 0b1100_0000) == 0b1000_0000 {
+            n -= 1;
+        }
+    }
     for (i, b) in bytes[..n].iter().enumerate() {
         buf[i] = *b as c_char;
     }
     buf[n] = 0;
+}
+
+/// Format a caught panic payload into a short message.
+fn panic_msg(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown cause".to_string()
+    }
 }
 
 #[repr(C)]
@@ -56,6 +76,11 @@ pub struct FcProbe {
     pub msps: f64,
     pub msps_known: i32,
     pub error: [c_char; 256],
+    /// Non-fatal diagnostics (tag-unit corrections, scan misalignment, vorbis
+    /// mismatches), "; "-joined. Empty when everything checked out. NOTE: this
+    /// field was appended to the struct — the C header (flacchop.h) must be
+    /// regenerated to match before the GUI links against this build.
+    pub warnings: [c_char; 512],
 }
 
 impl Default for FcProbe {
@@ -81,6 +106,7 @@ impl Default for FcProbe {
             msps: 0.0,
             msps_known: 0,
             error: [0; 256],
+            warnings: [0; 512],
         }
     }
 }
@@ -105,13 +131,7 @@ pub extern "C" fn fc_probe(path: *const c_char, out: *mut FcProbe) {
             fc_probe_impl(path, out)
         }));
         if let Err(payload) = result {
-            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "probe panicked (unknown cause)".to_string()
-            };
+            let msg = panic_msg(payload);
             set_str(&mut out.error, &format!("probe panicked: {msg}"));
         }
     }
@@ -143,11 +163,11 @@ fn fc_probe_impl(path: *const c_char, out: &mut FcProbe) {
     out.total_samples_known = if res.total_samples_known { 1 } else { 0 };
     out.total_samples_wraps = res.total_samples_wraps;
     out.total_samples_estimated = if res.total_samples_estimated { 1 } else { 0 };
-        out.total_samples_scanned = if res.total_samples_scanned { 1 } else { 0 };
-        out.total_samples_from_companion = if res.total_samples_from_companion { 1 } else { 0 };
-        out.total_samples_from_vorbis = if res.total_samples_from_vorbis { 1 } else { 0 };
-        out.rate_from_vorbis = if res.rate_from_vorbis { 1 } else { 0 };
-        out.bits_per_sample = res.bits_per_sample;
+    out.total_samples_scanned = if res.total_samples_scanned { 1 } else { 0 };
+    out.total_samples_from_companion = if res.total_samples_from_companion { 1 } else { 0 };
+    out.total_samples_from_vorbis = if res.total_samples_from_vorbis { 1 } else { 0 };
+    out.rate_from_vorbis = if res.rate_from_vorbis { 1 } else { 0 };
+    out.bits_per_sample = res.bits_per_sample;
     out.channels = res.channels;
     out.file_size = res.file_size;
     out.audio_offset = res.audio_offset;
@@ -157,6 +177,7 @@ fn fc_probe_impl(path: *const c_char, out: &mut FcProbe) {
         out.msps = m;
         out.msps_known = 1;
     }
+    set_str(&mut out.warnings, &res.warnings);
 }
 
 #[repr(C)]
@@ -204,42 +225,68 @@ pub extern "C" fn fc_plan(
         let out = &mut *out;
         *out = FcPlan::default();
 
-        let real_rate = real_rate_hz;
-        if !(real_rate > 0.0) {
-            set_str(&mut out.error, "sample rate is zero");
-            return;
+        // Guard against panics: like fc_probe, this runs on a C++ thread
+        // where a Rust panic cannot unwind and would abort the process.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fc_plan_impl(start_sec, len_sec, real_rate_hz, total_samples, total_known, out)
+        }));
+        if let Err(payload) = result {
+            let msg = panic_msg(payload);
+            set_str(&mut out.error, &format!("plan panicked: {msg}"));
+            out.ok = 0;
         }
-        if len_sec <= 0.0 {
-            set_str(&mut out.error, "length must be > 0");
-            return;
-        }
-        if start_sec < 0.0 {
-            set_str(&mut out.error, "start must be >= 0");
-            return;
-        }
-
-        let mut start_s = (start_sec * real_rate).round() as u64;
-        let mut len_s = (len_sec * real_rate).round() as u64;
-
-        if total_known != 0 {
-            out.real_total_seconds = total_samples as f64 / real_rate;
-            if start_s > total_samples {
-                start_s = total_samples;
-            }
-            if start_s + len_s > total_samples {
-                len_s = total_samples.saturating_sub(start_s);
-            }
-        }
-        if len_s == 0 {
-            len_s = 1;
-        }
-
-        out.start_samples = start_s;
-        out.length_samples = len_s;
-        out.end_sample = start_s.saturating_add(len_s);
-        out.real_sample_rate_hz = real_rate;
-        out.ok = 1;
     }
+}
+
+fn fc_plan_impl(
+    start_sec: f64,
+    len_sec: f64,
+    real_rate_hz: f64,
+    total_samples: u64,
+    total_known: i32,
+    out: &mut FcPlan,
+) {
+    let real_rate = real_rate_hz;
+    if !real_rate.is_finite() || !(real_rate > 0.0) {
+        set_str(&mut out.error, "sample rate is zero or invalid");
+        return;
+    }
+    if !len_sec.is_finite() || len_sec <= 0.0 {
+        set_str(&mut out.error, "length must be > 0");
+        return;
+    }
+    if !start_sec.is_finite() || start_sec < 0.0 {
+        set_str(&mut out.error, "start must be >= 0");
+        return;
+    }
+
+    let start_s = (start_sec * real_rate).round() as u64;
+    let mut len_s = (len_sec * real_rate).round() as u64;
+
+    if total_known != 0 {
+        out.real_total_seconds = total_samples as f64 / real_rate;
+        // A start at or past the end of the file cannot yield a valid cut;
+        // report it instead of silently producing a degenerate 1-sample cut
+        // past EOF (the previous behavior).
+        if start_s >= total_samples {
+            set_str(&mut out.error, "start is at or past the end of the file");
+            return;
+        }
+        if start_s + len_s > total_samples {
+            len_s = total_samples - start_s; // start_s < total_samples here
+        }
+    }
+    if len_s == 0 {
+        // Sub-sample length request rounded to zero; cut a single sample.
+        // (Guaranteed in-bounds: start_s < total_samples when total is known.)
+        len_s = 1;
+    }
+
+    out.start_samples = start_s;
+    out.length_samples = len_s;
+    out.end_sample = start_s.saturating_add(len_s);
+    out.real_sample_rate_hz = real_rate;
+    out.ok = 1;
 }
 
 #[repr(C)]
@@ -275,6 +322,27 @@ pub extern "C" fn fc_chop(
         let out = &mut *out;
         *out = FcChopResult::default();
 
+        // Guard against panics on the C++ worker thread (same rationale as
+        // fc_probe/fc_plan: an uncaught Rust panic there aborts the process).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fc_chop_impl(in_path, out_path, start_samples, length_samples, out)
+        }));
+        if let Err(payload) = result {
+            let msg = panic_msg(payload);
+            set_str(&mut out.stderr_buf, &format!("chop panicked: {msg}"));
+            out.ok = 0;
+        }
+    }
+}
+
+fn fc_chop_impl(
+    in_path: *const c_char,
+    out_path: *const c_char,
+    start_samples: u64,
+    length_samples: u64,
+    out: &mut FcChopResult,
+) {
+    unsafe {
         if in_path.is_null() || out_path.is_null() {
             set_str(&mut out.stderr_buf, "null path");
             return;
@@ -338,5 +406,76 @@ pub extern "C" fn fc_sox_available() -> i32 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cbuf_to_string(buf: &[c_char]) -> String {
+        let bytes: Vec<u8> = buf.iter().take_while(|&&c| c != 0).map(|&c| c as u8).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn plan_basic_20msps() {
+        let mut out = FcPlan::default();
+        // 10 s at 20 MSPS out of a 200 s file — the validated reference case.
+        fc_plan(60.0, 10.0, 20_000_000.0, 4_000_000_000, 1, &mut out);
+        assert_eq!(out.ok, 1, "{}", cbuf_to_string(&out.error));
+        assert_eq!(out.start_samples, 1_200_000_000);
+        assert_eq!(out.length_samples, 200_000_000);
+        assert_eq!(out.end_sample, 1_400_000_000);
+    }
+
+    #[test]
+    fn plan_clamps_length_to_eof() {
+        let mut out = FcPlan::default();
+        fc_plan(9.0, 5.0, 1000.0, 10_000, 1, &mut out);
+        assert_eq!(out.ok, 1);
+        assert_eq!(out.start_samples, 9_000);
+        assert_eq!(out.length_samples, 1_000); // clamped to the file end
+    }
+
+    #[test]
+    fn plan_start_past_eof_is_an_error_not_a_one_sample_cut() {
+        // Previously this clamped start to EOF and then forced len to 1,
+        // asking SoX for a cut past the end of the file.
+        let mut out = FcPlan::default();
+        fc_plan(20.0, 5.0, 1000.0, 10_000, 1, &mut out);
+        assert_eq!(out.ok, 0);
+        assert!(cbuf_to_string(&out.error).contains("end of the file"));
+        // Exactly at EOF is also an empty cut → error.
+        let mut out2 = FcPlan::default();
+        fc_plan(10.0, 5.0, 1000.0, 10_000, 1, &mut out2);
+        assert_eq!(out2.ok, 0);
+    }
+
+    #[test]
+    fn plan_rejects_non_finite_inputs() {
+        let mut out = FcPlan::default();
+        fc_plan(f64::NAN, 5.0, 1000.0, 10_000, 1, &mut out);
+        assert_eq!(out.ok, 0);
+        let mut out2 = FcPlan::default();
+        fc_plan(0.0, f64::INFINITY, 1000.0, 10_000, 1, &mut out2);
+        assert_eq!(out2.ok, 0);
+    }
+
+    #[test]
+    fn set_str_truncates_on_char_boundary() {
+        // "ééé…" in a 4-byte buffer (3 usable): must keep exactly one 2-byte
+        // 'é', never a dangling half character.
+        let mut buf = [0 as c_char; 4];
+        set_str(&mut buf, "ééé");
+        let s = cbuf_to_string(&buf);
+        assert_eq!(s, "é");
+    }
+
+    #[test]
+    fn set_str_no_truncation_untouched() {
+        let mut buf = [0 as c_char; 16];
+        set_str(&mut buf, "hello");
+        assert_eq!(cbuf_to_string(&buf), "hello");
     }
 }

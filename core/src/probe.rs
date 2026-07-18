@@ -38,6 +38,10 @@ pub const FLAC_TOTAL_SAMPLES_FIELD_MOD: u64 = 1 << 36; // 68_719_476_736
 pub struct ProbeResult {
     pub ok: bool,
     pub error: String,
+    /// Non-fatal diagnostics accumulated during the probe (tag-unit
+    /// corrections, scan misalignment, vorbis self-consistency mismatches).
+    /// Empty when everything checked out. Also echoed to stderr for the CLIs.
+    pub warnings: String,
     /// Sample rate as stored in the FLAC STREAMINFO (e.g. 20000 for a 20 MSPS
     /// RF capture that divides the real rate by 1000).
     pub header_sample_rate: u64,
@@ -93,6 +97,7 @@ impl Default for ProbeResult {
         Self {
             ok: false,
             error: String::new(),
+            warnings: String::new(),
             header_sample_rate: 0,
             declared_total_samples: 0,
             total_samples: 0,
@@ -111,6 +116,15 @@ impl Default for ProbeResult {
             is_rf: false,
         }
     }
+}
+
+/// Append a non-fatal warning to the result and echo it to stderr (for CLIs).
+fn add_warning(r: &mut ProbeResult, msg: &str) {
+    eprintln!("[probe] WARNING: {msg}");
+    if !r.warnings.is_empty() {
+        r.warnings.push_str("; ");
+    }
+    r.warnings.push_str(msg);
 }
 
 /// Walk the FLAC metadata block headers from the start of `file` and return the
@@ -346,11 +360,22 @@ fn count_samples_by_scanning(
         .map_err(|e| e.to_string())?;
 
     const CHUNK: usize = 8 << 20; // 8 MiB — fewer syscalls on slow disks
+    const TAIL: usize = 64; // carried unprocessed tail (a header is <= 17)
     const SOFT_EOF_AFTER: u64 = 4 * 1024 * 1024; // 4 MiB seed-fallback window
     let min_frame_skip = min_frame_size.map(|f| f as usize).unwrap_or(0);
-    let mut buf = vec![0u8; CHUNK];
-    let mut carry: Vec<u8> = Vec::new();
-    let mut running: u64 = 0;       // sum of block sizes (also = expected sample no. for variable)
+    // One persistent window buffer, reused across chunks: the <=64-byte tail is
+    // moved to the front and the next chunk is read in after it. This avoids
+    // the previous per-chunk 8 MiB allocation + full memcpy (a 115 GB scan did
+    // ~14k of those, copying every byte twice).
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + TAIL);
+    // `running` tracks the expected next sample number for variable-blocksize
+    // streams (it is seeded from the first frame's number on a mid-stream
+    // cut). `counted` is the actual number of samples observed — the two only
+    // differ when the seed number is non-zero, and `counted` is what we
+    // return. (Previously `running` was returned, which over-reported a
+    // mid-stream file's length by its seed offset.)
+    let mut running: u64 = 0;
+    let mut counted: u64 = 0;
     let mut frame_index: u64 = 0;   // expected frame number for fixed-blocksize
     let mut seeded = false;         // have we accepted the first frame yet?
     let mut strict = true;          // require sequential frame/sample numbers
@@ -358,11 +383,11 @@ fn count_samples_by_scanning(
     let mut frames_found: u64 = 0;
 
     loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        let tail_len = window.len();
+        window.resize(tail_len + CHUNK, 0);
+        let n = file.read(&mut window[tail_len..]).map_err(|e| e.to_string())?;
+        window.truncate(tail_len + n);
         let eof = n == 0;
-        let mut window: Vec<u8> = Vec::with_capacity(carry.len() + n);
-        window.extend_from_slice(&carry);
-        window.extend_from_slice(&buf[..n]);
 
         let mut i = 0usize;
         while i + 1 < window.len() {
@@ -391,6 +416,7 @@ fn count_samples_by_scanning(
                             continue;
                         }
                         running = running.saturating_add(block_size as u64);
+                        counted = counted.saturating_add(block_size as u64);
                         frame_index = frame_index.saturating_add(1);
                         seeded = true;
                         strict = true; // subsequent frames must be sequential
@@ -426,21 +452,36 @@ fn count_samples_by_scanning(
             strict = false;
         }
 
-        // Keep an unprocessed tail, capped at 64 bytes (a header is <= 17), so
-        // candidates split across chunk boundaries survive. Bytes before `i`
-        // are fully processed (any accepted frame is before `i`, so no double-
-        // count); the tail is unprocessed. Clamp `i` to the window length first:
-        // the min_frame_size skip can jump `i` past the end of the window.
-        let keep_from = i.min(window.len()).max(window.len().saturating_sub(64));
-        carry = window[keep_from..].to_vec();
+        if i >= window.len() {
+            // The min_frame_size skip jumped past the buffered data: the
+            // remainder of the skip applies to bytes not yet read, so seek
+            // forward instead of reading and re-scanning them. (Previously the
+            // overshoot was silently dropped, so the skip was truncated at
+            // every chunk boundary.)
+            let overshoot = (i - window.len()) as u64;
+            if overshoot > 0 {
+                file.seek(SeekFrom::Current(overshoot as i64))
+                    .map_err(|e| e.to_string())?;
+            }
+            window.clear();
+        } else {
+            // Keep an unprocessed tail, capped at TAIL bytes, so candidates
+            // split across chunk boundaries survive. Bytes before `i` are
+            // fully processed (any accepted frame is before `i`, so no
+            // double-count); the tail is unprocessed.
+            let keep_from = i.max(window.len().saturating_sub(TAIL));
+            window.copy_within(keep_from.., 0);
+            let keep_len = window.len() - keep_from;
+            window.truncate(keep_len);
+        }
     }
 
     eprintln!(
         "[probe] scan done: frames_found={}, samples={}, min_frame_size={:?}",
-        frames_found, running, min_frame_size
+        frames_found, counted, min_frame_size
     );
 
-    Ok(running)
+    Ok(counted)
 }
 
 /// Decide whether the declared `total_samples` can be trusted, and if not,
@@ -560,11 +601,13 @@ pub fn probe(path: &Path) -> ProbeResult {
     };
     r.audio_offset = audio_offset;
 
-    // metadata_only + skip vorbis comment => claxon returns as soon as the
-    // mandatory STREAMINFO block has been parsed.
+    // metadata_only + read_vorbis_comment => claxon parses the metadata blocks
+    // (STREAMINFO + Vorbis comment) and stops before any audio frame. Reading
+    // the comment here lets us pull the RF tags from this same reader instead
+    // of opening and re-parsing the file a second time.
     let opts = FlacReaderOptions {
         metadata_only: true,
-        read_vorbis_comment: false,
+        read_vorbis_comment: true,
     };
     let reader = match FlacReader::new_ext(file, opts) {
         Ok(rd) => rd,
@@ -585,22 +628,37 @@ pub fn probe(path: &Path) -> ProbeResult {
     // These are the capture tool's authoritative in-file record and beat every
     // other source. The tags are self-consistent by construction:
     //   RF_TOTAL_SAMPLES / RF_SAMPLE_RATE = DURATION_SECONDS
-    // The pipeline has used two tag schemas: an early one where RF_SAMPLE_RATE
-    // held the /1000 kHz value (20000) and a later one where it holds the real
-    // Hz value (20000000, with RF_SAMPLE_RATE_KHZ for the /1000 value). Either
-    // way, dividing RF_TOTAL_SAMPLES by RF_SAMPLE_RATE gives the correct real
-    // duration, so we use RF_SAMPLE_RATE directly as the real rate — no ×1000
-    // assumption. The ×1000 RF convention only applies to files WITHOUT these
-    // tags (handled by the rate module).
-    let rf_tags = crate::vorbis::read_rf_tags(path);
+    //
+    // The pipeline has used two tag schemas:
+    //  - EARLY: RF_SAMPLE_RATE holds the /1000 kHz header value (20000), and
+    //    RF_TOTAL_SAMPLES is therefore a count at that rate — i.e. the on-disk
+    //    sample count divided by 1000. (A 4403.98 s capture at 20 MSPS holds
+    //    ~88e9 samples on disk; the tag says 88,079,600.)
+    //  - LATER: RF_SAMPLE_RATE holds the real Hz value (20000000, with
+    //    RF_SAMPLE_RATE_KHZ carrying the /1000 value) and RF_TOTAL_SAMPLES is
+    //    the true on-disk count.
+    //
+    // Everything downstream (the GUI duration, `fc_plan`, and SoX's `trim Ns`,
+    // which counts ACTUAL on-disk samples) works in on-disk units at the real
+    // rate, so early-schema values must be rescaled by 1000 — otherwise a cut
+    // planned from them lands 1000× short. Schema detection: an RF_SAMPLE_RATE
+    // below 1 MHz cannot be a real RF rate, so it is the /1000 kHz value.
+    let rf_tags = crate::vorbis::rf_tags_from_reader(&reader);
 
     let msps_hint = crate::msps::extract_msps(&path.to_string_lossy());
     let (mut real_rate, mut is_rf) = resolve_real_rate(r.header_sample_rate, msps_hint);
+    // Scale applied to vorbis tag values to convert them to on-disk units.
+    let mut vorbis_scale: u64 = 1;
     if let Some(tag_sr) = rf_tags.sample_rate {
         if tag_sr > 0 {
-            // The tag's RF_SAMPLE_RATE is the rate the capture tool counts
-            // samples at; use it directly as the real rate.
-            real_rate = tag_sr as f64;
+            if tag_sr < 1_000_000 {
+                // Early schema: tag values are in /1000 (kHz) units.
+                vorbis_scale = 1000;
+                real_rate = tag_sr as f64 * 1000.0;
+            } else {
+                // Later schema: the tag is already the real Hz rate.
+                real_rate = tag_sr as f64;
+            }
             is_rf = true;
             r.rate_from_vorbis = true;
         }
@@ -619,39 +677,80 @@ pub fn probe(path: &Path) -> ProbeResult {
     // 2. STREAMINFO header (+ 36-bit wrap correction) — finalized files.
     // 3. Companion .log/.wav — unfinalized files with a sibling.
     // 4. Frame-header scan — unfinalized files with no sibling (slow).
+    // Raw tag values, and the same values scaled to on-disk units (×1000 for
+    // the early /1000 schema, ×1 for the later real-Hz schema).
     let mut vorbis_total: Option<u64> = None;
     if let Some(ts) = rf_tags.total_samples {
         if ts > 0 {
-            vorbis_total = Some(ts);
+            vorbis_total = Some(ts.saturating_mul(vorbis_scale));
         }
     }
-    // Sanity: the tags' own math is RF_TOTAL_SAMPLES / RF_SAMPLE_RATE =
-    // DURATION_SECONDS, all at the /1000 (kHz) rate. Verify they agree; warn
-    // if not, but still trust the integer total. (The real cut rate used
-    // downstream is RF_SAMPLE_RATE * 1000.)
+    // Sanity 1: the tags' own math is RF_TOTAL_SAMPLES / RF_SAMPLE_RATE =
+    // DURATION_SECONDS (both raw, so the check is schema-independent). Verify
+    // they agree; warn if not, but still trust the integer total.
     if let (Some(ts), Some(tag_sr), Some(dur)) =
-        (vorbis_total, rf_tags.sample_rate, rf_tags.duration_seconds)
+        (rf_tags.total_samples, rf_tags.sample_rate, rf_tags.duration_seconds)
     {
-        if tag_sr > 0 {
+        if tag_sr > 0 && ts > 0 {
             let implied = ts as f64 / tag_sr as f64;
             if (implied - dur).abs() > 1.0 {
-                eprintln!(
-                    "[probe] WARNING: vorbis RF_TOTAL_SAMPLES={} / RF_SAMPLE_RATE={} = {:.3}s but DURATION_SECONDS={}; mismatch",
-                    ts, tag_sr, implied, dur
+                add_warning(
+                    &mut r,
+                    &format!(
+                        "vorbis RF_TOTAL_SAMPLES={} / RF_SAMPLE_RATE={} = {:.3}s but DURATION_SECONDS={}; mismatch",
+                        ts, tag_sr, implied, dur
+                    ),
                 );
+            }
+        }
+    }
+    // Sanity 2: cross-check the (scaled) total against the compressed payload.
+    // FLAC never expands the data, so total * bytes_per_sample must be >= the
+    // audio payload size. A total that fails this by ~1000× means the tag was
+    // in /1000 units despite the schema detection — rescale and warn. A total
+    // that fails it outright is unusable — drop it and fall through to the
+    // header / companion / scan sources.
+    let audio_bytes = if file_size > audio_offset {
+        file_size - audio_offset
+    } else {
+        0
+    };
+    let bytes_per_sample = u64::from(si.channels) * (u64::from(si.bits_per_sample) / 8);
+    if let Some(ts) = vorbis_total {
+        if audio_bytes > 0 && bytes_per_sample > 0 {
+            let uncompressed = (ts as u128) * (bytes_per_sample as u128);
+            if uncompressed < audio_bytes as u128 {
+                if uncompressed * 1000 >= audio_bytes as u128 {
+                    add_warning(
+                        &mut r,
+                        &format!(
+                            "vorbis RF_TOTAL_SAMPLES ({}) too small for the {}-byte audio payload; interpreting it as a /1000-unit count (×1000)",
+                            ts, audio_bytes
+                        ),
+                    );
+                    vorbis_total = Some(ts.saturating_mul(1000));
+                } else {
+                    add_warning(
+                        &mut r,
+                        &format!(
+                            "vorbis RF_TOTAL_SAMPLES ({}) inconsistent with the {}-byte audio payload; ignoring the tag",
+                            ts, audio_bytes
+                        ),
+                    );
+                    vorbis_total = None;
+                }
             }
         }
     }
 
     if let Some(ts) = vorbis_total {
-        // RF_TOTAL_SAMPLES is the actual on-disk sample count, at the
-        // RF_SAMPLE_RATE (which equals the header rate). Use it as-is — no
-        // scaling. (Duration = ts / RF_SAMPLE_RATE, matching DURATION_SECONDS.)
+        // `ts` is now the actual on-disk sample count at `real_rate_hz` (the
+        // schema scaling above converted early /1000-unit tags). Duration =
+        // ts / real_rate_hz, matching DURATION_SECONDS.
         r.total_samples = ts;
         r.total_samples_known = true;
         r.total_samples_from_vorbis = true;
     } else if known && audio_offset > 0 && file_size > audio_offset {
-        let audio_bytes = file_size - audio_offset;
         let (trustworthy, corrected) = check_total_samples(
             declared,
             audio_bytes,
@@ -731,9 +830,12 @@ pub fn probe(path: &Path) -> ProbeResult {
                         u64::from(si.channels) * (u64::from(si.bits_per_sample) / 8);
                     let uncompressed = scanned.saturating_mul(bytes_per_sample);
                     if bytes_per_sample > 0 && uncompressed < audio_bytes {
-                        eprintln!(
-                            "[probe] WARNING: scanned {} samples * {}/ch-byte = {} bytes < audio payload {} bytes; scan may be misaligned",
-                            scanned, bytes_per_sample, uncompressed, audio_bytes
+                        add_warning(
+                            &mut r,
+                            &format!(
+                                "scanned {} samples * {}/ch-byte = {} bytes < audio payload {} bytes; scan may be misaligned",
+                                scanned, bytes_per_sample, uncompressed, audio_bytes
+                            ),
                         );
                     }
                     r.total_samples = scanned;
@@ -744,7 +846,7 @@ pub fn probe(path: &Path) -> ProbeResult {
                     // No frames found — leave known=false; the GUI shows unknown.
                 }
                 Err(e) => {
-                    eprintln!("[probe] frame scan failed: {e}");
+                    add_warning(&mut r, &format!("frame scan failed: {e}"));
                 }
             }
         }
@@ -808,6 +910,234 @@ mod tests {
         let c = corrected.expect("expected a unique recovery");
         assert_eq!(c - declared, FLAC_TOTAL_SAMPLES_FIELD_MOD);
         assert_eq!(c, 118_247_751_100);
+    }
+
+    use std::io::Write;
+
+    fn crc8(bytes: &[u8]) -> u8 {
+        let mut c = 0u8;
+        for &b in bytes {
+            c = CRC8_TABLE[(c ^ b) as usize];
+        }
+        c
+    }
+
+    /// Fixed-blocksize (192-sample) frame header, frame number 0..=127.
+    fn fixed_frame_header(frame_no: u8) -> Vec<u8> {
+        assert!(frame_no < 128, "single-byte UTF-8-coded number only");
+        // sync FF F8 | blocksize code 0001 (=192), rate code 0000 | mono, bps
+        // from STREAMINFO, reserved 0 | frame number | CRC-8.
+        let mut h = vec![0xFF, 0xF8, 0x10, 0x00, frame_no];
+        let c = crc8(&h);
+        h.push(c);
+        h
+    }
+
+    /// Variable-blocksize frame header with an 8-bit blocksize field (192
+    /// samples) and a two-byte UTF-8-coded starting sample number (< 2048).
+    fn variable_frame_header(sample_no: u16) -> Vec<u8> {
+        assert!((128..2048).contains(&sample_no));
+        let b0 = 0xC0 | ((sample_no >> 6) as u8 & 0x1F);
+        let b1 = 0x80 | (sample_no as u8 & 0x3F);
+        // sync FF F9 | blocksize code 0110 (8-bit follows), rate code 0000 |
+        // mono, bps from STREAMINFO | number | bs-1 | CRC-8.
+        let mut h = vec![0xFF, 0xF9, 0x60, 0x00, b0, b1, 191];
+        let c = crc8(&h);
+        h.push(c);
+        h
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        let mut f = File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn scan_counts_sequential_fixed_frames() {
+        // Two valid, CRC-checked, sequential fixed-blocksize frames with junk
+        // between and after them → exactly 2 × 192 samples.
+        let mut data = Vec::new();
+        data.extend_from_slice(&fixed_frame_header(0));
+        data.extend_from_slice(&[0x00; 37]); // frame "body" junk (no FF sync)
+        data.extend_from_slice(&fixed_frame_header(1));
+        data.extend_from_slice(&[0x00; 100]);
+        let p = write_temp("fc_test_scan_fixed.bin", &data);
+        let mut f = File::open(&p).unwrap();
+        let n = count_samples_by_scanning(&mut f, 0, None).unwrap();
+        assert_eq!(n, 384);
+    }
+
+    #[test]
+    fn scan_rejects_nonsequential_false_sync() {
+        // A CRC-valid header with the WRONG frame number (5 instead of the
+        // expected 1) must be rejected by the sequential cross-check.
+        let mut data = Vec::new();
+        data.extend_from_slice(&fixed_frame_header(0));
+        data.extend_from_slice(&[0x00; 20]);
+        data.extend_from_slice(&fixed_frame_header(5)); // out of sequence
+        data.extend_from_slice(&[0x00; 20]);
+        let p = write_temp("fc_test_scan_seq.bin", &data);
+        let mut f = File::open(&p).unwrap();
+        let n = count_samples_by_scanning(&mut f, 0, None).unwrap();
+        assert_eq!(n, 192); // only frame 0 counted
+    }
+
+    #[test]
+    fn scan_survives_chunk_boundary_via_carry() {
+        // Place a frame pair straddling the 8 MiB chunk boundary so the second
+        // header is split across reads and must survive in the carried tail.
+        const CHUNK: usize = 8 << 20;
+        let h0 = fixed_frame_header(0);
+        let h1 = fixed_frame_header(1);
+        let mut data = vec![0u8; CHUNK - h0.len() - 3];
+        let mut full = Vec::new();
+        full.extend_from_slice(&h0); // frame 0 near the start
+        full.append(&mut data);
+        full.extend_from_slice(&h1); // frame 1 straddles the boundary
+        full.extend_from_slice(&[0u8; 64]);
+        // sanity: header 1 starts 3 bytes before the chunk boundary
+        assert!(CHUNK - 3 < full.len());
+        let p = write_temp("fc_test_scan_boundary.bin", &full);
+        let mut f = File::open(&p).unwrap();
+        let n = count_samples_by_scanning(&mut f, 0, None).unwrap();
+        assert_eq!(n, 384);
+    }
+
+    #[test]
+    fn scan_midstream_seed_counts_only_observed_samples() {
+        // A "mid-stream" variable-blocksize file: 8.5 MiB of zeros (so the
+        // strict seed relaxes after the first 8 MiB chunk), then two frames
+        // whose first sample number is 1000. The returned count must be the
+        // OBSERVED samples (2 × 192 = 384), not seed + observed (1384), which
+        // is what the pre-fix code returned.
+        let mut data = vec![0u8; (8 << 20) + (512 * 1024)];
+        let f1 = variable_frame_header(1000);
+        let f2 = variable_frame_header(1192); // 1000 + 192, sequential
+        let at = data.len() - 200;
+        data.splice(at..at + f1.len(), f1.iter().copied());
+        let at2 = at + f1.len() + 10;
+        data.splice(at2..at2 + f2.len(), f2.iter().copied());
+        let p = write_temp("fc_test_scan_midstream.bin", &data);
+        let mut f = File::open(&p).unwrap();
+        let n = count_samples_by_scanning(&mut f, 0, None).unwrap();
+        assert_eq!(n, 384, "count must exclude the 1000-sample seed offset");
+    }
+
+    #[test]
+    fn scan_min_frame_skip_overshoot_is_preserved() {
+        // With min_frame_size set, the skip after an accepted frame can jump
+        // past the end of the buffered window; the overshoot must be applied
+        // to the NEXT chunk (via seek), not dropped. Frame 1 sits exactly one
+        // min-frame stride after frame 0, straddling the chunk boundary.
+        const CHUNK: usize = 8 << 20;
+        let h0 = fixed_frame_header(0);
+        let h1 = fixed_frame_header(1);
+        let min_frame: u32 = (CHUNK + 50) as u32; // forces overshoot past chunk 1
+        let mut full = vec![0u8; CHUNK + 50 + h1.len() + 32];
+        full[..h0.len()].copy_from_slice(&h0);
+        let at = CHUNK + 50;
+        full[at..at + h1.len()].copy_from_slice(&h1);
+        let p = write_temp("fc_test_scan_overshoot.bin", &full);
+        let mut f = File::open(&p).unwrap();
+        let n = count_samples_by_scanning(&mut f, 0, Some(min_frame)).unwrap();
+        assert_eq!(n, 384);
+    }
+
+    /// Build a metadata-only FLAC: STREAMINFO (20 kHz, mono, 8-bit) + a
+    /// Vorbis comment block carrying the given tags. No audio frames — the
+    /// probe never needs them.
+    fn make_flac_with_tags(sample_rate: u32, total: u64, tags: &[(&str, &str)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        // STREAMINFO (type 0, not last, 34 bytes)
+        v.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
+        v.extend_from_slice(&4096u16.to_be_bytes()); // min block
+        v.extend_from_slice(&4096u16.to_be_bytes()); // max block
+        v.extend_from_slice(&[0, 0, 0]); // min frame (unknown)
+        v.extend_from_slice(&[0, 0, 0]); // max frame (unknown)
+        // 64 bits: rate(20) | channels-1(3) | bps-1(5) | total(36)
+        let packed: u64 = ((sample_rate as u64) << 44) | (0u64 << 41) | (7u64 << 36) | (total & 0xF_FFFF_FFFF);
+        v.extend_from_slice(&packed.to_be_bytes());
+        v.extend_from_slice(&[0u8; 16]); // md5
+        // VORBIS_COMMENT (type 4, last)
+        let mut body = Vec::new();
+        let vendor = b"fc-test";
+        body.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        body.extend_from_slice(vendor);
+        body.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for (k, val) in tags {
+            let entry = format!("{k}={val}");
+            body.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            body.extend_from_slice(entry.as_bytes());
+        }
+        v.push(0x84);
+        let len = body.len() as u32;
+        v.extend_from_slice(&len.to_be_bytes()[1..4]);
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn vorbis_early_schema_khz_units_are_rescaled_to_on_disk() {
+        // Early schema: RF_SAMPLE_RATE is the /1000 kHz header value, so
+        // RF_TOTAL_SAMPLES is a /1000-unit count. The probe must rescale both
+        // to on-disk units, or every cut planned from them is 1000× short.
+        let flac = make_flac_with_tags(
+            20_000,
+            12_345, // bogus header total; the vorbis tag must beat it
+            &[
+                ("RF_TOTAL_SAMPLES", "88079600"),
+                ("RF_SAMPLE_RATE", "20000"),
+                ("DURATION_SECONDS", "4403.980000"),
+            ],
+        );
+        let p = write_temp("fc_test_vorbis_early.flac", &flac);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!(r.total_samples_from_vorbis);
+        assert!(r.rate_from_vorbis);
+        assert!(r.is_rf);
+        // Real rate: 20000 kHz-value × 1000 = 20 MSPS.
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        // Total: 88,079,600 × 1000 on-disk samples.
+        assert_eq!(r.total_samples, 88_079_600_000);
+        // And the implied duration still matches DURATION_SECONDS.
+        let dur = r.total_samples as f64 / r.real_rate_hz;
+        assert!((dur - 4403.98).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vorbis_later_schema_real_hz_used_as_is() {
+        let flac = make_flac_with_tags(
+            20_000,
+            12_345,
+            &[
+                ("RF_TOTAL_SAMPLES", "88079600000"),
+                ("RF_SAMPLE_RATE", "20000000"),
+                ("DURATION_SECONDS", "4403.980000"),
+            ],
+        );
+        let p = write_temp("fc_test_vorbis_later.flac", &flac);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!(r.total_samples_from_vorbis);
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(r.total_samples, 88_079_600_000);
+    }
+
+    #[test]
+    fn no_vorbis_tags_header_rate_x1000_rule_applies() {
+        let flac = make_flac_with_tags(20_000, 200_000_000, &[]);
+        let p = write_temp("fc_test_vorbis_none.flac", &flac);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!(!r.total_samples_from_vorbis);
+        assert!(!r.rate_from_vorbis);
+        assert!(r.is_rf);
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(r.total_samples, 200_000_000);
     }
 
     #[test]

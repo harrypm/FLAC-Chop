@@ -7,14 +7,13 @@
 //! `..._2026.07.10_22.32.43_video_rf_8-bit_20msps.flac` there are usually:
 //!   `<base>_misrc_capture.log`        — contains an explicit `duration=Ns` line
 //!   `<base>_baseband_stereo_ch1_ch2.wav` — finalized WAV header (exact frames)
-//!   `<base>_video_rf_8-bit_10msps.flac`  — a different-MSPS RF with a known total
 //!
-//! All of these agree on the real duration (verified on Tape_12: 01:42:00 from
-//! four independent sources). We prefer the log (smallest, most explicit), then
-//! a WAV header, then fall back to the caller's frame scan.
+//! These agree on the real duration (verified on Tape_12: 01:42:00 from
+//! independent sources). We prefer the log (smallest, most explicit), then a
+//! WAV header, then fall back to the caller's frame scan.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Extract the capture base prefix: everything up to and including the first
@@ -93,47 +92,56 @@ fn parse_log_duration(text: &str) -> Option<f64> {
 }
 
 /// Parse a RIFF/WAVE header from `path` and return the duration in seconds.
-/// Handles the common PCM case; returns None for RF64 or anything it can't
-/// make sense of (the caller falls back to another source). Only the first
-/// ~128 bytes are read, so even a multi-GB WAV is cheap to probe.
+/// Walks the chunk list with seeks, so `bext` (Broadcast WAV), `LIST`, `JUNK`
+/// and other pre-`data` chunks of any size are handled. Handles the common PCM
+/// case; returns None for RF64, unfinalized/streamed data sizes (0 or
+/// 0xFFFFFFFF), or anything it can't make sense of (the caller falls back to
+/// another source). Only chunk headers and the 16-byte fmt body are read, so
+/// even a multi-GB WAV is cheap to probe.
 fn parse_wav_duration(path: &Path) -> Option<f64> {
     let mut f = fs::File::open(path).ok()?;
-    let mut head = [0u8; 128];
-    let n = f.read(&mut head).ok()?;
-    let h = &head[..n];
-    if n < 12 || &h[0..4] != b"RIFF" || &h[8..12] != b"WAVE" {
+    let mut riff = [0u8; 12];
+    f.read_exact(&mut riff).ok()?;
+    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
         return None; // not a plain RIFF WAVE (RF64 etc. unsupported here)
     }
-    // Walk chunks: fmt (1) for rate/ch/bps, data for size.
-    let mut i = 12usize;
     let mut sample_rate: Option<u32> = None;
     let mut channels: Option<u16> = None;
     let mut bits_per_sample: Option<u16> = None;
-    let mut data_size: Option<u32> = None;
-    while i + 8 <= h.len() {
-        let id = &h[i..i + 4];
-        let sz = u32::from_le_bytes([h[i + 4], h[i + 5], h[i + 6], h[i + 7]]) as usize;
-        let body = i + 8;
-        if id == b"fmt " && body + 16 <= h.len() {
-            channels = Some(u16::from_le_bytes([h[body + 2], h[body + 3]]));
-            sample_rate = Some(u32::from_le_bytes([
-                h[body + 4],
-                h[body + 5],
-                h[body + 6],
-                h[body + 7],
-            ]));
-            bits_per_sample = Some(u16::from_le_bytes([h[body + 14], h[body + 15]]));
-        } else if id == b"data" {
-            data_size = Some(sz as u32);
-            // data is usually last and huge; we don't need to walk past it.
-            break;
+    let mut data_size: Option<u64> = None;
+    // Bound the walk: no sane WAV has hundreds of chunks before `data`.
+    for _ in 0..256 {
+        let mut hdr = [0u8; 8];
+        if f.read_exact(&mut hdr).is_err() {
+            break; // clean EOF before a data chunk
         }
-        // chunks are word-aligned; advance past body + pad
-        let next = body + sz + (sz & 1);
-        if next <= i {
-            break;
+        let id = [hdr[0], hdr[1], hdr[2], hdr[3]];
+        let sz = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if &id == b"fmt " {
+            if sz < 16 {
+                return None; // malformed fmt chunk
+            }
+            let mut fmt = [0u8; 16];
+            f.read_exact(&mut fmt).ok()?;
+            channels = Some(u16::from_le_bytes([fmt[2], fmt[3]]));
+            sample_rate = Some(u32::from_le_bytes([fmt[4], fmt[5], fmt[6], fmt[7]]));
+            bits_per_sample = Some(u16::from_le_bytes([fmt[14], fmt[15]]));
+            // Skip any fmt extension plus the word-alignment pad byte.
+            let rest = (sz as u64 - 16) + u64::from(sz & 1);
+            f.seek(SeekFrom::Current(rest as i64)).ok()?;
+        } else if &id == b"data" {
+            // 0 or 0xFFFFFFFF means the writer never finalized the header
+            // (streamed / interrupted capture) — the size is meaningless.
+            if sz == 0 || sz == u32::MAX {
+                return None;
+            }
+            data_size = Some(u64::from(sz));
+            break; // data is what we came for; no need to walk further
+        } else {
+            // Any other chunk (JUNK, LIST, bext, fact, …): skip body + pad.
+            let skip = u64::from(sz) + u64::from(sz & 1);
+            f.seek(SeekFrom::Current(skip as i64)).ok()?;
         }
-        i = next;
     }
     let sr = sample_rate? as f64;
     let ch = channels? as f64;
@@ -176,11 +184,14 @@ pub fn companion_duration(rf_path: &Path) -> Option<f64> {
 
     // 1) logs — prefer one that actually contains a duration line.
     for log in siblings_with_ext(dir, base, "log") {
-        if let Ok(bytes) = fs::read(&log) {
-            // bound the read: only scan up to 64 KB of the file
-            let cap = &bytes[..bytes.len().min(64 * 1024)];
-            if let Ok(text) = std::str::from_utf8(cap) {
-                if let Some(secs) = parse_log_duration(text) {
+        if let Ok(f) = fs::File::open(&log) {
+            // Bound the READ (not just the scan) to 64 KB so a multi-MB log is
+            // never loaded whole, and decode lossily so a multibyte character
+            // split at the cap doesn't discard the log.
+            let mut bytes = Vec::with_capacity(64 * 1024);
+            if f.take(64 * 1024).read_to_end(&mut bytes).is_ok() {
+                let text = String::from_utf8_lossy(&bytes);
+                if let Some(secs) = parse_log_duration(&text) {
                     if secs > 0.0 {
                         return Some(secs);
                     }
@@ -234,5 +245,105 @@ mod tests {
     #[test]
     fn parse_log_duration_absent_returns_none() {
         assert_eq!(parse_log_duration("no timing info here"), None);
+    }
+
+    use std::io::Write;
+
+    /// Build a minimal WAV: RIFF/WAVE, optional junk chunks, PCM fmt, data.
+    fn make_wav(pre_chunks: &[(&[u8; 4], usize)], data_size: u32) -> Vec<u8> {
+        let mut v: Vec<u8> = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&0u32.to_le_bytes()); // riff size, unused by parser
+        v.extend_from_slice(b"WAVE");
+        for (id, sz) in pre_chunks {
+            v.extend_from_slice(*id);
+            v.extend_from_slice(&(*sz as u32).to_le_bytes());
+            v.extend(std::iter::repeat(0u8).take(sz + (sz & 1)));
+        }
+        // fmt chunk: PCM, 2 ch, 48000 Hz, 16-bit
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&2u16.to_le_bytes()); // channels
+        v.extend_from_slice(&48000u32.to_le_bytes()); // rate
+        v.extend_from_slice(&(48000u32 * 4).to_le_bytes()); // byte rate
+        v.extend_from_slice(&4u16.to_le_bytes()); // block align
+        v.extend_from_slice(&16u16.to_le_bytes()); // bits
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data_size.to_le_bytes());
+        // parser never reads the data body, so we can omit it
+        v
+    }
+
+    fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn wav_duration_plain() {
+        // 1 second of 48 kHz 16-bit stereo = 192000 bytes.
+        let p = write_temp("fc_test_plain.wav", &make_wav(&[], 192_000));
+        let d = parse_wav_duration(&p).unwrap();
+        assert!((d - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wav_duration_with_bext_and_junk_before_data() {
+        // Broadcast WAVs carry a 602+ byte bext chunk, and many writers add
+        // JUNK padding — both used to push fmt/data past the old 128-byte
+        // window and silently fail.
+        let p = write_temp(
+            "fc_test_bext.wav",
+            &make_wav(&[(b"bext", 602), (b"JUNK", 512)], 384_000),
+        );
+        let d = parse_wav_duration(&p).unwrap();
+        assert!((d - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wav_duration_odd_sized_chunk_is_word_aligned() {
+        let p = write_temp("fc_test_odd.wav", &make_wav(&[(b"LIST", 33)], 96_000));
+        let d = parse_wav_duration(&p).unwrap();
+        assert!((d - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wav_unfinalized_data_size_rejected() {
+        // Streamed/interrupted writers leave 0 or 0xFFFFFFFF in the data size;
+        // any duration derived from those would be garbage.
+        let p0 = write_temp("fc_test_unfin0.wav", &make_wav(&[], 0));
+        assert_eq!(parse_wav_duration(&p0), None);
+        let pf = write_temp("fc_test_unfinf.wav", &make_wav(&[], u32::MAX));
+        assert_eq!(parse_wav_duration(&pf), None);
+    }
+
+    #[test]
+    fn wav_non_riff_rejected() {
+        let p = write_temp("fc_test_notwav.wav", b"FORM....AIFF");
+        assert_eq!(parse_wav_duration(&p), None);
+    }
+
+    #[test]
+    fn companion_log_read_is_bounded_and_lossy_safe() {
+        // A log bigger than the 64 KB cap, with the duration line inside the
+        // cap and a multibyte char straddling the boundary — must still parse.
+        let dir = std::env::temp_dir().join("fc_test_companion");
+        let _ = fs::create_dir_all(&dir);
+        let base = "Tape_X_2026.07.10_22.32.43";
+        let log_path = dir.join(format!("{base}_misrc_capture.log"));
+        let mut body = String::from("Recording stopped: duration=6120.27s (01.42.00)\n");
+        while body.len() < 64 * 1024 - 1 {
+            body.push('x');
+        }
+        body.push('é'); // 2-byte char straddling the 64 KB boundary
+        body.push_str(&"y".repeat(4096));
+        fs::write(&log_path, body).unwrap();
+        let rf = dir.join(format!("{base}_video_rf_8-bit_20msps.flac"));
+        fs::write(&rf, b"").unwrap();
+        let d = companion_duration(&rf).unwrap();
+        assert!((d - 6120.27).abs() < 1e-6);
     }
 }
