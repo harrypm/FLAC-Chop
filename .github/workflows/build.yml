@@ -109,7 +109,6 @@ jobs:
             pkg-config \
             qt6-base-dev \
             qt6-base-dev-tools \
-            qt6-widgets-dev \
             libgl1-mesa-dev \
             curl \
             file \
@@ -239,9 +238,16 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          source ~/.cargo/env
-          rustup target add x86_64-pc-windows-gnu
+          # Install rustup into the MSYS2 home ($HOME) so that ~/.cargo/env is
+          # resolvable from later `msys2 {0}` steps. Without this, rustup installs
+          # to the Windows user profile (C:\Users\runneradmin) while `~` inside
+          # MSYS2 resolves to /home/runneradmin, so `source ~/.cargo/env` fails.
+          export CARGO_HOME="$HOME/.cargo"
+          export RUSTUP_HOME="$HOME/.rustup"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal \
+                 --default-host x86_64-pc-windows-gnu
+          source "$CARGO_HOME/env"
           rustup default stable-x86_64-pc-windows-gnu
 
       - name: Build FLAC-Chop
