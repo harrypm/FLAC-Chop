@@ -444,3 +444,139 @@ macos-app         134 MB   (universal .dmg)
   noted in the toolchain block above.
 - The `actions/*@v4` steps emit Node.js 20 deprecation warnings (runner
   force-upgrades to Node 24). Non-blocking; bumping to `@v5` later clears them.
+
+---
+
+## 2026-07-18 (session 5) — fix Windows x86_64 runtime (missing MinGW DLLs) + add Windows arm64 build
+
+### Goal / problem (user-reported)
+The CI-built Windows x86_64 `flac-chop.exe` from session 4's green run
+(`29633003940`, commit c714009) failed at runtime — it would not start
+(missing-DLL / crash). Session 4 had explicitly caveatted that the Windows
+binary was format/arch-verified but never runtime-tested. User also asked to
+add a Windows arm64 build.
+
+### Root cause (verified against hard data, not guessed)
+Downloaded the green `windows-exe` artifact (run 29633003940) and dumped PE
+import tables with `objdump -p`:
+- `flac-chop.exe` itself imports only Windows system DLLs + Qt6Core/Gui/Widgets
+  (all bundled by windeployqt). Qt6Concurrent is NOT imported —
+  `QtConcurrent::run` is header-inline templates in Qt6. The MinGW runtime was
+  statically linked INTO THE EXE (no libgcc_s_seh-1 / libwinpthread-1 /
+  libstdc++-6 in its imports) thanks to CMakeLists `-static-libgcc
+  -static-libstdc++ -static`.
+- BUT the bundled Qt6 DLLs (Qt6Core/Gui/Network) each import a tree of MinGW
+  runtime + MSYS2 third-party DLLs that windeployqt did NOT bundle:
+  libgcc_s_seh-1, libwinpthread-1, libstdc++-6, libpcre2-16-0, zlib1, libzstd,
+  libdouble-conversion, libb2-1, libicuin78 / libicuuc78, libfreetype-6,
+  libharfbuzz-0, libmd4c, libpng16-16, libbrotlidec (+ libbrotlicommon), ...
+  windeployqt is built for MSVC and has no knowledge of MSYS2 MinGW runtime
+  DLLs, so it copies none of them.
+- Result: the loader resolved Qt6Core.dll → its deps → missing libgcc_s_seh-1
+  etc. → the "missing DLL / won't start" failure the user saw.
+
+A local dry-run of a single-pass `ldd`-walk against the downloaded dist
+(found 9 deps present in the local /mingw64/bin) proved a single pass MISSES
+multi-level transitives: `libbrotlicommon` (dep of libbrotlidec) was only
+revealed once libbrotlidec had been copied into dist/, because ldd only
+recurses into deps that resolve from dist. It also proved a strict leak-check
+over ALL dist DLLs gives FALSE POSITIVES (plugins in subdirs resolve their
+runtime deps via PATH under ldd, even though at runtime the loader searches
+the exe's directory first and finds them in dist/ root). `ldd` on the exe
+alone was clean after the copy → that is the reliable gate.
+
+### Fix
+`gui/CMakeLists.txt`:
+- staticlib extension now `if(MSVC)` (was `WIN32 AND NOT MINGW`) so the
+  LLVM-mingw arm64 toolchain picks `.a` even if CMake doesn't set MINGW for
+  clang. No-op for the existing MinGW-gcc x86_64 job (MSVC false → .a).
+- MinGW static-link flags now gated on `CMAKE_CXX_COMPILER_ID STREQUAL "GNU"`
+  (was `WIN32 AND MINGW`) so they're never passed to clang on arm64; for that
+  build the runtime DLLs are bundled by the ldd-walk instead. No-op for gcc.
+
+`.github/workflows/build.yml`:
+- x86_64 job: after windeployqt, a FIXPOINT `ldd`-walk copies every
+  /mingw64/bin DLL the exe + bundled Qt6 DLLs + plugins transitively need into
+  dist/, iterating until a pass copies nothing new. Sanity gate: `ldd
+  dist/flac-chop.exe` (exe tree only) must have no /mingw64/bin refs. Renamed
+  the zip `..._x86.zip` → `..._x86_64.zip`.
+- NEW `windows-arm64` job: `runs-on: windows-11-arm` (GA, free for public
+  repos) + MSYS2 `CLANGARM64` (packages mingw-w64-clang-aarch64-{clang,cmake,
+  ninja,pkgconf,qt6-base,qt6-tools}) + Rust `stable-aarch64-pc-windows-gnullvm`
+  (LLVM-mingw arm64 ABI matches CLANGARM64 Qt6; MSVC would ABI-mismatch and
+  fail to link) installed as the job's default toolchain so `cargo build
+  --release` (no --target) lands the staticlib at core/target/release/
+  libflac_chop_core.a (matching gui/CMakeLists.txt). Same fixpoint ldd-walk
+  against /clangarm64/bin. Artifact `windows-exe-arm64` → `..._arm64.zip`.
+- release job: `needs` += windows-arm64; `files` globs updated
+  (windows_FLAC-Chop_*_x86_64.zip + windows_FLAC-Chop_*_arm64.zip).
+
+Toolchain facts confirmed before writing the arm64 job: `windows-11-arm` is a
+GA GitHub-hosted runner for public repos (actions/runner-images table);
+MSYS2 CLANGARM64 packages exist (local pacman -Sl clangarm64):
+mingw-w64-clang-aarch64-clang 22.1.4, -qt6-base 6.11.0, -qt6-tools 6.11.0,
+-cmake 4.3.3, -ninja 1.13.2, -pkgconf; `aarch64-pc-windows-gnullvm` is a valid
+Rust target (local `rustc --print target-list`).
+
+### Commands run (this session)
+```bash
+# investigate the green CI artifact (downloaded via gh run download 29633003940)
+objdump -p flac-chop.exe | grep 'DLL Name:'           # exe imports
+objdump -p Qt6Core.dll | grep 'DLL Name:'             # Qt6 DLL deps -> the missing tree
+# local dry-run of the ldd-walk logic (proved fixpoint + exe-only gate needed):
+#   C:\Users\Harry\fc-win-inspect\test_ldd_walk.sh (MSYS2 MINGW64)
+
+# local mirror of the CI x86_64 build (MSYS2 MINGW64 + gnu Rust toolchain):
+#   installed: pacman -S mingw-w64-x86_64-qt6-base mingw-w64-x86_64-qt6-tools
+#   installed: rustup toolchain install stable-x86_64-pc-windows-gnu
+#   RUSTUP_TOOLCHAIN=stable-x86_64-pc-windows-gnu \
+#   cmake -S . -B build-local -G Ninja -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build-local
+#   windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
+#   <fixpoint ldd-walk, BINDIR=/mingw64/bin>
+#   script: C:\Users\Harry\fc-win-inspect\local_build_x86_64.sh
+```
+
+### Verification (hard data) — x86_64
+Local build (mirrors CI): cargo 1.97.1 (gnu), claxon 0.4.3, Qt 6.11.0, GNU
+16.1.0 → `build-local/gui/flac-chop.exe`.
+
+PE: `objdump -f dist/flac-chop.exe` → `file format pei-x86-64`,
+`architecture: i386:x86-64`.
+
+Fixpoint ldd-walk copied 28 DLLs into dist/ root (verbatim):
+libb2-1, libbrotlicommon, libbrotlidec, libbz2-1, libdouble-conversion,
+libffi-8, libfreetype-6, libgcc_s_seh-1, libgio-2.0-0, libglib-2.0-0,
+libgmodule-2.0-0, libgobject-2.0-0, libgraphite2, libharfbuzz-0, libiconv-2,
+libicudt78, libicuin78, libicuuc78, libintl-8, libjpeg-8, libmd4c,
+libpcre2-16-0, libpcre2-8-0, libpng16-16, libstdc++-6, libwinpthread-1,
+libzstd, zlib1. (MSYS2 Qt6 Gui's libharfbuzz is built WITH glib, so the whole
+glib stack — glib/gobject/gio/gmodule + ffi/intl/iconv/pcre2-8/graphite2 +
+bz2 — is pulled in transitively; the fixpoint loop captured all of it, which
+a single-pass walk would have missed.)
+
+Exe-tree leak gate: EXE_TREE_CLEAN (ldd dist/flac-chop.exe has no
+/mingw64/bin refs after bundling).
+
+USER RUN-TEST (real-world confirmation): launched
+C:\Users\Harry\flac-chop\dist\flac-chop.exe — "It opens now without error
+prompts." The missing-DLL runtime failure is FIXED. Restore-point snapshot
+zipped at C:\Users\Harry\fc-restore-points\2026-07-18_windows-x86_64-runtime-fix\
+(working dist + changed source + this log).
+
+### Honest caveats
+- arm64 NOT verified: no arm64 machine locally. The `windows-arm64` job is
+  implemented but needs a CI run (or an arm64 device) to confirm it builds and
+  the exe runs. Risks to watch on first CI run: `windows-11-arm` runner
+  availability/queue; setup-msys2 CLANGARM64 on an arm64 host; whether
+  `dtolnay/rust-toolchain` accepts `toolchain: stable-aarch64-pc-windows-gnullvm`
+  and the gnullvm rustc/cargo run under the CLANGARM64 shell PATH; whether the
+  gnullvm Rust std's link deps are fully covered by the CMakeLists Windows lib
+  list (ws2_32/advapi32/userenv/bcrypt/ntdll — same as x86_64).
+- The x86_64 run-test confirmed the GUI STARTS. An end-to-end cut (Process →
+  sox trim) still needs SoX on PATH + a real RF file; not re-tested here.
+- x86_64 dist grew: root ~82 MB uncompressed (dominated by libicudt78 ~32 MB),
+  so the zip is now ~35-40 MB (was ~14 MB when it was broken/missing DLLs).
+  Exact compressed size to be confirmed from the CI artifact.
+- No commit pushed yet; changes are in the working tree (branch name set:
+  fix/windows-x86_64-runtime-and-arm64, uncommitted).

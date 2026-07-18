@@ -272,17 +272,174 @@ jobs:
           windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
           # SoX is NOT bundled — it is a runtime dep (user installs SoX for Windows).
 
+      - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          # windeployqt only bundles Qt6 + MSVC-runtime DLLs. The MSYS2 MinGW
+          # Qt6 DLLs also depend on the compiler runtime (libgcc_s_seh-1,
+          # libwinpthread-1, libstdc++-6) and third-party libs (libpcre2-16-0,
+          # zlib1, libzstd, libdouble-conversion, libb2-1, libicuin/uc,
+          # libfreetype, libharfbuzz, libmd4c, libpng16, libbrotlidec/common,
+          # ...). windeployqt does NOT copy any of these, so without them the
+          # exe fails to start with a "missing DLL" error.
+          #
+          # Walk the full transitive dep tree with ldd and copy every
+          # /mingw64/bin DLL into dist. Iterate to a fixpoint because ldd only
+          # recurses into a dep's own deps once that dep has been copied into
+          # dist (so e.g. libbrotlicommon is only revealed after libbrotlidec
+          # is copied). At runtime the Windows loader searches the exe's
+          # directory first, so putting these in dist/ root also satisfies the
+          # plugins in subdirs (platforms/, imageformats/, ...).
+          BINDIR="/mingw64/bin"
+          for pass in 1 2 3 4 5 6 7 8; do
+            new=0
+            while IFS= read -r d; do
+              base="$(basename "$d")"
+              if [ ! -f "dist/$base" ]; then cp "$d" "dist/$base"; new=$((new+1)); fi
+            done < <(find dist -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 \
+                     | xargs -0 -n1 ldd 2>/dev/null \
+                     | grep -oE "${BINDIR}/[^ ]+\.dll" | sort -u)
+            echo "dep-bundle pass $pass: newly copied $new DLL(s)"
+            [ "$new" -eq 0 ] && break
+          done
+          # Gate on the exe's own tree only: plugin DLLs in subdirs still show
+          # ${BINDIR} refs under ldd (a false positive — at runtime the loader
+          # uses the exe dir, where these libs now live).
+          LEAKS=$(ldd dist/flac-chop.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
+          if [ -n "$LEAKS" ]; then
+            echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
+          fi
+          echo "Bundled DLLs in dist/:"
+          ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
+
       - name: Create ZIP artifact
         shell: pwsh
         run: |
-          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86.zip"
+          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe
-          path: windows_FLAC-Chop_*_x86.zip
+          path: windows_FLAC-Chop_*_x86_64.zip
+          if-no-files-found: error
+
+  # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
+  windows-arm64:
+    name: Windows EXE (arm64)
+    runs-on: windows-11-arm
+    needs: cargo-tests
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup MSYS2 (CLANGARM64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANGARM64
+          update: true
+          install: >-
+            git
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-cmake
+            mingw-w64-clang-aarch64-ninja
+            mingw-w64-clang-aarch64-pkgconf
+            mingw-w64-clang-aarch64-qt6-base
+            mingw-w64-clang-aarch64-qt6-tools
+
+      - name: Resolve build version
+        id: version
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.release_tag }}" ]]; then
+            VERSION="${{ github.event.inputs.release_tag }}"
+          else
+            VERSION="$(git describe --tags --dirty --match 'v*' 2>/dev/null || true)"
+            if [[ -z "$VERSION" ]]; then
+              VERSION="dev-${GITHUB_SHA:0:7}"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust (aarch64 gnullvm toolchain)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # aarch64-pc-windows-gnullvm = the LLVM-mingw arm64 ABI, which
+          # matches MSYS2's CLANGARM64 Qt6 (built against the LLVM-mingw
+          # runtime). The MSVC target would ABI-mismatch and fail to link.
+          # Installing it as the job's default toolchain means `cargo build
+          # --release` (no --target) builds for gnullvm and lands the
+          # staticlib at core/target/release/libflac_chop_core.a, matching
+          # gui/CMakeLists.txt (which uses .a for every non-MSVC toolchain).
+          toolchain: stable-aarch64-pc-windows-gnullvm
+
+      - name: Build FLAC-Chop
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          # cargo/rustc are installed by dtolnay/rust-toolchain into the Windows
+          # CARGO_HOME; cmake's custom command spawns `cargo` via cmd.exe which
+          # does not inherit dtolnay's GITHUB_PATH under the MSYS2 shell, so
+          # convert CARGO_HOME to an MSYS2 path and prepend its bin (same fix
+          # as the x86_64 job).
+          export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
+          cargo --version
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD_DIR"
+          test -x "$BUILD_DIR/gui/flac-chop.exe"
+
+      - name: Bundle Qt6 DLLs with windeployqt
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "$BUILD_DIR/gui/flac-chop.exe" dist/
+          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
+          # SoX is NOT bundled — it is a runtime dep (user installs SoX for Windows).
+
+      - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          # Same rationale as the x86_64 job. CLANGARM64 Qt6 DLLs depend on the
+          # LLVM-mingw compiler runtime + third-party libs that windeployqt does
+          # not copy; iterate ldd to a fixpoint and copy every /clangarm64/bin
+          # DLL into dist.
+          BINDIR="/clangarm64/bin"
+          for pass in 1 2 3 4 5 6 7 8; do
+            new=0
+            while IFS= read -r d; do
+              base="$(basename "$d")"
+              if [ ! -f "dist/$base" ]; then cp "$d" "dist/$base"; new=$((new+1)); fi
+            done < <(find dist -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 \
+                     | xargs -0 -n1 ldd 2>/dev/null \
+                     | grep -oE "${BINDIR}/[^ ]+\.dll" | sort -u)
+            echo "dep-bundle pass $pass: newly copied $new DLL(s)"
+            [ "$new" -eq 0 ] && break
+          done
+          LEAKS=$(ldd dist/flac-chop.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
+          if [ -n "$LEAKS" ]; then
+            echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
+          fi
+          echo "Bundled DLLs in dist/:"
+          ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
+
+      - name: Create ZIP artifact
+        shell: pwsh
+        run: |
+          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+
+      - name: Upload Windows arm64 ZIP
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-exe-arm64
+          path: windows_FLAC-Chop_*_arm64.zip
           if-no-files-found: error
 
   # --- macOS APP (arm64 + x86_64, then universal DMG) ---
@@ -500,6 +657,7 @@ jobs:
     needs:
       - linux-appimage
       - windows-exe
+      - windows-arm64
       - macos-app-universal
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true')
     permissions:
@@ -554,5 +712,6 @@ jobs:
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.zip
             release-assets/**/linux_FLAC-Chop_*_arm64.zip
-            release-assets/**/windows_FLAC-Chop_*_x86.zip
+            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
+            release-assets/**/windows_FLAC-Chop_*_arm64.zip
             release-assets/**/macos_FLAC-Chop_*_universal.dmg

@@ -40,8 +40,8 @@ Cross-platform builds run on GitHub Actions (`.github/workflows/build.yml`).
 
 - **Latest CI build (any branch):** download the workflow run artifacts from
   the [Actions tab](https://github.com/harrypm/FLAC-Chop/actions) —
-  `linux-zip-x86_64`, `linux-zip-arm64`, `windows-exe`, `macos-app` (universal
-  DMG). These are `dev-<sha>` builds.
+  `linux-zip-x86_64`, `linux-zip-arm64`, `windows-exe`, `windows-exe-arm64`,
+  `macos-app` (universal DMG). These are `dev-<sha>` builds.
 - **Versioned releases:** push a `v*` tag (e.g. `v1.2.0`) and the release job
   publishes the same assets to a GitHub Release automatically.
 
@@ -51,7 +51,8 @@ Artifacts:
 |---|---|---|
 | Linux x86_64 | `linux-zip-x86_64` | AppImage (~26 MB) |
 | Linux arm64 | `linux-zip-arm64` | AppImage (~25 MB) |
-| Windows x86_64 | `windows-exe` | `flac-chop.exe` + Qt6 DLLs (ZIP, ~14 MB) |
+| Windows x86_64 | `windows-exe` | `flac-chop.exe` + Qt6 + MinGW runtime DLLs (ZIP) |
+| Windows arm64 | `windows-exe-arm64` | `flac-chop.exe` + Qt6 + LLVM-mingw runtime DLLs (ZIP) |
 | macOS universal | `macos-app` | universal `FLAC-Chop.dmg` (arm64 + x86_64, ~134 MB) |
 
 > SoX is still a separate runtime install on every platform (see above).
