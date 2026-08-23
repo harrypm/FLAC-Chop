@@ -306,13 +306,16 @@ impl Default for FcChopResult {
     }
 }
 
-/// Run the SoX cut. Blocking — the GUI calls this on a worker thread.
+/// Run the SoX cut/conversion. Blocking — the GUI calls this on a worker thread.
 #[no_mangle]
 pub extern "C" fn fc_chop(
     in_path: *const c_char,
     out_path: *const c_char,
     start_samples: u64,
     length_samples: u64,
+    output_rate_hz: u64,
+    output_bits: u32,
+    basic_rf_filter: i32,
     out: *mut FcChopResult,
 ) {
     unsafe {
@@ -325,7 +328,16 @@ pub extern "C" fn fc_chop(
         // Guard against panics on the C++ worker thread (same rationale as
         // fc_probe/fc_plan: an uncaught Rust panic there aborts the process).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fc_chop_impl(in_path, out_path, start_samples, length_samples, out)
+            fc_chop_impl(
+                in_path,
+                out_path,
+                start_samples,
+                length_samples,
+                output_rate_hz,
+                output_bits,
+                basic_rf_filter,
+                out,
+            )
         }));
         if let Err(payload) = result {
             let msg = panic_msg(payload);
@@ -340,6 +352,9 @@ fn fc_chop_impl(
     out_path: *const c_char,
     start_samples: u64,
     length_samples: u64,
+    output_rate_hz: u64,
+    output_bits: u32,
+    basic_rf_filter: i32,
     out: &mut FcChopResult,
 ) {
     unsafe {
@@ -362,7 +377,12 @@ fn fc_chop_impl(
             }
         };
 
-        let r = chop::chop(i, o, start_samples, length_samples);
+        let opts = chop::ChopOptions {
+            output_rate_hz: if output_rate_hz > 0 { Some(output_rate_hz) } else { None },
+            output_bits: if output_bits > 0 { Some(output_bits) } else { None },
+            basic_rf_filter: basic_rf_filter != 0,
+        };
+        let r = chop::chop_with_options(i, o, start_samples, length_samples, opts);
         out.ok = if r.ok { 1 } else { 0 };
         out.exit_code = r.exit_code;
         set_str(&mut out.stderr_buf, &r.stderr);

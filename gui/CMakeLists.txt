@@ -53,6 +53,12 @@ if(WIN32)
     list(APPEND GUI_SOURCES windows_app_icon.rc)
 endif()
 add_executable(flac-chop ${GUI_SOURCES})
+if(WIN32)
+    set_source_files_properties(
+        windows_app_icon.rc
+        PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/assets/icons/flac-chop-icon.ico")
+endif()
 
 target_include_directories(flac-chop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 

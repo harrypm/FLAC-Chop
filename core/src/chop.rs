@@ -4,11 +4,43 @@
 //! the `s` suffix makes the numbers sample counts (per channel). This was
 //! validated against a real 115 GB RF capture: a 10 s / 20 MSPS request
 //! produced exactly 200,000,000 samples, 8-bit, with the 20 kHz header
-//! preserved. SoX preserves bit depth and the FLAC sample-rate header when
-//! input and output are both `.flac`, so no extra encoding flags are needed.
+//! preserved. The default path is a pure sample-exact trim; optional output
+//! conversion controls can also apply rate/bit-depth processing.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+/// Optional post-cut processing controls for SoX.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChopOptions {
+    /// Output FLAC header sample rate in Hz (e.g. 20000 for 20 MSPS RF files
+    /// that use the /1000 header convention). `None` keeps the source rate.
+    pub output_rate_hz: Option<u64>,
+    /// Requested output bit depth. `None` keeps source precision.
+    ///
+    /// Note: SoX/FLAC cannot encode true 6-bit FLAC. When this is `Some(6)`,
+    /// the command writes an 8-bit FLAC container and applies `dither -p 6` so
+    /// the effective precision is 6-bit ("bit-crushed 6-bit in 8-bit FLAC").
+    pub output_bits: Option<u32>,
+    /// Apply the wiki-aligned basic RF low-pass profile (`sinc -n 2500 0-...`)
+    /// when changing output rate.
+    pub basic_rf_filter: bool,
+}
+
+/// Map an RF output sample-rate header (Hz) to a basic wiki profile cutoff
+/// (kHz) for SoX `sinc`.
+fn rf_filter_cutoff_khz(output_rate_hz: u64) -> Option<u32> {
+    match output_rate_hz {
+        // 16 MSPS (experimental VHS profile)
+        16_000 => Some(7650),
+        // 20 MSPS VHS profile
+        20_000 => Some(9650),
+        // 24 MSPS profile
+        24_000 => Some(9400),
+        // 28.6 MSPS (8fsc) fallback profile (conservative, same as 24 MSPS profile)
+        28_600 => Some(9400),
+        _ => None,
+    }
+}
 
 /// Outcome of a SoX cut.
 pub struct ChopResult {
@@ -19,16 +51,60 @@ pub struct ChopResult {
 
 /// Run `sox in out trim <start>s <len>s`. Captures stderr for the GUI.
 pub fn chop(in_path: &str, out_path: &str, start_samples: u64, length_samples: u64) -> ChopResult {
+    chop_with_options(in_path, out_path, start_samples, length_samples, ChopOptions::default())
+}
+
+/// Run `sox in out trim <start>s <len>s` with optional output conversion.
+pub fn chop_with_options(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    opts: ChopOptions,
+) -> ChopResult {
     let start = format!("{}s", start_samples);
     let len = format!("{}s", length_samples);
+    let mut cmd = Command::new("sox");
+    cmd.arg(in_path);
 
-    let output = Command::new("sox")
-        .arg(in_path)
-        .arg(out_path)
-        .arg("trim")
-        .arg(&start)
-        .arg(&len)
-        .output();
+    // Output format controls must be specified before the output path.
+    if let Some(rate) = opts.output_rate_hz {
+        if rate > 0 {
+            cmd.arg("-r").arg(rate.to_string());
+        }
+    }
+
+    // FLAC cannot encode 6-bit directly in SoX, so we store 8-bit and apply
+    // a 6-bit precision reduction effect after trim.
+    let mut emulated_six_bit = false;
+    if let Some(bits) = opts.output_bits {
+        if bits == 6 {
+            cmd.arg("-b").arg("8");
+            emulated_six_bit = true;
+        } else if bits > 0 {
+            cmd.arg("-b").arg(bits.to_string());
+        }
+    }
+
+    cmd.arg(out_path);
+    cmd.arg("trim").arg(&start).arg(&len);
+
+    if let Some(rate) = opts.output_rate_hz {
+        if rate > 0 && opts.basic_rf_filter {
+            if let Some(cutoff_khz) = rf_filter_cutoff_khz(rate) {
+                cmd.arg("sinc")
+                    .arg("-n")
+                    .arg("2500")
+                    .arg(format!("0-{cutoff_khz}"));
+            }
+        }
+    }
+
+    if emulated_six_bit {
+        cmd.arg("dither").arg("-p").arg("6");
+    }
+
+    let output = cmd.output();
 
     match output {
         Ok(o) => {
@@ -124,5 +200,14 @@ mod tests {
         let second = generate_output_path(input.to_str().unwrap()).unwrap();
         assert!(second.ends_with("tape-cut-2.flac"), "got {second}");
         let _ = std::fs::remove_file(&first);
+    }
+
+    #[test]
+    fn rf_filter_profiles_match_expected_presets() {
+        assert_eq!(rf_filter_cutoff_khz(16_000), Some(7650));
+        assert_eq!(rf_filter_cutoff_khz(20_000), Some(9650));
+        assert_eq!(rf_filter_cutoff_khz(24_000), Some(9400));
+        assert_eq!(rf_filter_cutoff_khz(28_600), Some(9400));
+        assert_eq!(rf_filter_cutoff_khz(12_000), None);
     }
 }

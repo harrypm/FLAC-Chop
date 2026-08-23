@@ -22,6 +22,11 @@ whose FLAC header total is unknown.
 - Async probing — loading a 100 GB file doesn't freeze the window.
 - IN / OUT markers via a single time box + Set IN / Set OUT buttons (ld-analyse
   style), with a dual-handle slider.
+- Optional output processing modes for RF captures: keep source rate, or
+  downsample to 20/24/28.6 MSPS (plus an experimental 16 MSPS mode), with
+  wiki-aligned basic SoX sinc filter presets.
+- Bit-depth control (keep source, 8-bit, or 6-bit crush emulation stored in an
+  8-bit FLAC container).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 
 ## Requirements
@@ -105,8 +110,8 @@ The CLIs run the exact same probe → plan → SoX path as the GUI.
   runtime-tested yet; feedback welcome.
 - No progress percentage during a cut (SoX doesn't emit sample progress to a
   captured pipe easily); the GUI shows a busy indicator instead.
-- The cut is at the input sample rate. Decimation is a decode-side concern and
-  is not performed here.
+- 6-bit RF output is emulated by quantizing to 6-bit precision and storing in
+  an 8-bit FLAC container (SoX/FLAC cannot encode true 6-bit FLAC directly).
 - No tagged release yet; CI binaries so far are `dev-<sha>` builds.
 
 ## Development notes

@@ -7,6 +7,8 @@
 #include <QGroupBox>
 #include <QLabel>
 #include <QLineEdit>
+#include <QComboBox>
+#include <QCheckBox>
 #include <QPushButton>
 #include <QProgressBar>
 #include <QFileDialog>
@@ -33,6 +35,28 @@ static QString ulongStr(quint64 v)
     return s;
 }
 
+static QString rfFilterProfileText(quint64 outHeaderRateHz)
+{
+    switch (outHeaderRateHz) {
+    case 16000: return QStringLiteral("sinc -n 2500 0-7650");
+    case 20000: return QStringLiteral("sinc -n 2500 0-9650");
+    case 24000: return QStringLiteral("sinc -n 2500 0-9400");
+    case 28600: return QStringLiteral("sinc -n 2500 0-9400");
+    default: return QString();
+    }
+}
+
+static QString modeDisplay(quint64 outHeaderRateHz)
+{
+    switch (outHeaderRateHz) {
+    case 16000: return QStringLiteral("16 MSPS");
+    case 20000: return QStringLiteral("20 MSPS");
+    case 24000: return QStringLiteral("24 MSPS");
+    case 28600: return QStringLiteral("28.6 MSPS (8fsc)");
+    default: return QStringLiteral("source rate");
+    }
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -44,11 +68,6 @@ MainWindow::MainWindow(QWidget* parent)
     auto* root = new QVBoxLayout(central);
     root->setContentsMargins(12, 12, 12, 12);
     root->setSpacing(10);
-
-    auto* title = new QLabel(tr("<h3>FLAC-Chop</h3>"
-        "<div>Sample-exact FLAC cutter for RF captures "
-        "(SoX engine, Rust/claxon probe) — drag a .flac in</div>"), central);
-    root->addWidget(title);
 
     // --- Input file ---
     auto* inBox = new QGroupBox(tr("Input File"), central);
@@ -114,6 +133,28 @@ MainWindow::MainWindow(QWidget* parent)
     infoLay->addRow(tr("MSPS (from name):"), m_mspsLabel);
     infoLay->addRow(tr("Total (real):"), m_totalLabel);
     root->addWidget(infoBox);
+    // --- Output processing ---
+    auto* outBox = new QGroupBox(tr("Output Processing"), central);
+    auto* outLay = new QFormLayout(outBox);
+    m_outputModeCombo = new QComboBox(outBox);
+    m_outputModeCombo->addItem(tr("Keep source rate"), quint64(0));
+    m_outputModeCombo->setEnabled(false);
+    m_outputBitsCombo = new QComboBox(outBox);
+    m_outputBitsCombo->addItem(tr("Keep source bit-depth"), uint(0));
+    m_outputBitsCombo->addItem(tr("8-bit"), uint(8));
+    m_outputBitsCombo->addItem(tr("6-bit crush (stored as 8-bit FLAC)"), uint(6));
+    m_outputBitsCombo->setEnabled(false);
+    m_basicFilterCheck = new QCheckBox(tr("Apply basic RF filter profile"), outBox);
+    m_basicFilterCheck->setChecked(true);
+    m_basicFilterCheck->setEnabled(false);
+    m_filterProfileLabel = new QLabel(QStringLiteral("—"), outBox);
+    m_filterProfileLabel->setWordWrap(true);
+    m_filterProfileLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    outLay->addRow(tr("Output mode:"), m_outputModeCombo);
+    outLay->addRow(tr("Bit-depth:"), m_outputBitsCombo);
+    outLay->addRow(QString(), m_basicFilterCheck);
+    outLay->addRow(tr("Filter profile:"), m_filterProfileLabel);
+    root->addWidget(outBox);
 
     // --- Preview ---
     auto* prevBox = new QGroupBox(tr("Preview"), central);
@@ -128,7 +169,7 @@ MainWindow::MainWindow(QWidget* parent)
     root->addWidget(prevBox);
 
     // --- Process + progress + status ---
-    m_processBtn = new QPushButton(tr("Process FLAC (cut)"), central);
+    m_processBtn = new QPushButton(tr("Process FLAC"), central);
     m_processBtn->setEnabled(false);
     m_progress = new QProgressBar(central);
     m_progress->setRange(0, 1);
@@ -147,6 +188,12 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_setOutBtn, &QPushButton::clicked, this, &MainWindow::setOutFromBox);
     connect(m_slider, &QRangeSlider::inValueChanged, this, &MainWindow::onSliderInChanged);
     connect(m_slider, &QRangeSlider::outValueChanged, this, &MainWindow::onSliderOutChanged);
+    connect(m_outputModeCombo, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, &MainWindow::applyCut);
+    connect(m_outputBitsCombo, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, &MainWindow::applyCut);
+    connect(m_basicFilterCheck, &QCheckBox::toggled,
+            this, &MainWindow::applyCut);
 
     // Drag & drop: the window accepts file drops; the time box must not swallow them.
     setAcceptDrops(true);
@@ -172,6 +219,10 @@ void MainWindow::setControlsEnabled(bool enabled)
     m_timeEdit->setEnabled(enabled);
     m_setInBtn->setEnabled(enabled && m_probeOk);
     m_setOutBtn->setEnabled(enabled && m_probeOk);
+    m_outputModeCombo->setEnabled(enabled && m_probeOk && m_outputModeCombo->count() > 1);
+    m_outputBitsCombo->setEnabled(enabled && m_probeOk);
+    const quint64 outRate = m_outputModeCombo->currentData().toULongLong();
+    m_basicFilterCheck->setEnabled(enabled && m_probeOk && outRate > 0);
 }
 
 void MainWindow::browse()
@@ -219,6 +270,23 @@ void MainWindow::unloadFile()
     m_startSampLabel->setText(QStringLiteral("—"));
     m_lenSampLabel->setText(QStringLiteral("—"));
     m_outPathLabel->setText(QStringLiteral("—"));
+    {
+        QSignalBlocker b1(m_outputModeCombo);
+        m_outputModeCombo->clear();
+        m_outputModeCombo->addItem(tr("Keep source rate"), quint64(0));
+        m_outputModeCombo->setEnabled(false);
+    }
+    {
+        QSignalBlocker b2(m_outputBitsCombo);
+        m_outputBitsCombo->setCurrentIndex(0);
+        m_outputBitsCombo->setEnabled(false);
+    }
+    {
+        QSignalBlocker b3(m_basicFilterCheck);
+        m_basicFilterCheck->setChecked(true);
+        m_basicFilterCheck->setEnabled(false);
+    }
+    m_filterProfileLabel->setText(QStringLiteral("—"));
 
     setProbeInfo();
 }
@@ -274,6 +342,34 @@ void MainWindow::onProbeFinished()
     }
 
     setProbeInfo();
+    {
+        QSignalBlocker b(m_outputModeCombo);
+        m_outputModeCombo->clear();
+        m_outputModeCombo->addItem(tr("Keep source rate"), quint64(0));
+        if (m_probe.is_rf) {
+            struct ModeEntry { quint64 headerRateHz; const char* label; };
+            const ModeEntry modes[] = {
+                {20000, "20 MSPS"},
+                {24000, "24 MSPS"},
+                {28600, "28.6 MSPS (8fsc)"},
+                {16000, "16 MSPS (VHS experimental)"},
+            };
+            for (const auto& m : modes) {
+                const double outRealHz = double(m.headerRateHz) * 1000.0;
+                if (m_probe.real_rate_hz + 0.5 >= outRealHz)
+                    m_outputModeCombo->addItem(tr(m.label), m.headerRateHz);
+            }
+        }
+        m_outputModeCombo->setCurrentIndex(0);
+    }
+    {
+        QSignalBlocker b(m_outputBitsCombo);
+        m_outputBitsCombo->setCurrentIndex(0);
+    }
+    {
+        QSignalBlocker b(m_basicFilterCheck);
+        m_basicFilterCheck->setChecked(true);
+    }
 
     // On load, put the IN/OUT markers at each end of the tape: IN at the
     // start (00:00:00) and OUT at the full real duration, so the slider's
@@ -485,6 +581,9 @@ void MainWindow::applyCut()
 {
     m_plan = FcPlan{};
     m_outPath.clear();
+    const quint64 outHeaderRateHz = m_outputModeCombo->currentData().toULongLong();
+    const uint outBits = m_outputBitsCombo->currentData().toUInt();
+    const bool useBasicFilter = (outHeaderRateHz > 0) && m_basicFilterCheck->isChecked();
 
     if (!m_probeOk) {
         m_inLabel->setText(QStringLiteral("--:--:--.--"));
@@ -493,8 +592,36 @@ void MainWindow::applyCut()
         m_startSampLabel->setText(QStringLiteral("—"));
         m_lenSampLabel->setText(QStringLiteral("—"));
         m_outPathLabel->setText(QStringLiteral("—"));
+        m_filterProfileLabel->setText(QStringLiteral("—"));
         m_processBtn->setEnabled(false);
         return;
+    }
+    if (outHeaderRateHz == 0) {
+        m_filterProfileLabel->setText(tr("off (keeping source rate)"));
+    } else if (useBasicFilter) {
+        const QString profile = rfFilterProfileText(outHeaderRateHz);
+        if (profile.isEmpty())
+            m_filterProfileLabel->setText(tr("on (no preset profile for this rate)"));
+        else
+            m_filterProfileLabel->setText(profile);
+    } else {
+        m_filterProfileLabel->setText(tr("off"));
+    }
+    m_basicFilterCheck->setEnabled(m_probeOk && outHeaderRateHz > 0 && m_browseBtn->isEnabled());
+
+    if (outHeaderRateHz > 0) {
+        if (!m_probe.is_rf) {
+            m_statusLabel->setText(tr("Output MSPS modes are only available for RF captures."));
+            m_processBtn->setEnabled(false);
+            return;
+        }
+        const double outRealHz = double(outHeaderRateHz) * 1000.0;
+        if (outRealHz > m_probe.real_rate_hz + 0.5) {
+            m_statusLabel->setText(tr("Selected output mode (%1) is above input rate.")
+                .arg(modeDisplay(outHeaderRateHz)));
+            m_processBtn->setEnabled(false);
+            return;
+        }
     }
 
     double startSec = m_inSec;
@@ -532,14 +659,25 @@ void MainWindow::applyCut()
     m_lenSampLabel->setText(ulongStr(m_plan.length_samples));
     m_outPathLabel->setText(m_outPath);
     m_processBtn->setEnabled(true);
-    m_statusLabel->setText(tr("Plan ready: %1 + %2 samples.")
-        .arg(ulongStr(m_plan.start_samples), ulongStr(m_plan.length_samples)));
+    const QString bitsText =
+        (outBits == 0) ? tr("source depth")
+      : (outBits == 6) ? tr("6-bit crush in 8-bit FLAC")
+      : tr("%1-bit").arg(outBits);
+    const QString modeText = modeDisplay(outHeaderRateHz);
+    m_statusLabel->setText(tr("Plan ready: %1 + %2 samples | output %3 | %4.")
+        .arg(ulongStr(m_plan.start_samples),
+             ulongStr(m_plan.length_samples),
+             modeText,
+             bitsText));
 }
 
 void MainWindow::process()
 {
     if (!m_probeOk || !m_plan.ok || m_outPath.isEmpty())
         return;
+    const quint64 outHeaderRateHz = m_outputModeCombo->currentData().toULongLong();
+    const quint32 outBits = m_outputBitsCombo->currentData().toUInt();
+    const qint32 basicFilter = (outHeaderRateHz > 0 && m_basicFilterCheck->isChecked()) ? 1 : 0;
 
     if (QFile::exists(m_outPath)) {
         auto r = QMessageBox::question(this, tr("Overwrite?"),
@@ -551,19 +689,26 @@ void MainWindow::process()
 
     setControlsEnabled(false);
     m_progress->setRange(0, 0); // busy indicator
-    m_statusLabel->setText(tr("Processing... sox trim %1s %2s")
-        .arg(ulongStr(m_plan.start_samples), ulongStr(m_plan.length_samples)));
+    const QString bitsText =
+        (outBits == 0) ? tr("source depth")
+      : (outBits == 6) ? tr("6-bit crush")
+      : tr("%1-bit").arg(outBits);
+    m_statusLabel->setText(tr("Processing... trim %1s %2s | %3 | %4")
+        .arg(ulongStr(m_plan.start_samples),
+             ulongStr(m_plan.length_samples),
+             modeDisplay(outHeaderRateHz),
+             bitsText));
 
     const QString inPath = m_inPath;
     const QString outPath = m_outPath;
     const quint64 start = m_plan.start_samples;
     const quint64 len = m_plan.length_samples;
-
-    auto fut = QtConcurrent::run([inPath, outPath, start, len]() -> FcChopResult {
+    auto fut = QtConcurrent::run([inPath, outPath, start, len, outHeaderRateHz, outBits, basicFilter]() -> FcChopResult {
         FcChopResult r{};
         QByteArray inB = inPath.toUtf8();
         QByteArray outB = outPath.toUtf8();
-        fc_chop(inB.constData(), outB.constData(), start, len, &r);
+        fc_chop(inB.constData(), outB.constData(), start, len,
+                outHeaderRateHz, outBits, basicFilter, &r);
         return r;
     });
     m_watcher->setFuture(fut);

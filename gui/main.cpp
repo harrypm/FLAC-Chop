@@ -39,7 +39,14 @@ int main(int argc, char* argv[])
     app.setApplicationVersion("v1.0.0");
     app.setOrganizationName("FLAC-Chop");
     applyDarkFusion(app);
-    const QIcon appIcon(":/icons/flac-chop-icon.png");
+    QIcon appIcon;
+#if defined(Q_OS_WIN)
+    appIcon = QIcon(":/icons/flac-chop-icon.ico");
+    if (appIcon.isNull())
+        appIcon = QIcon(":/icons/flac-chop-icon.png");
+#else
+    appIcon = QIcon(":/icons/flac-chop-icon.png");
+#endif
     app.setWindowIcon(appIcon);
 
     MainWindow w;

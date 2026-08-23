@@ -12,6 +12,8 @@ class QLineEdit;
 class QPushButton;
 class QProgressBar;
 class QRangeSlider;
+class QComboBox;
+class QCheckBox;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -79,6 +81,10 @@ private:
     QLabel* m_startSampLabel = nullptr;
     QLabel* m_lenSampLabel = nullptr;
     QLabel* m_outPathLabel = nullptr;
+    QComboBox* m_outputModeCombo = nullptr;
+    QComboBox* m_outputBitsCombo = nullptr;
+    QCheckBox* m_basicFilterCheck = nullptr;
+    QLabel* m_filterProfileLabel = nullptr;
     QPushButton* m_processBtn = nullptr;
     QProgressBar* m_progress = nullptr;
     QLabel* m_statusLabel = nullptr;
