@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QIcon>
 #include <QPalette>
 #include <cstdlib>
 #include "mainwindow.h"
@@ -38,8 +39,11 @@ int main(int argc, char* argv[])
     app.setApplicationVersion("v1.0.0");
     app.setOrganizationName("FLAC-Chop");
     applyDarkFusion(app);
+    const QIcon appIcon(":/icons/flac-chop-icon.png");
+    app.setWindowIcon(appIcon);
 
     MainWindow w;
+    w.setWindowIcon(appIcon);
     w.show();
 
     return app.exec();

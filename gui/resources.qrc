@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/">
+    <file alias="icons/flac-chop-icon.png">../assets/icons/flac-chop-icon.png</file>
+  </qresource>
+</RCC>

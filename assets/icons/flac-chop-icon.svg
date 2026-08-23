@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <linearGradient id="frameFill" x1="512" y1="120" x2="512" y2="904" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#59606D"/>
+      <stop offset="1" stop-color="#2B3039"/>
+    </linearGradient>
+    <linearGradient id="plateFill" x1="512" y1="188" x2="512" y2="836" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#254E2E"/>
+      <stop offset="1" stop-color="#102517"/>
+    </linearGradient>
+    <linearGradient id="plateGlow" x1="188" y1="512" x2="836" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#5AFF8A" stop-opacity="0.0"/>
+      <stop offset="0.5" stop-color="#5AFF8A" stop-opacity="0.38"/>
+      <stop offset="1" stop-color="#5AFF8A" stop-opacity="0.0"/>
+    </linearGradient>
+    <linearGradient id="bladeFill" x1="512" y1="170" x2="512" y2="786" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6FAFF"/>
+      <stop offset="0.52" stop-color="#D2DAE5"/>
+      <stop offset="1" stop-color="#A6B0BD"/>
+    </linearGradient>
+  </defs>
+  <rect x="120" y="120" width="784" height="784" rx="170" fill="url(#frameFill)"/>
+  <rect x="120" y="120" width="784" height="784" rx="170" stroke="#7E8898" stroke-width="14"/>
+  <rect x="188" y="188" width="648" height="648" rx="128" fill="url(#plateFill)"/>
+  <rect x="188" y="188" width="648" height="648" rx="128" stroke="#56D274" stroke-opacity="0.35" stroke-width="10"/>
+  <rect x="188" y="450" width="648" height="124" fill="url(#plateGlow)"/>
+  <path d="M220 328H804" stroke="#62E98A" stroke-opacity="0.16" stroke-width="6"/>
+  <path d="M220 512H804" stroke="#62E98A" stroke-opacity="0.16" stroke-width="6"/>
+  <path d="M220 696H804" stroke="#62E98A" stroke-opacity="0.16" stroke-width="6"/>
+  <g fill="#91FFAB" fill-opacity="0.56" font-family="Menlo, Consolas, monospace" font-size="56" font-weight="700">
+    <text x="236" y="300">1010010110</text>
+    <text x="236" y="382">0101101001</text>
+    <text x="236" y="464">1100101010</text>
+    <text x="236" y="546">0010110101</text>
+    <text x="236" y="628">1011001010</text>
+    <text x="236" y="710">0101010011</text>
+  </g>
+  <path d="M512 258V788" stroke="#0A0F0C" stroke-opacity="0.72" stroke-width="32" stroke-linecap="round"/>
+  <path d="M512 258V788" stroke="#74FF9B" stroke-opacity="0.62" stroke-width="6" stroke-linecap="round"/>
+  <g>
+    <rect x="446" y="112" width="132" height="92" rx="28" fill="#5A4030"/>
+    <rect x="462" y="124" width="100" height="68" rx="20" fill="#7A5842"/>
+    <rect x="475" y="170" width="74" height="560" rx="26" fill="url(#bladeFill)" stroke="#7A8493" stroke-width="8"/>
+    <path d="M475 730L512 786L549 730Z" fill="#B9C2CD"/>
+    <circle cx="512" cy="156" r="8" fill="#D2D8DF"/>
+  </g>
+  <circle cx="548" cy="603" r="6" fill="#66E08A"/>
+  <circle cx="477" cy="633" r="5" fill="#5FD680"/>
+  <circle cx="544" cy="666" r="4" fill="#7CF19A"/>
+</svg>

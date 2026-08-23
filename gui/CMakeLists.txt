@@ -42,12 +42,17 @@ add_custom_target(flac_chop_core DEPENDS "${CORE_LIB}")
 
 # --- GUI executable ----------------------------------------------------------
 
-add_executable(flac-chop
+set(GUI_SOURCES
     main.cpp
     mainwindow.cpp
     rangeslider.cpp
     rangeslider.h
+    resources.qrc
 )
+if(WIN32)
+    list(APPEND GUI_SOURCES windows_app_icon.rc)
+endif()
+add_executable(flac-chop ${GUI_SOURCES})
 
 target_include_directories(flac-chop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
