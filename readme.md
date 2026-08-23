@@ -17,6 +17,8 @@ whose FLAC header total is unknown.
   `DURATION_SECONDS`) as the authoritative in-file record.
 - Falls back to a sibling `.log`/`.wav` for unfinalized captures, then to an
   exact FLAC frame-header scan.
+- Surfaces non-fatal probe warnings (tag-unit corrections, Vorbis
+  self-consistency mismatches, scan misalignment) in the GUI and on CLI stderr.
 - Async probing — loading a 100 GB file doesn't freeze the window.
 - IN / OUT markers via a single time box + Set IN / Set OUT buttons (ld-analyse
   style), with a dual-handle slider.
@@ -39,13 +41,10 @@ whose FLAC header total is unknown.
 Cross-platform builds run on GitHub Actions (`.github/workflows/build.yml`).
 
 - **Latest CI build (any branch):** download the workflow run artifacts from
-  the [Actions tab](https://github.com/harrypm/FLAC-Chop/actions) —
-  `linux-zip-x86_64`, `linux-zip-arm64`, `windows-exe`, `windows-exe-arm64`,
-  `macos-app` (universal DMG). These are `dev-<sha>` builds.
+  the [Actions tab](https://github.com/harrypm/FLAC-Chop/actions). These are
+  `dev-<sha>` builds — the artifact per platform is listed below.
 - **Versioned releases:** push a `v*` tag (e.g. `v1.2.0`) and the release job
   publishes the same assets to a GitHub Release automatically.
-
-Artifacts:
 
 | Platform | Artifact | Contents |
 |---|---|---|
@@ -75,8 +74,10 @@ sudo apt install cmake ninja-build pkg-config qt6-base-dev rustc cargo sox
 ## Using the GUI
 1. **Browse** to a `.flac` RF capture (or drag-and-drop one onto the window).
 2. The probe runs on a background thread; the "Total (real)" label shows the
-   real-time duration and a provenance tag (`vorbis`, `companion file`,
-   `scanned from frames`, or `wrap-corrected +N×2³⁶`).
+   real-time duration and a provenance tag (`vorbis RF_TOTAL_SAMPLES`,
+   `companion file`, `scanned from frames`, or `wrap-corrected +N×2³⁶`). If
+   the probe emitted non-fatal warnings (e.g. a tag-unit correction), a ⚠ with
+   the details is appended to the label and shown in the status line.
 3. Move the slider or type a time into the time box, then click **Set IN** /
    **Set OUT** to drop the IN (green) and OUT (red) markers. On load the
    handles sit at the start/end of the tape.
@@ -98,9 +99,10 @@ The CLIs run the exact same probe → plan → SoX path as the GUI.
 - The GUI has been launched and confirmed on **Linux** and on **Windows x86_64**
   (the MinGW-runtime-DLL bundling step in `.github/workflows/build.yml` makes the
   CI-built exe start without a missing-DLL error). The **Windows arm64** and
-  macOS binaries are built by CI and verified as well-formed for their target
-  architecture (arm64 PE Machine 0xAA64), but have **not** been runtime-tested
-  yet — feedback welcome.
+  macOS binaries build and package on CI — the arm64 job runs natively on
+  `windows-11-arm` (MSYS2 `CLANGARM64` + the `aarch64-pc-windows-gnullvm` Rust
+  target) and the macOS job produces a universal DMG — but neither has been
+  runtime-tested yet; feedback welcome.
 - No progress percentage during a cut (SoX doesn't emit sample progress to a
   captured pipe easily); the GUI shows a busy indicator instead.
 - The cut is at the input sample rate. Decimation is a decode-side concern and
