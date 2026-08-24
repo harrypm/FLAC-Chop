@@ -1,7 +1,7 @@
 # FLAC-Chop
 
 
-<img width="150" height="150" alt="" src="assets/Icons/flac-chop-icon-512.png" />
+<img width="150" height="150" alt="" src="assets/icons/flac-chop-icon-512.png" />
 
 
 A small, cross-platform tool for **sample-exact cutting of RF-capture FLAC files**
