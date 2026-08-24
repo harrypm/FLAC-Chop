@@ -318,22 +318,54 @@ jobs:
           $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
-      - name: Create single-file self-extracting EXE artifact
+      - name: Create single-file Windows installer EXE
         shell: pwsh
         run: |
-          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)?.Source
-          if (-not $sevenZip) {
-            choco install 7zip -y
-            $candidates = @(
-              "$env:ProgramFiles\7-Zip\7z.exe",
-              "$env:ProgramFiles(x86)\7-Zip\7z.exe"
-            )
-            $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
           }
-          if (-not $sevenZip) { throw "7z.exe not found after attempting install." }
-          $OutExe = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.exe"
-          & $sevenZip a -t7z $OutExe "dist\*" -sfx
-          if (-not (Test-Path $OutExe)) { throw "Failed to create $OutExe" }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found after attempting install."
+          }
+          $version = "${{ steps.version.outputs.version }}"
+          $issPath = "flac-chop-x86_64.iss"
+          @"
+          [Setup]
+          AppName=FLAC-Chop
+          AppVersion=$version
+          AppPublisher=harrypm
+          DefaultDirName={localappdata}\Programs\FLAC-Chop
+          DisableProgramGroupPage=yes
+          OutputDir=.
+          OutputBaseFilename=windows_FLAC-Chop_${version}_x86_64
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          SetupIconFile=assets\icons\flac-chop-icon.ico
+          UninstallDisplayIcon={app}\flac-chop.exe
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop icon"; Flags: unchecked
+
+          [Files]
+          Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"
+          Name: "{autodesktop}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\flac-chop.exe"; Description: "Launch FLAC-Chop"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path $issPath -Encoding ASCII
+          & $iscc /Qp $issPath
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_x86_64.exe")) {
+            throw "Installer EXE was not generated."
+          }
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v6
@@ -453,22 +485,54 @@ jobs:
           $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
-      - name: Create single-file self-extracting EXE artifact
+      - name: Create single-file Windows installer EXE
         shell: pwsh
         run: |
-          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)?.Source
-          if (-not $sevenZip) {
-            choco install 7zip -y
-            $candidates = @(
-              "$env:ProgramFiles\7-Zip\7z.exe",
-              "$env:ProgramFiles(x86)\7-Zip\7z.exe"
-            )
-            $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
           }
-          if (-not $sevenZip) { throw "7z.exe not found after attempting install." }
-          $OutExe = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.exe"
-          & $sevenZip a -t7z $OutExe "dist\*" -sfx
-          if (-not (Test-Path $OutExe)) { throw "Failed to create $OutExe" }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found after attempting install."
+          }
+          $version = "${{ steps.version.outputs.version }}"
+          $issPath = "flac-chop-arm64.iss"
+          @"
+          [Setup]
+          AppName=FLAC-Chop
+          AppVersion=$version
+          AppPublisher=harrypm
+          DefaultDirName={localappdata}\Programs\FLAC-Chop
+          DisableProgramGroupPage=yes
+          OutputDir=.
+          OutputBaseFilename=windows_FLAC-Chop_${version}_arm64
+          Compression=lzma2
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          SetupIconFile=assets\icons\flac-chop-icon.ico
+          UninstallDisplayIcon={app}\flac-chop.exe
+
+          [Languages]
+          Name: "english"; MessagesFile: "compiler:Default.isl"
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop icon"; Flags: unchecked
+
+          [Files]
+          Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autoprograms}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"
+          Name: "{autodesktop}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"; Tasks: desktopicon
+
+          [Run]
+          Filename: "{app}\flac-chop.exe"; Description: "Launch FLAC-Chop"; Flags: nowait postinstall skipifsilent
+          "@ | Set-Content -Path $issPath -Encoding ASCII
+          & $iscc /Qp $issPath
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_arm64.exe")) {
+            throw "Installer EXE was not generated."
+          }
 
       - name: Upload Windows arm64 ZIP
         uses: actions/upload-artifact@v6
