@@ -158,8 +158,9 @@ jobs:
           StartupNotify=true
           EOF
 
-          # Use the checked-in branded app icon for AppImage metadata.
-          cp assets/icons/flac-chop-icon.png AppDir/flac-chop.png
+          # AppImage tooling rejects 1024x1024 icons; use a validated 512x512
+          # raster source for metadata embedding.
+          cp assets/icons/flac-chop-icon-512.png AppDir/flac-chop.png
 
           cat > AppDir/AppRun <<'EOF'
           #!/usr/bin/env bash
@@ -317,11 +318,30 @@ jobs:
           $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
+      - name: Create single-file self-extracting EXE artifact
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)?.Source
+          if (-not $sevenZip) {
+            choco install 7zip -y
+            $candidates = @(
+              "$env:ProgramFiles\7-Zip\7z.exe",
+              "$env:ProgramFiles(x86)\7-Zip\7z.exe"
+            )
+            $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $sevenZip) { throw "7z.exe not found after attempting install." }
+          $OutExe = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.exe"
+          & $sevenZip a -t7z $OutExe "dist\*" -sfx
+          if (-not (Test-Path $OutExe)) { throw "Failed to create $OutExe" }
+
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe
-          path: windows_FLAC-Chop_*_x86_64.zip
+          path: |
+            windows_FLAC-Chop_*_x86_64.zip
+            windows_FLAC-Chop_*_x86_64.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -433,11 +453,30 @@ jobs:
           $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
+      - name: Create single-file self-extracting EXE artifact
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue)?.Source
+          if (-not $sevenZip) {
+            choco install 7zip -y
+            $candidates = @(
+              "$env:ProgramFiles\7-Zip\7z.exe",
+              "$env:ProgramFiles(x86)\7-Zip\7z.exe"
+            )
+            $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $sevenZip) { throw "7z.exe not found after attempting install." }
+          $OutExe = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.exe"
+          & $sevenZip a -t7z $OutExe "dist\*" -sfx
+          if (-not (Test-Path $OutExe)) { throw "Failed to create $OutExe" }
+
       - name: Upload Windows arm64 ZIP
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe-arm64
-          path: windows_FLAC-Chop_*_arm64.zip
+          path: |
+            windows_FLAC-Chop_*_arm64.zip
+            windows_FLAC-Chop_*_arm64.exe
           if-no-files-found: error
 
   # --- macOS APP (arm64 + x86_64, then universal DMG) ---
@@ -729,5 +768,7 @@ jobs:
             release-assets/**/linux_FLAC-Chop_*_x86.zip
             release-assets/**/linux_FLAC-Chop_*_arm64.zip
             release-assets/**/windows_FLAC-Chop_*_x86_64.zip
+            release-assets/**/windows_FLAC-Chop_*_x86_64.exe
             release-assets/**/windows_FLAC-Chop_*_arm64.zip
+            release-assets/**/windows_FLAC-Chop_*_arm64.exe
             release-assets/**/macos_FLAC-Chop_*_universal.dmg

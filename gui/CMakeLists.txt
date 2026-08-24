@@ -52,7 +52,11 @@ set(GUI_SOURCES
 if(WIN32)
     list(APPEND GUI_SOURCES windows_app_icon.rc)
 endif()
-add_executable(flac-chop ${GUI_SOURCES})
+if(WIN32)
+    add_executable(flac-chop WIN32 ${GUI_SOURCES})
+else()
+    add_executable(flac-chop ${GUI_SOURCES})
+endif()
 if(WIN32)
     set_source_files_properties(
         windows_app_icon.rc

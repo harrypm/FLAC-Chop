@@ -55,8 +55,8 @@ Cross-platform builds run on GitHub Actions (`.github/workflows/build.yml`).
 |---|---|---|
 | Linux x86_64 | `linux-zip-x86_64` | AppImage (~26 MB) |
 | Linux arm64 | `linux-zip-arm64` | AppImage (~25 MB) |
-| Windows x86_64 | `windows-exe` | `flac-chop.exe` + Qt6 + MinGW runtime DLLs (ZIP) |
-| Windows arm64 | `windows-exe-arm64` | `flac-chop.exe` + Qt6 + LLVM-mingw runtime DLLs (ZIP) |
+| Windows x86_64 | `windows-exe` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs) plus single-file self-extracting `windows_FLAC-Chop_*_x86_64.exe` |
+| Windows arm64 | `windows-exe-arm64` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs) plus single-file self-extracting `windows_FLAC-Chop_*_arm64.exe` |
 | macOS universal | `macos-app` | universal `FLAC-Chop.dmg` (arm64 + x86_64, ~134 MB) |
 
 > SoX is still a separate runtime install on every platform (see above).
