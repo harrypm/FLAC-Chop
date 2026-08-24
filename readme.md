@@ -31,11 +31,11 @@ whose FLAC header total is unknown.
 
 ## Requirements
 **Runtime:**
-- **SoX** on PATH — FLAC-Chop shells out to `sox` for the actual cut. It is not
-  bundled. Install it separately:
-  - Linux: `sudo apt install sox`
-  - macOS: `brew install sox`
-  - Windows: install [SoX for Windows](https://sourceforge.net/projects/sox/) and add it to PATH.
+- FLAC-Chop shells out to `sox` for the actual cut.
+  - Linux: install SoX (`sudo apt install sox`)
+  - macOS: install SoX (`brew install sox`)
+  - Windows packaged builds (CI ZIP/installer): `sox.exe` is bundled
+  - Windows source builds: install [SoX for Windows](https://sourceforge.net/projects/sox/) and add it to PATH.
 
 **Build from source:**
 - Rust / cargo (stable)
@@ -55,11 +55,11 @@ Cross-platform builds run on GitHub Actions (`.github/workflows/build.yml`).
 |---|---|---|
 | Linux x86_64 | `linux-zip-x86_64` | AppImage (~26 MB) |
 | Linux arm64 | `linux-zip-arm64` | AppImage (~25 MB) |
-| Windows x86_64 | `windows-exe` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs) plus single-file installer `windows_FLAC-Chop_*_x86_64.exe` |
-| Windows arm64 | `windows-exe-arm64` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs) plus single-file installer `windows_FLAC-Chop_*_arm64.exe` |
+| Windows x86_64 | `windows-exe` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs + SoX) plus single-file installer `windows_FLAC-Chop_*_x86_64.exe` |
+| Windows arm64 | `windows-exe-arm64` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs + SoX) plus single-file installer `windows_FLAC-Chop_*_arm64.exe` |
 | macOS universal | `macos-app` | universal `FLAC-Chop.dmg` (arm64 + x86_64, ~134 MB) |
 
-> SoX is still a separate runtime install on every platform (see above).
+> Linux/macOS still require a separate SoX install; Windows packaged builds include SoX.
 
 ## Build from source
 ```bash

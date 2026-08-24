@@ -220,6 +220,7 @@ jobs:
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-qt6-tools
+            mingw-w64-x86_64-sox
 
       - name: Resolve build version
         id: version
@@ -269,7 +270,10 @@ jobs:
           mkdir -p dist
           cp "$BUILD_DIR/gui/flac-chop.exe" dist/
           windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
-          # SoX is NOT bundled — it is a runtime dep (user installs SoX for Windows).
+          # Bundle SoX for Windows artifacts so users do not need a separate
+          # SoX install on PATH.
+          cp "/mingw64/bin/sox.exe" dist/
+          test -x dist/sox.exe
 
       - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
         shell: msys2 {0}
@@ -308,6 +312,10 @@ jobs:
           LEAKS=$(ldd dist/flac-chop.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
           if [ -n "$LEAKS" ]; then
             echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
+          fi
+          SOX_LEAKS=$(ldd dist/sox.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
+          if [ -n "$SOX_LEAKS" ]; then
+            echo "::error::sox.exe still has un-bundled ${BINDIR} deps:"; echo "$SOX_LEAKS"; exit 1
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
@@ -398,6 +406,7 @@ jobs:
             mingw-w64-clang-aarch64-pkgconf
             mingw-w64-clang-aarch64-qt6-base
             mingw-w64-clang-aarch64-qt6-tools
+            mingw-w64-clang-aarch64-sox
 
       - name: Resolve build version
         id: version
@@ -450,7 +459,10 @@ jobs:
           mkdir -p dist
           cp "$BUILD_DIR/gui/flac-chop.exe" dist/
           windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
-          # SoX is NOT bundled — it is a runtime dep (user installs SoX for Windows).
+          # Bundle SoX for Windows artifacts so users do not need a separate
+          # SoX install on PATH.
+          cp "/clangarm64/bin/sox.exe" dist/
+          test -x dist/sox.exe
 
       - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
         shell: msys2 {0}
@@ -475,6 +487,10 @@ jobs:
           LEAKS=$(ldd dist/flac-chop.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
           if [ -n "$LEAKS" ]; then
             echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
+          fi
+          SOX_LEAKS=$(ldd dist/sox.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
+          if [ -n "$SOX_LEAKS" ]; then
+            echo "::error::sox.exe still has un-bundled ${BINDIR} deps:"; echo "$SOX_LEAKS"; exit 1
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
@@ -823,11 +839,12 @@ jobs:
             ## Runtime requirement: SoX
 
             FLAC-Chop shells out to **SoX** for the actual sample-exact cut.
-            Install it separately — it is not bundled in these packages:
+            Linux/macOS require a separate SoX install; Windows packages now
+            bundle SoX in the installer/ZIP artifacts:
 
             - **Linux:** `sudo apt install sox`
             - **macOS:** `brew install sox`
-            - **Windows:** install SoX for Windows and add it to your PATH.
+            - **Windows:** no separate SoX install required for packaged builds.
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.zip
             release-assets/**/linux_FLAC-Chop_*_arm64.zip
