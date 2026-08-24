@@ -1,7 +1,13 @@
 # FLAC-Chop
 
+
+<img width="150" height="150" alt="" src="assets/Icons/flac-chop-icon-512.png" />
+
+
 A small, cross-platform tool for **sample-exact cutting of RF-capture FLAC files**
-(LaserDisc / VHS / etc. as produced by the Domesday Duplicator / MISRC pipeline).
+
+(Ideally produced by the [MISRC-GUI](https://github.com/harrypm/MISRC-GUI) pipeline)
+
 A Rust core reads the FLAC metadata directly (no `soxi`/`ffprobe` shell-out) and
 [SoX](https://sox.sourceforge.net/) performs the actual cut. The GUI is Qt6.
 
@@ -10,7 +16,17 @@ files: the RF "20 kHz header = 20 MSPS real" convention, the 36-bit
 `total_samples` wrap that long captures hit, and unfinalized/piped captures
 whose FLAC header total is unknown.
 
+
+## Downloads
+
+
+Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://github.com/harrypm/FLAC-Chop/releases)
+
+
 ## Features
+
+<img width="722" height="841" alt="image" src="https://github.com/user-attachments/assets/3109c23f-0018-478c-a809-f214374c7b3d" />
+
 - Real-time HH:MM:SS duration for RF captures, not the 1000×-wrong header value.
 - Handles `total_samples` wrapping past 2³⁶ (recovers the true sample count).
 - Reads the MISRC/DdD Vorbis tags (`RF_TOTAL_SAMPLES`, `RF_SAMPLE_RATE`,
@@ -29,54 +45,8 @@ whose FLAC header total is unknown.
   8-bit FLAC container).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 
-## Requirements
-**Runtime:**
-- FLAC-Chop shells out to `sox` for the actual cut.
-  - Linux: install SoX (`sudo apt install sox`)
-  - macOS: install SoX (`brew install sox`)
-  - Windows packaged builds (CI ZIP/installer): `sox.exe` is bundled
-  - Windows source builds: install [SoX for Windows](https://sourceforge.net/projects/sox/) and add it to PATH.
-
-**Build from source:**
-- Rust / cargo (stable)
-- Qt 6 (Widgets, Concurrent) + dev headers
-- CMake ≥ 3.16 and Ninja (recommended)
-
-## Get prebuilt binaries
-Cross-platform builds run on GitHub Actions (`.github/workflows/build.yml`).
-
-- **Latest CI build (any branch):** download the workflow run artifacts from
-  the [Actions tab](https://github.com/harrypm/FLAC-Chop/actions). These are
-  `dev-<sha>` builds — the artifact per platform is listed below.
-- **Versioned releases:** push a `v*` tag (e.g. `v1.2.0`) and the release job
-  publishes the same assets to a GitHub Release automatically.
-
-| Platform | Artifact | Contents |
-|---|---|---|
-| Linux x86_64 | `linux-zip-x86_64` | AppImage (~26 MB) |
-| Linux arm64 | `linux-zip-arm64` | AppImage (~25 MB) |
-| Windows x86_64 | `windows-exe` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs + SoX) plus single-file installer `windows_FLAC-Chop_*_x86_64.exe` |
-| Windows arm64 | `windows-exe-arm64` | ZIP (`flac-chop.exe` + Qt6/runtime DLLs + SoX) plus single-file installer `windows_FLAC-Chop_*_arm64.exe` |
-| macOS universal | `macos-app` | universal `FLAC-Chop.dmg` (arm64 + x86_64, ~134 MB) |
-
-> Linux/macOS still require a separate SoX install; Windows packaged builds include SoX.
-
-## Build from source
-```bash
-cd FLAC-Chop
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-./build/gui/flac-chop
-```
-This builds the Rust core (`cargo build --release`, invoked by CMake) and links
-the Qt6 GUI against it.
-
-Linux apt example:
-```bash
-sudo apt install cmake ninja-build pkg-config qt6-base-dev rustc cargo sox
-```
-
 ## Using the GUI
+
 1. **Browse** to a `.flac` RF capture (or drag-and-drop one onto the window).
 2. The probe runs on a background thread; the "Total (real)" label shows the
    real-time duration and a provenance tag (`vorbis RF_TOTAL_SAMPLES`,
@@ -91,6 +61,7 @@ sudo apt install cmake ninja-build pkg-config qt6-base-dev rustc cargo sox
    so the cut is sample-exact at the real MSPS rate).
 
 ## Headless use
+
 ```bash
 # probe a file (print real rate, total samples, real duration, provenance)
 cargo run --release --manifest-path core/Cargo.toml --example probe_cli -- file.flac
@@ -100,20 +71,13 @@ cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.f
 ```
 The CLIs run the exact same probe → plan → SoX path as the GUI.
 
-## Status & limitations
-- The GUI has been launched and confirmed on **Linux** and on **Windows x86_64**
-  (the MinGW-runtime-DLL bundling step in `.github/workflows/build.yml` makes the
-  CI-built exe start without a missing-DLL error). The **Windows arm64** and
-  macOS binaries build and package on CI — the arm64 job runs natively on
-  `windows-11-arm` (MSYS2 `CLANGARM64` + the `aarch64-pc-windows-gnullvm` Rust
-  target) and the macOS job produces a universal DMG — but neither has been
-  runtime-tested yet; feedback welcome.
+## Status & Limitations
+
 - No progress percentage during a cut (SoX doesn't emit sample progress to a
   captured pipe easily); the GUI shows a busy indicator instead.
 - 6-bit RF output is emulated by quantizing to 6-bit precision and storing in
   an 8-bit FLAC container (SoX/FLAC cannot encode true 6-bit FLAC directly).
-- No tagged release yet; CI binaries so far are `dev-<sha>` builds.
 
-## Development notes
-Design rationale, reference extraction, the per-session development log, and
-verification hard data are in [`dev_notes.md`](dev_notes.md).
+## Author
+
+© Harry Munday 2026 harry@opcomedia.com (therealharrypm - Discord) 
