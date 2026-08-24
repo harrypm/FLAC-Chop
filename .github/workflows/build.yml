@@ -313,18 +313,25 @@ jobs:
           if [ -n "$LEAKS" ]; then
             echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
           fi
-          SOX_LEAKS=$(ldd dist/sox.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
-          if [ -n "$SOX_LEAKS" ]; then
-            echo "::error::sox.exe still has un-bundled ${BINDIR} deps:"; echo "$SOX_LEAKS"; exit 1
+          # ldd may still resolve DLLs to ${BINDIR} even when matching DLLs are
+          # present in dist/. Validate by basename presence in dist/ instead.
+          SOX_MISSING=""
+          while IFS= read -r sox_dll; do
+            [ -z "$sox_dll" ] && continue
+            if [ ! -f "dist/$sox_dll" ]; then
+              SOX_MISSING+="$sox_dll"$'\n'
+            fi
+          done < <(ldd dist/sox.exe 2>/dev/null \
+                   | grep -oE "${BINDIR}/[^ ]+\\.dll" \
+                   | xargs -r -n1 basename \
+                   | sort -u)
+          if [ -n "$SOX_MISSING" ]; then
+            echo "::error::sox.exe is missing required bundled DLLs:"
+            printf '%s' "$SOX_MISSING"
+            exit 1
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
-
-      - name: Create ZIP artifact
-        shell: pwsh
-        run: |
-          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
-          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
       - name: Create single-file Windows installer EXE
         shell: pwsh
@@ -375,13 +382,11 @@ jobs:
             throw "Installer EXE was not generated."
           }
 
-      - name: Upload Windows ZIP
+      - name: Upload Windows x86 installer
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe
-          path: |
-            windows_FLAC-Chop_*_x86_64.zip
-            windows_FLAC-Chop_*_x86_64.exe
+          path: windows_FLAC-Chop_*_x86_64.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -488,9 +493,22 @@ jobs:
           if [ -n "$LEAKS" ]; then
             echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
           fi
-          SOX_LEAKS=$(ldd dist/sox.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
-          if [ -n "$SOX_LEAKS" ]; then
-            echo "::error::sox.exe still has un-bundled ${BINDIR} deps:"; echo "$SOX_LEAKS"; exit 1
+          # ldd may still resolve DLLs to ${BINDIR} even when matching DLLs are
+          # present in dist/. Validate by basename presence in dist/ instead.
+          SOX_MISSING=""
+          while IFS= read -r sox_dll; do
+            [ -z "$sox_dll" ] && continue
+            if [ ! -f "dist/$sox_dll" ]; then
+              SOX_MISSING+="$sox_dll"$'\n'
+            fi
+          done < <(ldd dist/sox.exe 2>/dev/null \
+                   | grep -oE "${BINDIR}/[^ ]+\\.dll" \
+                   | xargs -r -n1 basename \
+                   | sort -u)
+          if [ -n "$SOX_MISSING" ]; then
+            echo "::error::sox.exe is missing required bundled DLLs:"
+            printf '%s' "$SOX_MISSING"
+            exit 1
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
@@ -848,7 +866,6 @@ jobs:
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.zip
             release-assets/**/linux_FLAC-Chop_*_arm64.zip
-            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
             release-assets/**/windows_FLAC-Chop_*_x86_64.exe
             release-assets/**/windows_FLAC-Chop_*_arm64.zip
             release-assets/**/windows_FLAC-Chop_*_arm64.exe
