@@ -11,17 +11,31 @@
 #include <QCheckBox>
 #include <QPushButton>
 #include <QProgressBar>
+#include <QMenuBar>
+#include <QMenu>
+#include <QAction>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QDir>
 #include <QFileInfo>
 #include <QFile>
+#include <QCoreApplication>
 #include <QtConcurrent>
 #include <QSignalBlocker>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
 #include <QUrl>
+#include <QDesktopServices>
+#include <QDateTime>
+#include <QSettings>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QVersionNumber>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <cmath>
 #include "rangeslider.h"
 
@@ -57,6 +71,20 @@ static QString modeDisplay(quint64 outHeaderRateHz)
     }
 }
 
+static QVersionNumber parseReleaseVersion(const QString& raw)
+{
+    QString s = raw.trimmed();
+    if (s.startsWith(QLatin1Char('v'), Qt::CaseInsensitive))
+        s.remove(0, 1);
+    const int plus = s.indexOf(QLatin1Char('+'));
+    if (plus > 0)
+        s = s.left(plus);
+    const int dash = s.indexOf(QLatin1Char('-'));
+    if (dash > 0)
+        s = s.left(dash);
+    return QVersionNumber::fromString(s);
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -68,6 +96,24 @@ MainWindow::MainWindow(QWidget* parent)
     auto* root = new QVBoxLayout(central);
     root->setContentsMargins(12, 12, 12, 12);
     root->setSpacing(10);
+
+    // --- Top menu bar ---
+    auto* fileMenu = menuBar()->addMenu(tr("&File"));
+    QAction* openAct = fileMenu->addAction(tr("&Open FLAC..."));
+    connect(openAct, &QAction::triggered, this, &MainWindow::browse);
+    fileMenu->addSeparator();
+    QAction* exitAct = fileMenu->addAction(tr("E&xit"));
+    connect(exitAct, &QAction::triggered, this, &QWidget::close);
+
+    auto* helpMenu = menuBar()->addMenu(tr("&Help"));
+    QAction* checkUpdatesAct = helpMenu->addAction(tr("Check for &Updates"));
+    connect(checkUpdatesAct, &QAction::triggered, this, &MainWindow::checkForUpdatesManual);
+    QAction* docsAct = helpMenu->addAction(tr("&Documentation (README)"));
+    connect(docsAct, &QAction::triggered, this, [this]() {
+        const QUrl docsUrl(QStringLiteral("https://github.com/harrypm/FLAC-Chop#readme"));
+        if (!QDesktopServices::openUrl(docsUrl))
+            m_statusLabel->setText(tr("Unable to open documentation URL."));
+    });
 
     // --- Input file ---
     auto* inBox = new QGroupBox(tr("Input File"), central);
@@ -171,19 +217,24 @@ MainWindow::MainWindow(QWidget* parent)
     // --- Process + progress + status ---
     m_processBtn = new QPushButton(tr("Process FLAC"), central);
     m_processBtn->setEnabled(false);
+    m_checkUpdatesBtn = new QPushButton(tr("Check for Updates"), central);
+    auto* actionLay = new QHBoxLayout();
+    actionLay->addWidget(m_processBtn, 1);
+    actionLay->addWidget(m_checkUpdatesBtn);
     m_progress = new QProgressBar(central);
     m_progress->setRange(0, 1);
     m_progress->setValue(0);
     m_progress->setTextVisible(false);
     m_statusLabel = new QLabel(tr("Ready — select a FLAC file."), central);
     m_statusLabel->setWordWrap(true);
-    root->addWidget(m_processBtn);
+    root->addLayout(actionLay);
     root->addWidget(m_progress);
     root->addWidget(m_statusLabel);
     root->addStretch(1);
 
     connect(m_browseBtn, &QPushButton::clicked, this, &MainWindow::browse);
     connect(m_processBtn, &QPushButton::clicked, this, &MainWindow::process);
+    connect(m_checkUpdatesBtn, &QPushButton::clicked, this, &MainWindow::checkForUpdatesManual);
     connect(m_setInBtn, &QPushButton::clicked, this, &MainWindow::setInFromBox);
     connect(m_setOutBtn, &QPushButton::clicked, this, &MainWindow::setOutFromBox);
     connect(m_slider, &QRangeSlider::inValueChanged, this, &MainWindow::onSliderInChanged);
@@ -206,10 +257,12 @@ MainWindow::MainWindow(QWidget* parent)
     m_probeWatcher = new QFutureWatcher<FcProbe>(this);
     connect(m_probeWatcher, &QFutureWatcher<FcProbe>::finished,
             this, &MainWindow::onProbeFinished);
+    m_net = new QNetworkAccessManager(this);
 
     if (!fc_sox_available()) {
         m_statusLabel->setText(tr("WARNING: `sox` not found on PATH — cutting will fail."));
     }
+    maybeCheckForUpdates();
 }
 
 void MainWindow::setControlsEnabled(bool enabled)
@@ -732,6 +785,151 @@ void MainWindow::onChopFinished()
     }
 
     setControlsEnabled(true);
+}
+
+void MainWindow::checkForUpdatesManual()
+{
+    checkForUpdates(true);
+}
+
+void MainWindow::maybeCheckForUpdates()
+{
+    static constexpr qint64 kSevenDaysSeconds = 7ll * 24ll * 60ll * 60ll;
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("updates"));
+    const qint64 lastCheckUtc = settings.value(QStringLiteral("last_check_utc"), 0).toLongLong();
+    settings.endGroup();
+    const qint64 nowUtc = QDateTime::currentSecsSinceEpoch();
+    if (lastCheckUtc > 0 && nowUtc > lastCheckUtc && (nowUtc - lastCheckUtc) < kSevenDaysSeconds)
+        return;
+    checkForUpdates(false);
+}
+
+void MainWindow::checkForUpdates(bool manual)
+{
+    if (!m_net) {
+        if (manual)
+            m_statusLabel->setText(tr("Update check unavailable: network manager not initialized."));
+        return;
+    }
+    if (m_updateCheckInFlight) {
+        if (manual)
+            m_statusLabel->setText(tr("Update check already in progress."));
+        return;
+    }
+
+    m_updateCheckInFlight = true;
+    if (m_checkUpdatesBtn)
+        m_checkUpdatesBtn->setEnabled(false);
+
+    QNetworkRequest req(QUrl(QStringLiteral("https://api.github.com/repos/harrypm/FLAC-Chop/releases/latest")));
+    req.setHeader(QNetworkRequest::UserAgentHeader,
+                  QStringLiteral("FLAC-Chop/%1").arg(QCoreApplication::applicationVersion()));
+    req.setRawHeader("Accept", "application/vnd.github+json");
+    req.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                     QNetworkRequest::NoLessSafeRedirectPolicy);
+
+    QNetworkReply* reply = m_net->get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply, manual]() {
+        auto finish = [this, reply]() {
+            m_updateCheckInFlight = false;
+            if (m_checkUpdatesBtn)
+                m_checkUpdatesBtn->setEnabled(true);
+            reply->deleteLater();
+        };
+
+        if (reply->error() != QNetworkReply::NoError) {
+            if (manual)
+                m_statusLabel->setText(tr("Update check failed: %1").arg(reply->errorString()));
+            finish();
+            return;
+        }
+
+        const QByteArray body = reply->readAll();
+        QJsonParseError parseErr{};
+        const QJsonDocument doc = QJsonDocument::fromJson(body, &parseErr);
+        if (parseErr.error != QJsonParseError::NoError || !doc.isObject()) {
+            if (manual)
+                m_statusLabel->setText(tr("Update check failed: invalid release metadata."));
+            finish();
+            return;
+        }
+
+        const QJsonObject obj = doc.object();
+        const QString tagName = obj.value(QStringLiteral("tag_name")).toString().trimmed();
+        const QString releaseName = obj.value(QStringLiteral("name")).toString().trimmed();
+        const QString releaseUrl = obj.value(QStringLiteral("html_url")).toString().trimmed();
+        QString latestDisplay = tagName.isEmpty() ? releaseName : tagName;
+        if (latestDisplay.isEmpty())
+            latestDisplay = tr("(unknown)");
+        const QString appVersion = QCoreApplication::applicationVersion().trimmed();
+        const QString currentDisplay = appVersion.isEmpty() ? tr("(unknown)") : appVersion;
+
+        // Record successful checks to enforce the 7-day automatic cadence.
+        QSettings settings;
+        settings.beginGroup(QStringLiteral("updates"));
+        settings.setValue(QStringLiteral("last_check_utc"), QDateTime::currentSecsSinceEpoch());
+        settings.endGroup();
+
+        const QVersionNumber latestVersion = parseReleaseVersion(latestDisplay);
+        const QVersionNumber currentVersion = parseReleaseVersion(appVersion);
+        const bool comparable = !latestVersion.isNull() && !currentVersion.isNull();
+        const bool updateAvailable = comparable && (QVersionNumber::compare(latestVersion, currentVersion) > 0);
+
+        if (updateAvailable) {
+            const QString msg = tr("Update available: %1 (current %2).")
+                .arg(latestDisplay, currentDisplay);
+            m_statusLabel->setText(msg);
+            if (manual) {
+                QMessageBox box(this);
+                box.setIcon(QMessageBox::Information);
+                box.setWindowTitle(tr("Update available"));
+                box.setText(msg);
+                QPushButton* openBtn = nullptr;
+                if (!releaseUrl.isEmpty()) {
+                    box.setInformativeText(releaseUrl);
+                    openBtn = box.addButton(tr("Open release page"), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Close);
+                } else {
+                    box.addButton(QMessageBox::Ok);
+                }
+                box.exec();
+                if (openBtn && box.clickedButton() == openBtn)
+                    QDesktopServices::openUrl(QUrl(releaseUrl));
+            }
+            finish();
+            return;
+        }
+
+        if (manual) {
+            if (comparable) {
+                const QString msg = tr("No update found. Current version: %1.").arg(currentDisplay);
+                m_statusLabel->setText(msg);
+                QMessageBox::information(this, tr("Up to date"), msg);
+            } else {
+                const QString msg = tr("Latest release seen: %1 (unable to compare to current version %2).")
+                    .arg(latestDisplay, currentDisplay);
+                m_statusLabel->setText(msg);
+                QMessageBox box(this);
+                box.setIcon(QMessageBox::Information);
+                box.setWindowTitle(tr("Update check"));
+                box.setText(msg);
+                QPushButton* openBtn = nullptr;
+                if (!releaseUrl.isEmpty()) {
+                    box.setInformativeText(releaseUrl);
+                    openBtn = box.addButton(tr("Open release page"), QMessageBox::AcceptRole);
+                    box.addButton(QMessageBox::Close);
+                } else {
+                    box.addButton(QMessageBox::Ok);
+                }
+                box.exec();
+                if (openBtn && box.clickedButton() == openBtn)
+                    QDesktopServices::openUrl(QUrl(releaseUrl));
+            }
+        }
+
+        finish();
+    });
 }
 
 bool MainWindow::parseHms(const QString& s, double& outSec)

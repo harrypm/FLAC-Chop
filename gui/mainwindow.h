@@ -14,6 +14,7 @@ class QProgressBar;
 class QRangeSlider;
 class QComboBox;
 class QCheckBox;
+class QNetworkAccessManager;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -34,6 +35,7 @@ private slots:
     void onSliderOutChanged(int v);
     void setInFromBox();
     void setOutFromBox();
+    void checkForUpdatesManual();
 
 private:
     // HH:MM:SS parsing helpers (accept "SS", "MM:SS", "HH:MM:SS").
@@ -50,6 +52,8 @@ private:
     void syncSliderFromCut();
     // Set the time box text (signals blocked) to a given seconds value.
     void setTimeBox(double sec);
+    void maybeCheckForUpdates();
+    void checkForUpdates(bool manual);
 
     QString m_inPath;
     FcProbe m_probe{};
@@ -85,6 +89,7 @@ private:
     QComboBox* m_outputBitsCombo = nullptr;
     QCheckBox* m_basicFilterCheck = nullptr;
     QLabel* m_filterProfileLabel = nullptr;
+    QPushButton* m_checkUpdatesBtn = nullptr;
     QPushButton* m_processBtn = nullptr;
     QProgressBar* m_progress = nullptr;
     QLabel* m_statusLabel = nullptr;
@@ -94,8 +99,10 @@ private:
     QString m_outPath;
     QFutureWatcher<FcChopResult>* m_watcher = nullptr;
     QFutureWatcher<FcProbe>* m_probeWatcher = nullptr;
+    QNetworkAccessManager* m_net = nullptr;
     bool m_syncing = false;
     bool m_probing = false; // true while fc_probe runs off-thread
+    bool m_updateCheckInFlight = false;
 };
 
 #endif // FLACCHOP_MAINWINDOW_H

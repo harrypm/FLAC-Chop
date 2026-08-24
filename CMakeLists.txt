@@ -12,6 +12,6 @@ set(CMAKE_AUTORCC ON)
 
 # Qt6 on this system is 6.2.4 (Debian/Ubuntu qt6-base-dev). The ld-decode /
 # ld-analyse project uses the same Widgets + CMake approach.
-find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Concurrent Network)
 
 add_subdirectory(gui)

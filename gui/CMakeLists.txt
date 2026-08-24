@@ -72,6 +72,7 @@ target_include_directories(flac-chop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(flac-chop PRIVATE
     Qt6::Widgets
     Qt6::Concurrent
+    Qt6::Network
     "${CORE_LIB}"
 )
 if(WIN32)

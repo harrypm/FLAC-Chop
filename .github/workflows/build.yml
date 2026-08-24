@@ -332,6 +332,13 @@ jobs:
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
+      - name: Create ZIP artifact (portable)
+        shell: pwsh
+        run: |
+          # Windows packaging rule: keep a portable build output in addition
+          # to the installer so users can run from an extracted folder.
+          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
 
       - name: Create single-file Windows installer EXE
         shell: pwsh
@@ -382,11 +389,13 @@ jobs:
             throw "Installer EXE was not generated."
           }
 
-      - name: Upload Windows x86 installer
+      - name: Upload Windows x86 artifacts
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe
-          path: windows_FLAC-Chop_*_x86_64.exe
+          path: |
+            windows_FLAC-Chop_*_x86_64.zip
+            windows_FLAC-Chop_*_x86_64.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -866,6 +875,7 @@ jobs:
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.zip
             release-assets/**/linux_FLAC-Chop_*_arm64.zip
+            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
             release-assets/**/windows_FLAC-Chop_*_x86_64.exe
             release-assets/**/windows_FLAC-Chop_*_arm64.zip
             release-assets/**/windows_FLAC-Chop_*_arm64.exe
