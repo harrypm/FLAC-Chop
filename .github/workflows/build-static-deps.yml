@@ -61,18 +61,25 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          cd "$PWD/.deps"
+          DEPS_DIR="$PWD/.deps"
+          cd "$DEPS_DIR"
           tar -cf - sox-static | xz -T0 -9 > sox-static-windows-x86_64.tar.xz
           tar --exclude='qt6-static/src' -cf - qt6-static | xz -T0 -9 > qt6-static-windows-x86_64.tar.xz
           sha256sum sox-static-windows-x86_64.tar.xz > sox-static-windows-x86_64.tar.xz.sha256
           sha256sum qt6-static-windows-x86_64.tar.xz > qt6-static-windows-x86_64.tar.xz.sha256
+          # Move tarballs to the workspace root so upload-artifact can find
+          # them with a simple glob (the .deps/ subdir glob wasn't matching).
+          mv *.tar.xz *.sha256 "$PWD/"
+          cd "$PWD"
           ls -la *.tar.xz *.sha256
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           name: static-deps-windows-x86_64
-          path: .deps/*.tar.xz*
+          path: |
+            *.tar.xz
+            *.sha256
           if-no-files-found: error
 
   publish-cache:
