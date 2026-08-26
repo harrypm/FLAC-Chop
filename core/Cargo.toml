@@ -3,6 +3,7 @@ name = "flac_chop_core"
 version = "0.1.0"
 edition = "2021"
 description = "Rust core for FLAC-Chop: FLAC STREAMINFO probe (claxon), RF MSPS math, SoX sample-exact trim cutter. Exposed as a C ABI staticlib for the Qt6 GUI."
+build = "build.rs"
 
 [lib]
 name = "flac_chop_core"
@@ -10,6 +11,11 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 claxon = "0.4"
+
+[features]
+# Link libSoX statically and run the cut in-process (no external sox binary).
+# The build script links libsox + deps from $SOX_STATIC_PREFIX when set.
+static-sox = []
 
 [profile.release]
 opt-level = 3

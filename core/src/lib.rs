@@ -18,3 +18,6 @@ pub mod msps;
 pub mod probe;
 pub mod rate;
 pub mod vorbis;
+
+#[cfg(feature = "static-sox")]
+pub mod sox_ffi;
