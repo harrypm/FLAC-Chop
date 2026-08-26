@@ -283,9 +283,10 @@ jobs:
           export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
           cargo --version
           DEPS="$PWD/.deps"
-          export CMAKE_PREFIX_PATH="$(cygpath -m "$DEPS/qt6-static")"
+          QT_PREFIX="$(cygpath -m "$DEPS/qt6-static")"
           SOX_PREFIX="$(cygpath -m "$DEPS/sox-static")"
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
             -DFLAC_CHOP_STATIC_QT=ON \
             -DFLAC_CHOP_STATIC_SOX=ON \
             -DSOX_STATIC_PREFIX="$SOX_PREFIX" \
