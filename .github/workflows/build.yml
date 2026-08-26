@@ -221,9 +221,6 @@ jobs:
             make
             python
             perl
-            autoconf
-            automake
-            libtool
             tar
             xz
 
@@ -244,30 +241,33 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Cache static deps (libsox + Qt6)
+      - name: Cache static deps (downloaded from ci-cache repo)
         id: deps-cache
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.deps
-          key: deps-win-x86_64-static-qt6.8.3-sox14.4.2-flac1.4.3-zlib1.3.1-${{ hashFiles('deps/*.sh') }}
+          key: deps-win-x86_64-cache-v1
 
-      - name: Build static libsox (+ libFLAC + zlib)
+      - name: Download pre-built static deps (libsox + Qt6)
         if: steps.deps-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
+        env:
+          DEPS_VERSION: v1
+          CACHE_REPO: harrypm/FLAC-Chop-ci-cache
         run: |
           set -euo pipefail
-          # Remove any pre-installed MSYS2 shared FLAC so its headers (which
-          # declare FLAC_API as __declspec(dllimport)) don't get picked up during
-          # the SoX build instead of our static ones.
-          pacman -R --noconfirm mingw-w64-x86_64-flac 2>/dev/null || true
-          bash deps/build-sox-static.sh "$PWD/.deps/sox-static"
-
-      - name: Build static Qt6 (qtbase)
-        if: steps.deps-cache.outputs.cache-hit != 'true'
-        shell: msys2 {0}
-        run: |
-          set -euo pipefail
-          bash deps/build-qt6-static.sh "$PWD/.deps/qt6-static"
+          mkdir -p .deps
+          cd .deps
+          BASE="https://github.com/${CACHE_REPO}/releases/download/${DEPS_VERSION}"
+          for asset in sox-static-windows-x86_64 qt6-static-windows-x86_64; do
+            curl -fsSL -o "${asset}.tar.xz" "${BASE}/${asset}.tar.xz"
+            curl -fsSL -o "${asset}.tar.xz.sha256" "${BASE}/${asset}.tar.xz.sha256"
+            expected="$(awk '{print $1}' "${asset}.tar.xz.sha256")"
+            actual="$(sha256sum "${asset}.tar.xz" | awk '{print $1}')"
+            [[ "${actual}" == "${expected}" ]] || { echo "sha mismatch for ${asset}"; exit 1; }
+            tar -xf "${asset}.tar.xz"
+          done
+          echo ":: Pre-built static deps downloaded + verified."
 
       - name: Install Rust (MinGW gnu toolchain)
         uses: dtolnay/rust-toolchain@stable

@@ -1,0 +1,99 @@
+name: Build and publish static deps cache
+
+# One-off workflow: builds static libsox (+libFLAC+zlib) and static Qt6 for
+# each Windows toolchain, then publishes the tarballs + sha256 sidecars to a
+# release on harrypm/FLAC-Chop-ci-cache. Run manually once; the main build.yml
+# then downloads these pre-built tarballs instead of building from source.
+#
+# Mirrors the harrypm/MISRC-ci-cache pattern (pre-built libFLAC, sha256-verified,
+# downloaded in CI).
+
+on:
+  workflow_dispatch:
+    inputs:
+      deps_version:
+        description: "Deps version tag (e.g. v1)"
+        required: true
+        type: string
+        default: "v1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-x86_64:
+    name: Build static deps (Windows x86_64)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout FLAC-Chop
+        uses: actions/checkout@v5
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            make
+            python
+            perl
+            tar
+            xz
+
+      - name: Remove pre-installed shared FLAC (avoids dllimport headers)
+        shell: msys2 {0}
+        run: pacman -R --noconfirm mingw-w64-x86_64-flac 2>/dev/null || true
+
+      - name: Build static libsox (+ libFLAC + zlib)
+        shell: msys2 {0}
+        run: bash deps/build-sox-static.sh "$PWD/.deps/sox-static"
+
+      - name: Build static Qt6 (qtbase)
+        shell: msys2 {0}
+        run: bash deps/build-qt6-static.sh "$PWD/.deps/qt6-static"
+
+      - name: Create tarballs
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$PWD/.deps"
+          tar -cf - sox-static | xz -T0 -9 > sox-static-windows-x86_64.tar.xz
+          tar -cf --exclude='*/src' qt6-static | xz -T0 -9 > qt6-static-windows-x86_64.tar.xz
+          sha256sum sox-static-windows-x86_64.tar.xz > sox-static-windows-x86_64.tar.xz.sha256
+          sha256sum qt6-static-windows-x86_64.tar.xz > qt6-static-windows-x86_64.tar.xz.sha256
+          ls -la *.tar.xz *.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: static-deps-windows-x86_64
+          path: .deps/*.tar.xz*
+          if-no-files-found: error
+
+  publish-cache:
+    name: Publish deps to cache repo
+    needs: build-windows-x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: static-deps-windows-x86_64
+          path: artifacts
+
+      - name: Create cache release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          DEPS_VERSION="${{ inputs.deps_version }}"
+          gh release create "$DEPS_VERSION" \
+            --repo harrypm/FLAC-Chop-ci-cache \
+            --title "Static deps $DEPS_VERSION" \
+            --notes "Pre-built static libsox + libFLAC + zlib + Qt6 for FLAC-Chop CI." \
+            artifacts/*.tar.xz artifacts/*.sha256
