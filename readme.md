@@ -22,6 +22,13 @@ whose FLAC header total is unknown.
 
 Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://github.com/harrypm/FLAC-Chop/releases)
 
+Packaged release artifacts are self-contained: they bundle SoX and required
+runtime libraries. You should not need to install SoX separately when using
+release downloads.
+
+If you build FLAC-Chop from source, SoX still needs to be available on PATH
+(or via `FLAC_CHOP_SOX=/path/to/sox`).
+
 
 ## Features
 

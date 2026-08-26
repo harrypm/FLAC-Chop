@@ -6,6 +6,19 @@
 # The staticlib name differs by toolchain: libflac_chop_core.a on Unix/MinGW,
 # flac_chop_core.lib on MSVC.
 
+# --- Single-binary build options ---------------------------------------------
+#
+# FLAC_CHOP_STATIC_SOX: build the Rust core with the `static-sox` cargo feature
+#   (in-process libSoX, no external sox binary). Requires SOX_STATIC_PREFIX
+#   (and optional SOX_STATIC_LIBS / SOX_STATIC_SYSTEM_LIBS) to point at a
+#   prebuilt static libsox + deps. See deps/build-sox-static.sh.
+# FLAC_CHOP_STATIC_QT: link Qt6 statically. Requires CMAKE_PREFIX_PATH to point
+#   at a static Qt6 install. Pulls in the required platform/imageformat plugins
+#   via qt_import_plugins (no-op for shared Qt) so the single exe starts without
+#   any DLL beside it.
+option(FLAC_CHOP_STATIC_SOX "Link libSoX statically (in-process cut, no sox binary)" OFF)
+option(FLAC_CHOP_STATIC_QT "Link Qt6 statically (single-binary builds)" OFF)
+
 set(CORE_DIR "${CMAKE_SOURCE_DIR}/core")
 # Rust staticlib naming: lib<name>.a for every MinGW-style toolchain (gcc on
 # MINGW64, clang on CLANGARM64/aarch64-pc-windows-gnullvm) and <name>.lib for
@@ -28,14 +41,28 @@ set(RUST_SOURCES
     "${CORE_DIR}/src/companions.rs"
     "${CORE_DIR}/src/chop.rs"
     "${CORE_DIR}/src/ffi.rs"
+    "${CORE_DIR}/src/sox_ffi.rs"
+    "${CORE_DIR}/build.rs"
 )
+
+if(FLAC_CHOP_STATIC_SOX)
+    set(CARGO_BUILD_CMD ${CMAKE_COMMAND} -E env
+        "SOX_STATIC_PREFIX=${SOX_STATIC_PREFIX}"
+        "SOX_STATIC_LIBS=${SOX_STATIC_LIBS}"
+        "SOX_STATIC_SYSTEM_LIBS=${SOX_STATIC_SYSTEM_LIBS}"
+        cargo build --release --features static-sox)
+    set(CARGO_COMMENT "Building Rust core (flac_chop_core) via cargo [static-sox]")
+else()
+    set(CARGO_BUILD_CMD cargo build --release)
+    set(CARGO_COMMENT "Building Rust core (flac_chop_core) via cargo")
+endif()
 
 add_custom_command(
     OUTPUT "${CORE_LIB}"
-    COMMAND cargo build --release
+    COMMAND ${CARGO_BUILD_CMD}
     WORKING_DIRECTORY "${CORE_DIR}"
     DEPENDS ${RUST_SOURCES}
-    COMMENT "Building Rust core (flac_chop_core) via cargo"
+    COMMENT "${CARGO_COMMENT}"
     VERBATIM)
 
 add_custom_target(flac_chop_core DEPENDS "${CORE_LIB}")
@@ -87,13 +114,40 @@ else()
     target_link_libraries(flac-chop PRIVATE pthread dl m)
 endif()
 
-# Statically link the C++ runtime on MinGW-gcc so the exe itself doesn't need
-# libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 DLLs. Gate on the GNU compiler
-# id (not `WIN32 AND MINGW`) so these gcc-specific flags are never passed to
-# clang on CLANGARM64; for that build the runtime DLLs are bundled into dist/
-# by the ldd-walk step in .github/workflows/build.yml instead.
-if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_link_options(flac-chop PRIVATE -static-libgcc -static-libstdc++ -static)
+# Statically link the C/C++ runtime so the exe doesn't need libgcc_s_seh-1 /
+# libwinpthread-1 / libstdc++-6 (gcc) or libc++ / libunwind (clang-mingw) DLLs.
+#
+# For a static-Qt single-binary build we always pass -static on every Windows
+# toolchain (gcc + clang-mingw) so no runtime DLL is emitted beside the exe.
+# For the shared-Qt build we only do this on gcc (CLANGARM64's runtime DLLs are
+# instead bundled into dist/ by the ldd-walk step in the workflow).
+if(WIN32)
+    if(FLAC_CHOP_STATIC_QT)
+        target_link_options(flac-chop PRIVATE -static)
+        if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+            target_link_options(flac-chop PRIVATE -static-libgcc -static-libstdc++)
+        endif()
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_options(flac-chop PRIVATE -static-libgcc -static-libstdc++ -static)
+    endif()
+endif()
+
+# --- Static Qt plugin import -------------------------------------------------
+# When Qt is linked statically the platform + imageformat plugins must be
+# pulled in explicitly, otherwise the exe starts with no platform plugin.
+# Only emit this for a static Qt build: a shared Qt install does not export
+# the plugin CMake targets (qt_import_plugins would warn "not known to the
+# current Qt installation"), and shared builds load plugins at runtime via
+# windeployqt instead. PNG is built into QtGui via libpng, so only the ICO
+# image format plugin is needed beyond the platform plugin.
+if(FLAC_CHOP_STATIC_QT)
+    if(WIN32)
+        qt_import_plugins(flac-chop
+            INCLUDE QWindowsIntegrationPlugin QICOPlugin)
+    else()
+        qt_import_plugins(flac-chop
+            INCLUDE QCocoaIntegrationPlugin QICOPlugin)
+    endif()
 endif()
 
 # Make sure the Rust lib is (re)built before we link against it.

@@ -113,6 +113,8 @@ jobs:
             curl \
             file \
             patchelf \
+            sox \
+            libsox-fmt-all \
             zip \
             unzip
 
@@ -146,6 +148,8 @@ jobs:
           set -eux
           mkdir -p AppDir/usr/bin
           cp "$BUILD_DIR/gui/flac-chop" AppDir/usr/bin/
+          cp "$(command -v sox)" AppDir/usr/bin/sox
+          chmod +x AppDir/usr/bin/sox
 
           cat > AppDir/flac-chop.desktop <<'EOF'
           [Desktop Entry]
@@ -173,11 +177,11 @@ jobs:
           curl -L -o linuxdeploy-plugin-qt "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${LINUXDEPLOY_ARCH}.AppImage"
           chmod +x linuxdeploy linuxdeploy-plugin-qt
 
-          # Bundle the Qt6 libs the GUI links against. SoX is NOT bundled —
-          # it is a runtime dep the user must have on PATH (apt install sox).
+          # Bundle Qt6 + SoX runtime deps into a single self-contained AppImage.
           ARCH="$LINUXDEPLOY_ARCH" APPIMAGE_EXTRACT_AND_RUN=1 ./linuxdeploy \
             --appdir AppDir \
             -e AppDir/usr/bin/flac-chop \
+            -e AppDir/usr/bin/sox \
             -d AppDir/flac-chop.desktop \
             -i AppDir/flac-chop.png \
             --plugin qt \
@@ -187,15 +191,11 @@ jobs:
           mv ./*.AppImage "$APPIMAGE_NAME"
           test -f "$APPIMAGE_NAME"
 
-          ZIP_NAME="linux_FLAC-Chop_${BUILD_VERSION}_${{ matrix.artifact_suffix }}.zip"
-          zip -j "$ZIP_NAME" "$APPIMAGE_NAME"
-          test -f "$ZIP_NAME"
-
-      - name: Upload Linux ZIP
+      - name: Upload Linux AppImage
         uses: actions/upload-artifact@v6
         with:
-          name: linux-zip-${{ matrix.arch }}
-          path: linux_FLAC-Chop_*_${{ matrix.artifact_suffix }}.zip
+          name: linux-appimage-${{ matrix.arch }}
+          path: linux_FLAC-Chop_*_${{ matrix.artifact_suffix }}.AppImage
           if-no-files-found: error
 
   # --- Windows EXE (x86_64 via MSYS2 MINGW64) ---
@@ -218,9 +218,14 @@ jobs:
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-qt6-base
-            mingw-w64-x86_64-qt6-tools
-            mingw-w64-x86_64-sox
+            make
+            python
+            perl
+            autoconf
+            automake
+            libtool
+            tar
+            xz
 
       - name: Resolve build version
         id: version
@@ -239,163 +244,97 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Cache static deps (libsox + Qt6)
+        id: deps-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ github.workspace }}/.deps
+          key: deps-win-x86_64-static-qt6.8.3-sox14.4.2-flac1.4.3-zlib1.3.1-${{ hashFiles('deps/*.sh') }}
+
+      - name: Build static libsox (+ libFLAC + zlib)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          bash deps/build-sox-static.sh "$PWD/.deps/sox-static"
+
+      - name: Build static Qt6 (qtbase)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          bash deps/build-qt6-static.sh "$PWD/.deps/qt6-static"
+
       - name: Install Rust (MinGW gnu toolchain)
         uses: dtolnay/rust-toolchain@stable
         with:
           # MinGW gnu toolchain so cargo links against MSYS2's MinGW gcc and
-          # the produced exe matches the MSYS2 Qt6 DLLs bundled by windeployqt.
+          # the produced exe matches the static Qt6 built with the same gcc.
           toolchain: stable-x86_64-pc-windows-gnu
 
-      - name: Build FLAC-Chop
+      - name: Build FLAC-Chop (static Qt6 + static libsox)
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          # cargo/rustc are installed by dtolnay/rust-toolchain into the Windows
-          # CARGO_HOME (C:\Users\runneradmin\.cargo). The cmake custom command
-          # runs `cargo build` via cmd.exe (spawned by ninja), which does NOT
-          # inherit dtolnay's GITHUB_PATH under the MSYS2 shell, so cargo is not
-          # found. Convert CARGO_HOME to an MSYS2 path and prepend its bin so
-          # cargo resolves both in bash and in the cmd.exe child (MSYS2 converts
-          # the POSIX PATH back to Windows for native children).
           export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
           cargo --version
-          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          DEPS="$PWD/.deps"
+          export CMAKE_PREFIX_PATH="$(cygpath -m "$DEPS/qt6-static")"
+          SOX_PREFIX="$(cygpath -m "$DEPS/sox-static")"
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_STATIC_QT=ON \
+            -DFLAC_CHOP_STATIC_SOX=ON \
+            -DSOX_STATIC_PREFIX="$SOX_PREFIX" \
+            -DSOX_STATIC_LIBS="FLAC z"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
 
-      - name: Bundle Qt6 DLLs with windeployqt
+      - name: Package + assert single self-contained EXE
         shell: msys2 {0}
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp "$BUILD_DIR/gui/flac-chop.exe" dist/
-          windeployqt --release --no-translations --no-system-d3d-compiler --no-opengl-sw dist/flac-chop.exe
-          # Bundle SoX for Windows artifacts so users do not need a separate
-          # SoX install on PATH.
-          cp "/mingw64/bin/sox.exe" dist/
-          test -x dist/sox.exe
+          OUT_EXE="dist/windows_FLAC-Chop_${BUILD_VERSION}_x86_64.exe"
+          cp "$BUILD_DIR/gui/flac-chop.exe" "$OUT_EXE"
+          # Assert exactly 1 file in dist/ and exactly 1 .exe (no DLLs, no plugins).
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.exe' | wc -l)" -eq 1
+          # Assert GUI subsystem (00000002), not console.
+          test "$(objdump -p "$OUT_EXE" | awk '/^Subsystem[[:space:]]/ {print $2; exit}')" = "00000002"
+          # Assert zero non-system DLL imports (mirrors MISRC-GUI's gate).
+          assert_no_nonsystem_dlls() {
+            local target="$1"
+            while IFS= read -r dll; do
+              case "$(echo "$dll" | tr '[:lower:]' '[:upper:]')" in
+                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL|NTDLL.DLL|USERENV.DLL|BCRYPT.DLL|MPR.DLL|SECUR32.DLL|WINTRUST.DLL|CRYPT32.DLL|OLE32.DLL|GDI32.DLL|DWMAPI.DLL|UXTHEME.DLL|D3D11.DLL|DXGI.DLL|DXGUID.DLL|D2D1.DLL|DWRITE.DLL|D3D12.DLL|OPENGL32.DLL|GLU32.DLL)
+                  continue
+                  ;;
+                *)
+                  echo "::error::Non-system runtime DLL dependency detected in $target: $dll" >&2
+                  exit 1
+                  ;;
+              esac
+            done < <(objdump -p "$target" | awk '/DLL Name:/ {print $3}')
+          }
+          assert_no_nonsystem_dlls "$OUT_EXE"
+          echo ":: Single self-contained EXE verified — no non-system DLL imports."
 
-      - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
+      - name: Smoke test the single EXE
         shell: msys2 {0}
         run: |
           set -euo pipefail
-          # windeployqt only bundles Qt6 + MSVC-runtime DLLs. The MSYS2 MinGW
-          # Qt6 DLLs also depend on the compiler runtime (libgcc_s_seh-1,
-          # libwinpthread-1, libstdc++-6) and third-party libs (libpcre2-16-0,
-          # zlib1, libzstd, libdouble-conversion, libb2-1, libicuin/uc,
-          # libfreetype, libharfbuzz, libmd4c, libpng16, libbrotlidec/common,
-          # ...). windeployqt does NOT copy any of these, so without them the
-          # exe fails to start with a "missing DLL" error.
-          #
-          # Walk the full transitive dep tree with ldd and copy every
-          # /mingw64/bin DLL into dist. Iterate to a fixpoint because ldd only
-          # recurses into a dep's own deps once that dep has been copied into
-          # dist (so e.g. libbrotlicommon is only revealed after libbrotlidec
-          # is copied). At runtime the Windows loader searches the exe's
-          # directory first, so putting these in dist/ root also satisfies the
-          # plugins in subdirs (platforms/, imageformats/, ...).
-          BINDIR="/mingw64/bin"
-          for pass in 1 2 3 4 5 6 7 8; do
-            new=0
-            while IFS= read -r d; do
-              base="$(basename "$d")"
-              if [ ! -f "dist/$base" ]; then cp "$d" "dist/$base"; new=$((new+1)); fi
-            done < <(find dist -type f \( -iname '*.exe' -o -iname '*.dll' \) -print0 \
-                     | xargs -0 -n1 ldd 2>/dev/null \
-                     | grep -oE "${BINDIR}/[^ ]+\.dll" | sort -u)
-            echo "dep-bundle pass $pass: newly copied $new DLL(s)"
-            [ "$new" -eq 0 ] && break
-          done
-          # Gate on the exe's own tree only: plugin DLLs in subdirs still show
-          # ${BINDIR} refs under ldd (a false positive — at runtime the loader
-          # uses the exe dir, where these libs now live).
-          LEAKS=$(ldd dist/flac-chop.exe 2>/dev/null | grep -E "${BINDIR}/" || true)
-          if [ -n "$LEAKS" ]; then
-            echo "::error::exe still has un-bundled ${BINDIR} deps:"; echo "$LEAKS"; exit 1
-          fi
-          # ldd may still resolve DLLs to ${BINDIR} even when matching DLLs are
-          # present in dist/. Validate by basename presence in dist/ instead.
-          SOX_MISSING=""
-          while IFS= read -r sox_dll; do
-            [ -z "$sox_dll" ] && continue
-            if [ ! -f "dist/$sox_dll" ]; then
-              SOX_MISSING+="$sox_dll"$'\n'
-            fi
-          done < <(ldd dist/sox.exe 2>/dev/null \
-                   | grep -oE "${BINDIR}/[^ ]+\\.dll" \
-                   | xargs -r -n1 basename \
-                   | sort -u)
-          if [ -n "$SOX_MISSING" ]; then
-            echo "::error::sox.exe is missing required bundled DLLs:"
-            printf '%s' "$SOX_MISSING"
-            exit 1
-          fi
-          echo "Bundled DLLs in dist/:"
-          ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
-      - name: Create ZIP artifact (portable)
-        shell: pwsh
-        run: |
-          # Windows packaging rule: keep a portable build output in addition
-          # to the installer so users can run from an extracted folder.
-          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_x86_64.zip"
-          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+          # The GUI has no --version flag, so verify the exe is a valid PE for
+          # the target arch and its imports are system-only (already asserted).
+          objdump -f dist/*.exe | grep -qE 'architecture:[[:space:]]*i386:x86-64'
+          echo ":: PE architecture check passed."
 
-      - name: Create single-file Windows installer EXE
-        shell: pwsh
-        run: |
-          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup --no-progress -y
-          }
-          if (-not (Test-Path $iscc)) {
-            throw "ISCC.exe not found after attempting install."
-          }
-          $version = "${{ steps.version.outputs.version }}"
-          $issPath = "flac-chop-x86_64.iss"
-          @"
-          [Setup]
-          AppName=FLAC-Chop
-          AppVersion=$version
-          AppPublisher=harrypm
-          DefaultDirName={localappdata}\Programs\FLAC-Chop
-          DisableProgramGroupPage=yes
-          OutputDir=.
-          OutputBaseFilename=windows_FLAC-Chop_${version}_x86_64
-          Compression=lzma2
-          SolidCompression=yes
-          WizardStyle=modern
-          PrivilegesRequired=lowest
-          SetupIconFile=assets\icons\flac-chop-icon.ico
-          UninstallDisplayIcon={app}\flac-chop.exe
-
-          [Languages]
-          Name: "english"; MessagesFile: "compiler:Default.isl"
-
-          [Tasks]
-          Name: "desktopicon"; Description: "Create a desktop icon"; Flags: unchecked
-
-          [Files]
-          Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-          [Icons]
-          Name: "{autoprograms}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"
-          Name: "{autodesktop}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"; Tasks: desktopicon
-
-          [Run]
-          Filename: "{app}\flac-chop.exe"; Description: "Launch FLAC-Chop"; Flags: nowait postinstall skipifsilent
-          "@ | Set-Content -Path $issPath -Encoding ASCII
-          & $iscc /Qp $issPath
-          if (-not (Test-Path "windows_FLAC-Chop_${version}_x86_64.exe")) {
-            throw "Installer EXE was not generated."
-          }
-
-      - name: Upload Windows x86 artifacts
+      - name: Upload Windows x86_64 single EXE
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe
-          path: |
-            windows_FLAC-Chop_*_x86_64.zip
-            windows_FLAC-Chop_*_x86_64.exe
+          path: dist/windows_FLAC-Chop_*_x86_64.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -521,69 +460,56 @@ jobs:
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
-
-      - name: Create ZIP artifact
+      - name: Create single-file portable Windows EXE (SFX)
         shell: pwsh
         run: |
-          $ZipPath = "windows_FLAC-Chop_${{ steps.version.outputs.version }}_arm64.zip"
-          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+          if (-not $sevenZip) {
+            choco install 7zip --no-progress -y
+            $sevenZip = Get-Command 7z -ErrorAction Stop
+          }
+          $sevenZipExe = $sevenZip.Source
+          $sevenZipDir = Split-Path -Parent $sevenZipExe
+          $sfxCandidates = @(
+            (Join-Path $sevenZipDir "7z.sfx"),
+            (Join-Path $sevenZipDir "7zS.sfx"),
+            (Join-Path $env:ProgramFiles "7-Zip\7z.sfx"),
+            (Join-Path $env:ProgramFiles "7-Zip\7zS.sfx"),
+            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.sfx"),
+            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7zS.sfx")
+          )
+          $sfxModule = $sfxCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $sfxModule) {
+            throw "7-Zip SFX module not found."
+          }
 
-      - name: Create single-file Windows installer EXE
-        shell: pwsh
-        run: |
-          $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) {
-            choco install innosetup --no-progress -y
-          }
-          if (-not (Test-Path $iscc)) {
-            throw "ISCC.exe not found after attempting install."
-          }
           $version = "${{ steps.version.outputs.version }}"
-          $issPath = "flac-chop-arm64.iss"
-          @"
-          [Setup]
-          AppName=FLAC-Chop
-          AppVersion=$version
-          AppPublisher=harrypm
-          DefaultDirName={localappdata}\Programs\FLAC-Chop
-          DisableProgramGroupPage=yes
-          OutputDir=.
-          OutputBaseFilename=windows_FLAC-Chop_${version}_arm64
-          Compression=lzma2
-          SolidCompression=yes
-          WizardStyle=modern
-          PrivilegesRequired=lowest
-          SetupIconFile=assets\icons\flac-chop-icon.ico
-          UninstallDisplayIcon={app}\flac-chop.exe
-
-          [Languages]
-          Name: "english"; MessagesFile: "compiler:Default.isl"
-
-          [Tasks]
-          Name: "desktopicon"; Description: "Create a desktop icon"; Flags: unchecked
-
-          [Files]
-          Source: "dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-
-          [Icons]
-          Name: "{autoprograms}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"
-          Name: "{autodesktop}\FLAC-Chop"; Filename: "{app}\flac-chop.exe"; Tasks: desktopicon
-
-          [Run]
-          Filename: "{app}\flac-chop.exe"; Description: "Launch FLAC-Chop"; Flags: nowait postinstall skipifsilent
-          "@ | Set-Content -Path $issPath -Encoding ASCII
-          & $iscc /Qp $issPath
-          if (-not (Test-Path "windows_FLAC-Chop_${version}_arm64.exe")) {
-            throw "Installer EXE was not generated."
+          $payload = "windows_FLAC-Chop_${version}_arm64.7z"
+          & $sevenZipExe a -t7z -mx=9 $payload .\dist\*
+          if ($LASTEXITCODE -ne 0) {
+            throw "7-Zip archive creation failed."
           }
 
-      - name: Upload Windows arm64 ZIP
+          $outExe = "windows_FLAC-Chop_${version}_arm64.exe"
+          $outStream = [System.IO.File]::Open($outExe, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
+          try {
+            foreach ($src in @($sfxModule, $payload)) {
+              $inStream = [System.IO.File]::OpenRead($src)
+              try { $inStream.CopyTo($outStream) } finally { $inStream.Dispose() }
+            }
+          } finally {
+            $outStream.Dispose()
+          }
+
+          if (-not (Test-Path $outExe)) {
+            throw "Portable EXE was not generated."
+          }
+
+      - name: Upload Windows arm64 artifact
         uses: actions/upload-artifact@v6
         with:
           name: windows-exe-arm64
-          path: |
-            windows_FLAC-Chop_*_arm64.zip
-            windows_FLAC-Chop_*_arm64.exe
+          path: windows_FLAC-Chop_*_arm64.exe
           if-no-files-found: error
 
   # --- macOS APP (arm64 + x86_64, then universal DMG) ---
@@ -626,7 +552,7 @@ jobs:
           # every brew command print a tap-trust warning. We don't use it —
           # untap it (best-effort) so brew runs clean.
           brew untap aws/tap 2>/dev/null || true
-          brew install cmake ninja qt@6 pkg-config
+          brew install cmake ninja qt@6 pkg-config sox
           # qt@6 is keg-only; force-link it so cmake finds qmake6 on the brew
           # prefix. The runner image now ships qt@6 already force-linked, so
           # guard the link to avoid the "Already linked" warning — only link
@@ -711,7 +637,36 @@ jobs:
 
           # Bundle Qt frameworks into the .app so it's self-contained.
           macdeployqt "dist/FLAC-Chop.app"
-          # SoX is NOT bundled — it is a runtime dep (brew install sox).
+          # Bundle SoX and its non-system dylib dependencies into the app.
+          mkdir -p "$APP_ROOT/Frameworks"
+          SOX_BIN="$(brew --prefix sox)/bin/sox"
+          cp "$SOX_BIN" "$APP_ROOT/MacOS/sox"
+          chmod +x "$APP_ROOT/MacOS/sox"
+          mapfile -t SOX_DEPS < <(otool -L "$SOX_BIN" \
+            | awk 'NR>1 {print $1}' \
+            | grep -E '^/opt/homebrew/|^/usr/local/' || true)
+          for dep in "${SOX_DEPS[@]}"; do
+            [ -n "$dep" ] || continue
+            cp -f "$dep" "$APP_ROOT/Frameworks/$(basename "$dep")"
+          done
+          for lib in "$APP_ROOT/Frameworks/"*.dylib; do
+            [ -e "$lib" ] || continue
+            base="$(basename "$lib")"
+            install_name_tool -id "@executable_path/../Frameworks/$base" "$lib"
+          done
+          for bin in "$APP_ROOT/MacOS/sox" "$APP_ROOT/Frameworks/"*.dylib; do
+            [ -e "$bin" ] || continue
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              base="$(basename "$dep")"
+              if [ -f "$APP_ROOT/Frameworks/$base" ]; then
+                install_name_tool -change "$dep" "@executable_path/../Frameworks/$base" "$bin"
+              fi
+            done < <(otool -L "$bin" \
+                     | awk 'NR>1 {print $1}' \
+                     | grep -E '^/opt/homebrew/|^/usr/local/' || true)
+          done
+          "$APP_ROOT/MacOS/sox" --version
 
           echo "$BUILD_VERSION" > dist/BUILD_VERSION.txt
 
@@ -781,6 +736,12 @@ jobs:
                 # "bundle format is ambiguous"; signing the inner binary
                 # avoids that check. Skip data-only frameworks (no binary).
                 if [ -f "$bin" ]; then
+                  codesign --force --sign - "$bin"
+                fi
+              done
+          find "dist/FLAC-Chop.app/Contents/MacOS" -type f -print0 \
+            | while IFS= read -r -d "" bin; do
+                if file "$bin" | grep -q "Mach-O"; then
                   codesign --force --sign - "$bin"
                 fi
               done
@@ -866,17 +827,11 @@ jobs:
             ## Runtime requirement: SoX
 
             FLAC-Chop shells out to **SoX** for the actual sample-exact cut.
-            Linux/macOS require a separate SoX install; Windows packages now
-            bundle SoX in the installer/ZIP artifacts:
-
-            - **Linux:** `sudo apt install sox`
-            - **macOS:** `brew install sox`
-            - **Windows:** no separate SoX install required for packaged builds.
+            Published release artifacts are packaged as self-contained builds
+            with bundled SoX/runtime dependencies.
           files: |
-            release-assets/**/linux_FLAC-Chop_*_x86.zip
-            release-assets/**/linux_FLAC-Chop_*_arm64.zip
-            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
+            release-assets/**/linux_FLAC-Chop_*_x86.AppImage
+            release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
             release-assets/**/windows_FLAC-Chop_*_x86_64.exe
-            release-assets/**/windows_FLAC-Chop_*_arm64.zip
             release-assets/**/windows_FLAC-Chop_*_arm64.exe
             release-assets/**/macos_FLAC-Chop_*_universal.dmg

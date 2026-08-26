@@ -260,7 +260,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_net = new QNetworkAccessManager(this);
 
     if (!fc_sox_available()) {
-        m_statusLabel->setText(tr("WARNING: `sox` not found on PATH — cutting will fail."));
+        m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — cutting will fail."));
     }
     maybeCheckForUpdates();
 }

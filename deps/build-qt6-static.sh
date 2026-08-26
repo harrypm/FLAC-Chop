@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Build a static Qt6 (qtbase only: Core/Gui/Widgets/Network/Concurrent) from
+# source for single-binary FLAC-Chop Windows builds. Produces $PREFIX with a
+# ready-to-use static Qt install findable via CMAKE_PREFIX_PATH.
+#
+# Usage: deps/build-qt6-static.sh <prefix>
+# Env:   CC, CXX, CFLAGS, CXXFLAGS, LDFLAGS (honored)
+#        QT6_SRC_TAG  — git tag to build (default: v6.8.3)
+#
+# Cacheable: re-runs are a no-op once $PREFIX/lib/cmake/Qt6/Qt6Config.cmake
+# exists.
+#
+# Designed for MSYS2 MINGW64 (gcc) and CLANGARM64 (clang). Only qtbase is
+# built — FLAC-Chop needs Widgets/Concurrent/Network, all in qtbase.
+set -euo pipefail
+
+PREFIX="${1:?usage: build-qt6-static.sh <prefix>}"
+mkdir -p "$PREFIX"
+PREFIX="$(cd "$PREFIX" && pwd)"
+
+# Fast path: already built.
+if [ -f "$PREFIX/lib/cmake/Qt6/Qt6Config.cmake" ]; then
+  echo "static Qt6 already present at $PREFIX — skipping"
+  exit 0
+fi
+
+QT_TAG="${QT6_SRC_TAG:-v6.8.3}"
+WORKDIR="${QT6_BUILD_WORKDIR:-$PREFIX/src}"
+mkdir -p "$WORKDIR"
+
+NJOBS="${QT6_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+
+# Clone qtbase at the pinned tag (shallow).
+SRC="$WORKDIR/qtbase"
+if [ ! -d "$SRC/.git" ]; then
+  rm -rf "$SRC"
+  git clone --depth 1 --branch "$QT_TAG" https://code.qt.io/qt/qtbase.git "$SRC"
+fi
+
+BUILD="$WORKDIR/qtbase-build"
+rm -rf "$BUILD"
+mkdir -p "$BUILD"
+
+cd "$BUILD"
+
+# Qt6's configure is a cmake wrapper. -static -release gives a release static
+# build. -nomake examples/tests skips the slow example/test builds. Only
+# qtbase is cloned, so no other Qt modules are built.
+"$SRC/configure" \
+  -static \
+  -release \
+  -prefix "$PREFIX" \
+  -nomake examples \
+  -nomake tests \
+  -no-dbus
+
+cmake --build . --parallel "$NJOBS"
+cmake --install .
+
+# Sanity: the cmake config must exist for find_package(Qt6) to work.
+test -f "$PREFIX/lib/cmake/Qt6/Qt6Config.cmake"
+
+echo ":: static Qt6 build complete at $PREFIX"
+echo ":: set CMAKE_PREFIX_PATH=$PREFIX"
