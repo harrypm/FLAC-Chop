@@ -52,12 +52,13 @@ build_zlib() {
   fi
   cd "$src"
   if [ "$IS_WINDOWS" = "1" ]; then
-    # zlib's configure is the makefile one; use -fMakefile.gcc for MinGW.
+    # zlib's win32/Makefile.gcc uses PREFIX as a *compiler* path prefix (e.g.
+    # /mingw64/bin/), NOT the install prefix. Leave it empty so `gcc` is found
+    # on the MSYS2 PATH. DESTDIR+prefix="" installs to $PREFIX/{include,lib}.
     make -f win32/Makefile.gcc -j"$NJOBS" \
-      PREFIX="${CC:-gcc}" \
       CFLAGS="${CFLAGS:-} -fPIC" \
       DESTDIR="$PREFIX" \
-      prefix="" install -j"$NJOBS"
+      prefix="" install
   else
     ./configure --static --prefix="$PREFIX" ${CFLAGS:+CFLAGS="$CFLAGS"}
     make -j"$NJOBS"
