@@ -256,6 +256,10 @@ jobs:
         shell: msys2 {0}
         run: |
           set -euo pipefail
+          # Remove any pre-installed MSYS2 shared FLAC so its headers (which
+          # declare FLAC_API as __declspec(dllimport)) don't get picked up during
+          # the SoX build instead of our static ones.
+          pacman -R --noconfirm mingw-w64-x86_64-flac 2>/dev/null || true
           bash deps/build-sox-static.sh "$PWD/.deps/sox-static"
 
       - name: Build static Qt6 (qtbase)

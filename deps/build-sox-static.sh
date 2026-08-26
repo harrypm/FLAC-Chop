@@ -89,6 +89,12 @@ build_flac() {
     ${LDFLAGS:+-DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" -DCMAKE_SHARED_LINKER_FLAGS="$LDFLAGS"}
   cmake --build "$WORKDIR/flac-build" --parallel "$NJOBS"
   cmake --install "$WORKDIR/flac-build"
+  # Ensure the installed static FLAC headers do NOT declare FLAC_API as
+  # __declspec(dllimport) — that would make SoX's flac.o reference __imp_FLAC__*
+  # import stubs (which don't exist in a static libFLAC). Patch export.h in place.
+  if [ -f "$PREFIX/include/FLAC/export.h" ]; then
+    sed -i 's/__declspec(dllimport)//g' "$PREFIX/include/FLAC/export.h"
+  fi
 }
 
 # ---------------------------------------------------------------------------
