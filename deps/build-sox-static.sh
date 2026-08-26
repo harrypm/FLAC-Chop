@@ -52,13 +52,12 @@ build_zlib() {
   fi
   cd "$src"
   if [ "$IS_WINDOWS" = "1" ]; then
-    # zlib's win32/Makefile.gcc uses PREFIX as a *compiler* path prefix (e.g.
-    # /mingw64/bin/), NOT the install prefix. Leave it empty so `gcc` is found
-    # on the MSYS2 PATH. DESTDIR+prefix="" installs to $PREFIX/{include,lib}.
-    make -f win32/Makefile.gcc -j"$NJOBS" \
-      CFLAGS="${CFLAGS:-} -fPIC" \
-      DESTDIR="$PREFIX" \
-      prefix="" install
+    # Build with MinGW's Makefile.gcc, then install manually (the Makefile's
+    # install target mangles paths when prefix is empty on MSYS2).
+    make -f win32/Makefile.gcc -j"$NJOBS" CFLAGS="${CFLAGS:-} -fPIC" libz.a
+    mkdir -p "$PREFIX/include" "$PREFIX/lib"
+    cp zlib.h zconf.h "$PREFIX/include/"
+    cp libz.a "$PREFIX/lib/"
   else
     ./configure --static --prefix="$PREFIX" ${CFLAGS:+CFLAGS="$CFLAGS"}
     make -j"$NJOBS"
@@ -72,7 +71,7 @@ build_zlib() {
 build_flac() {
   local src="$WORKDIR/flac-src"
   if [ ! -d "$src" ]; then
-    curl -fsSL "https://downloads.xiph.org/release/flac/flac-1.4.3.tar.xz" -o "$WORKDIR/flac.txz"
+    curl -fsSL "https://github.com/xiph/flac/releases/download/1.4.3/flac-1.4.3.tar.xz" -o "$WORKDIR/flac.txz"
     tar -C "$WORKDIR" -xJf "$WORKDIR/flac.txz"
     mv "$WORKDIR"/flac-* "$src"
   fi
