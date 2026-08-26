@@ -63,7 +63,7 @@ jobs:
           set -euo pipefail
           cd "$PWD/.deps"
           tar -cf - sox-static | xz -T0 -9 > sox-static-windows-x86_64.tar.xz
-          tar -cf --exclude='*/src' qt6-static | xz -T0 -9 > qt6-static-windows-x86_64.tar.xz
+          tar --exclude='qt6-static/src' -cf - qt6-static | xz -T0 -9 > qt6-static-windows-x86_64.tar.xz
           sha256sum sox-static-windows-x86_64.tar.xz > sox-static-windows-x86_64.tar.xz.sha256
           sha256sum qt6-static-windows-x86_64.tar.xz > qt6-static-windows-x86_64.tar.xz.sha256
           ls -la *.tar.xz *.sha256
