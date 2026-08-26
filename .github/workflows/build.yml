@@ -253,12 +253,12 @@ jobs:
         shell: msys2 {0}
         env:
           DEPS_VERSION: v1
-          CACHE_REPO: harrypm/FLAC-Chop-ci-cache
+          CACHE_REPO: harrypm/FLAC-Chop
         run: |
           set -euo pipefail
           mkdir -p .deps
           cd .deps
-          BASE="https://github.com/${CACHE_REPO}/releases/download/${DEPS_VERSION}"
+          BASE="https://github.com/${CACHE_REPO}/releases/download/deps-${DEPS_VERSION}"
           for asset in sox-static-windows-x86_64 qt6-static-windows-x86_64; do
             curl -fsSL -o "${asset}.tar.xz" "${BASE}/${asset}.tar.xz"
             curl -fsSL -o "${asset}.tar.xz.sha256" "${BASE}/${asset}.tar.xz.sha256"

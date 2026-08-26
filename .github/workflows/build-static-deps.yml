@@ -91,9 +91,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eux
-          DEPS_VERSION="${{ inputs.deps_version }}"
+          DEPS_VERSION="deps-${{ inputs.deps_version }}"
+          # Publish to the FLAC-Chop repo itself — the default GITHUB_TOKEN
+          # can't create releases on a different repo.
           gh release create "$DEPS_VERSION" \
-            --repo harrypm/FLAC-Chop-ci-cache \
-            --title "Static deps $DEPS_VERSION" \
+            --repo harrypm/FLAC-Chop \
+            --title "Static deps ${{ inputs.deps_version }}" \
             --notes "Pre-built static libsox + libFLAC + zlib + Qt6 for FLAC-Chop CI." \
             artifacts/*.tar.xz artifacts/*.sha256
