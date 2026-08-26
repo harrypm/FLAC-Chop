@@ -103,9 +103,14 @@ build_sox() {
     mv "$WORKDIR"/sox-* "$src"
   fi
   cd "$src"
-  # Point sox at our static zlib + libFLAC.
+  # Point sox at our static zlib + libFLAC. MUST set PKG_CONFIG_PATH to our
+  # prefix first, otherwise SoX's configure finds the MSYS2 system's SHARED
+  # flac.pc and links against the import stubs (__imp_FLAC__*) instead of
+  # our static libFLAC.a — producing undefined-reference errors at link time.
   local fp="$PREFIX"
+  export PKG_CONFIG_PATH="$fp/lib/pkgconfig:$fp/share/pkgconfig:${PKG_CONFIG_PATH:-}"
   export CFLAGS="${CFLAGS:-} -I$fp/include"
+  export CXXFLAGS="${CXXFLAGS:-} -I$fp/include"
   export LDFLAGS="${LDFLAGS:-} -L$fp/lib"
   # SoX 14.4.2 is old C code; modern GCC (14+) treats implicit function
   # declarations, int-conversion, and incompatible pointer types as errors by
