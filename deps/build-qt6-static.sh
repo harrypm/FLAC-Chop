@@ -61,12 +61,29 @@ cmake --build . --parallel "$NJOBS"
 # SBOM generation. Tolerate that and verify the essential files manually.
 cmake --install . || true
 
-# Sanity: the essential module cmake configs + static libs must exist for
-# find_package(Qt6 ...) and linking to work.
-test -f "$PREFIX/lib/cmake/Qt6Core/Qt6CoreConfig.cmake"
-test -f "$PREFIX/lib/cmake/Qt6Widgets/Qt6WidgetsConfig.cmake"
-test -f "$PREFIX/lib/cmake/Qt6Network/Qt6NetworkConfig.cmake"
-test -f "$PREFIX/lib/libQt6Widgets.a" || test -f "$PREFIX/lib/libQt6Widgets.prl"
+# Diagnostic: list what cmake config dirs and static libs were actually
+# installed, so a mismatch is visible in the log instead of a silent exit.
+echo ":: Qt6 cmake config dirs:"
+find "$PREFIX/lib/cmake" -maxdepth 1 -type d 2>/dev/null | sed 's/^/  /' || true
+echo ":: Qt6 static libs:"
+ls -1 "$PREFIX/lib"/libQt6*.a 2>/dev/null | sed 's/^/  /' || true
+
+# Sanity: the essential module cmake configs must exist for find_package(Qt6
+# ...) to work. Use explicit if-checks (not bare test under set -e) so the
+# error message is printed before the script exits.
+MISSING=""
+for f in \
+  "$PREFIX/lib/cmake/Qt6Core/Qt6CoreConfig.cmake" \
+  "$PREFIX/lib/cmake/Qt6Widgets/Qt6WidgetsConfig.cmake" \
+  "$PREFIX/lib/cmake/Qt6Network/Qt6NetworkConfig.cmake"; do
+  if [ ! -f "$f" ]; then
+    MISSING+="$f "
+  fi
+done
+if [ -n "$MISSING" ]; then
+  echo "::error::Required Qt6 cmake config files missing: $MISSING" >&2
+  exit 1
+fi
 
 echo ":: static Qt6 build complete at $PREFIX"
 echo ":: set CMAKE_PREFIX_PATH=$PREFIX"
