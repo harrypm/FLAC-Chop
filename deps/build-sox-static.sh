@@ -107,6 +107,10 @@ build_sox() {
   local fp="$PREFIX"
   export CFLAGS="${CFLAGS:-} -I$fp/include"
   export LDFLAGS="${LDFLAGS:-} -L$fp/lib"
+  # SoX 14.4.2 is old C code; modern GCC (14+) treats implicit function
+  # declarations, int-conversion, and incompatible pointer types as errors by
+  # default, which breaks the build. Downgrade them to warnings.
+  export CFLAGS="$CFLAGS -Wno-error=implicit-function-declaration -Wno-error=int-conversion -Wno-error=incompatible-pointer-types"
   ./configure \
     --enable-static \
     --disable-shared \
