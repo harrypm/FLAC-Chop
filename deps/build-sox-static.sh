@@ -46,7 +46,7 @@ fi
 build_zlib() {
   local src="$WORKDIR/zlib-src"
   if [ ! -d "$src" ]; then
-    curl -fsSL "https://zlib.net/zlib-1.3.1.tar.gz" -o "$WORKDIR/zlib.tgz"
+    curl -fsSL "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz" -o "$WORKDIR/zlib.tgz"
     tar -C "$WORKDIR" -xzf "$WORKDIR/zlib.tgz"
     mv "$WORKDIR"/zlib-* "$src"
   fi
