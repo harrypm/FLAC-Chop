@@ -246,17 +246,20 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.deps
-          key: deps-win-x86_64-cache-v2
+          key: deps-win-x86_64-cache-v3
 
       - name: Download pre-built static deps (libsox + Qt6)
         if: steps.deps-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         env:
-          # deps-v1's Qt tarball was empty (196 bytes) due to the since-fixed
-          # `tar --exclude` bug in build-static-deps.yml. deps-v2 is the real
-          # 722 MB static Qt6 install (Qt6Widgets/Core/Concurrent/Network
-          # Config.cmake all present — verified from the v2 build run log).
-          DEPS_VERSION: v2
+          # deps-v2's Qt tarball bundled only the source/build tree — the
+          # install tree was missing because build-qt6-static.sh passed an
+          # MSYS /d/... path to Qt configure -prefix, which native cmake
+          # misinterpreted, installing to a mangled D:\d\... location. deps-v3
+          # is rebuilt with a Windows -prefix (cygpath -m) and the src/ tree
+          # stripped, so the tarball contains the real install tree
+          # (lib/cmake/Qt6Widgets/Qt6WidgetsConfig.cmake).
+          DEPS_VERSION: v3
           CACHE_REPO: harrypm/FLAC-Chop
         run: |
           set -euo pipefail

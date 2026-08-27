@@ -64,8 +64,9 @@ jobs:
           WORKSPACE="$PWD"
           cd "$WORKSPACE/.deps"
           tar -cf - sox-static | xz -T0 -9 > sox-static-windows-x86_64.tar.xz
-          # Tar the entire qt6-static (including src/ — the --exclude flag was
-          # producing an empty tarball due to an MSYS2 tar issue; optimize later).
+          # build-qt6-static.sh removes qt6-static/src after install, so this
+          # tarball contains only the install tree (lib/cmake, mkspecs, plugins)
+          # — not the ~700 MB source/build tree.
           tar -cf - qt6-static | xz -T0 -9 > qt6-static-windows-x86_64.tar.xz
           sha256sum sox-static-windows-x86_64.tar.xz > sox-static-windows-x86_64.tar.xz.sha256
           sha256sum qt6-static-windows-x86_64.tar.xz > qt6-static-windows-x86_64.tar.xz.sha256
