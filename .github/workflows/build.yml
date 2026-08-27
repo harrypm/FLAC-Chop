@@ -246,13 +246,17 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.deps
-          key: deps-win-x86_64-cache-v1
+          key: deps-win-x86_64-cache-v2
 
       - name: Download pre-built static deps (libsox + Qt6)
         if: steps.deps-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         env:
-          DEPS_VERSION: v1
+          # deps-v1's Qt tarball was empty (196 bytes) due to the since-fixed
+          # `tar --exclude` bug in build-static-deps.yml. deps-v2 is the real
+          # 722 MB static Qt6 install (Qt6Widgets/Core/Concurrent/Network
+          # Config.cmake all present — verified from the v2 build run log).
+          DEPS_VERSION: v2
           CACHE_REPO: harrypm/FLAC-Chop
         run: |
           set -euo pipefail
@@ -647,7 +651,15 @@ jobs:
           SOX_BIN="$(brew --prefix sox)/bin/sox"
           cp "$SOX_BIN" "$APP_ROOT/MacOS/sox"
           chmod +x "$APP_ROOT/MacOS/sox"
-          mapfile -t SOX_DEPS < <(otool -L "$SOX_BIN" \
+          # macOS ships bash 3.2 as /bin/bash, which lacks the `mapfile`
+          # builtin (added in bash 4.0) — using it made both macOS arch jobs
+          # fail with "mapfile: command not found" (exit 127). Populate the
+          # array with a portable while-read loop instead.
+          SOX_DEPS=()
+          while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            SOX_DEPS+=("$dep")
+          done < <(otool -L "$SOX_BIN" \
             | awk 'NR>1 {print $1}' \
             | grep -E '^/opt/homebrew/|^/usr/local/' || true)
           for dep in "${SOX_DEPS[@]}"; do
