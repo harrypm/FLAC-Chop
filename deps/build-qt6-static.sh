@@ -61,13 +61,27 @@ cd "$BUILD"
 # Qt6's configure is a cmake wrapper. -static -release gives a release static
 # build. -nomake examples/tests skips the slow example/test builds. Only
 # qtbase is cloned, so no other Qt modules are built.
+#
+# Force Qt's BUNDLED static third-party copies and disable optional features
+# that would otherwise auto-detect MSYS2's SHARED system libs (zlib, pcre2,
+# libb2) — a static-Qt single-exe must not import zlib1.dll/libpcre2-16-0.dll/
+# libb2-1.dll. libb2 has a bundled fallback (qtbase/src/3rdparty/blake2);
+# zstd/brotli are optional features FLAC-Chop doesn't need, so disable them to
+# drop libzstd.dll/libbrotlidec.dll imports. Feature var names match vcpkg's
+# qtbase port and Gentoo's dev-qt/qtbase ebuild (QT_FEATURE_*).
 "$SRC/configure" \
   -static \
   -release \
   -prefix "$PREFIX_ARG" \
   -nomake examples \
   -nomake tests \
-  -no-dbus
+  -no-dbus \
+  -- \
+  -DQT_FEATURE_system_zlib=OFF \
+  -DQT_FEATURE_system_pcre2=OFF \
+  -DQT_FEATURE_system_libb2=OFF \
+  -DQT_FEATURE_zstd=OFF \
+  -DQT_FEATURE_brotli=OFF
 
 cmake --build . --parallel "$NJOBS"
 # cmake --install may return non-zero due to non-fatal post-install steps like

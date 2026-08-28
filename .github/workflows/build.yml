@@ -246,20 +246,18 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ github.workspace }}/.deps
-          key: deps-win-x86_64-cache-v3
+          key: deps-win-x86_64-cache-v4
 
       - name: Download pre-built static deps (libsox + Qt6)
         if: steps.deps-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         env:
-          # deps-v2's Qt tarball bundled only the source/build tree — the
-          # install tree was missing because build-qt6-static.sh passed an
-          # MSYS /d/... path to Qt configure -prefix, which native cmake
-          # misinterpreted, installing to a mangled D:\d\... location. deps-v3
-          # is rebuilt with a Windows -prefix (cygpath -m) and the src/ tree
-          # stripped, so the tarball contains the real install tree
-          # (lib/cmake/Qt6Widgets/Qt6WidgetsConfig.cmake).
-          DEPS_VERSION: v3
+          # deps-v3's Qt install tree was correct but Qt linked MSYS2's SHARED
+          # zlib/pcre2/libb2/brotli/zstd, so the single-exe imported those
+          # DLLs and failed the self-contained-EXE assert. deps-v4 rebuilds Qt
+          # with bundled static third-party (QT_FEATURE_system_{zlib,pcre2,libb2}=OFF)
+          # and zstd/brotli features disabled — no shared 3rdparty DLL imports.
+          DEPS_VERSION: v4
           CACHE_REPO: harrypm/FLAC-Chop
         run: |
           set -euo pipefail
@@ -326,7 +324,7 @@ jobs:
             local leaks=""
             while IFS= read -r dll; do
               case "$(echo "$dll" | tr '[:lower:]' '[:upper:]')" in
-                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL|NTDLL.DLL|USERENV.DLL|BCRYPT.DLL|MPR.DLL|SECUR32.DLL|WINTRUST.DLL|CRYPT32.DLL|DWMAPI.DLL|UXTHEME.DLL|D3D11.DLL|DXGI.DLL|DXGUID.DLL|D2D1.DLL|DWRITE.DLL|D3D12.DLL|OPENGL32.DLL|GLU32.DLL|AUTHZ.DLL)
+                API-MS-WIN-*|KERNEL32.DLL|KERNELBASE.DLL|USER32.DLL|GDI32.DLL|SHELL32.DLL|WINMM.DLL|OLE32.DLL|OLEAUT32.DLL|ADVAPI32.DLL|COMDLG32.DLL|COMCTL32.DLL|SHLWAPI.DLL|WS2_32.DLL|SETUPAPI.DLL|IMM32.DLL|VERSION.DLL|UCRTBASE.DLL|MSVCRT.DLL|MF.DLL|MFPLAT.DLL|MFREADWRITE.DLL|EVR.DLL|STRMIIDS.DLL|AVRT.DLL|NTDLL.DLL|USERENV.DLL|BCRYPT.DLL|BCRYPTPRIMITIVES.DLL|MPR.DLL|SECUR32.DLL|WINTRUST.DLL|CRYPT32.DLL|DWMAPI.DLL|UXTHEME.DLL|D3D9.DLL|D3D11.DLL|DXGI.DLL|DXGUID.DLL|D2D1.DLL|DWRITE.DLL|D3D12.DLL|OPENGL32.DLL|GLU32.DLL|AUTHZ.DLL|NCRYPT.DLL|NETAPI32.DLL|SHCORE.DLL|WINHTTP.DLL|WTSAPI32.DLL)
                   continue
                   ;;
                 *)
