@@ -292,12 +292,15 @@ jobs:
           DEPS="$PWD/.deps"
           QT_PREFIX="$(cygpath -m "$DEPS/qt6-static")"
           SOX_PREFIX="$(cygpath -m "$DEPS/sox-static")"
+          # SoX 14.4.2's effects/dsp code references OpenMP (GOMP_*/omp_*)
+          # symbols; link libgomp statically so the static libsox resolves at
+          # the final link (libgomp.a ships with mingw-w64-x86_64-gcc).
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
             -DFLAC_CHOP_STATIC_QT=ON \
             -DFLAC_CHOP_STATIC_SOX=ON \
             -DSOX_STATIC_PREFIX="$SOX_PREFIX" \
-            -DSOX_STATIC_LIBS="FLAC z"
+            -DSOX_STATIC_LIBS="FLAC z gomp"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
 
@@ -466,9 +469,25 @@ jobs:
                    | xargs -r -n1 basename \
                    | sort -u)
           if [ -n "$SOX_MISSING" ]; then
-            echo "::error::sox.exe is missing required bundled DLLs:"
-            printf '%s' "$SOX_MISSING"
-            exit 1
+            # The ldd-walk above can miss a sox dep whose ldd-reported path
+            # didn't match ${BINDIR}; copy each missing one straight from
+            # ${BINDIR} before failing. Only fail if it's genuinely absent
+            # from the MSYS2 install (sox.exe wouldn't run anyway).
+            STILL_MISSING=""
+            while IFS= read -r sox_dll; do
+              [ -z "$sox_dll" ] && continue
+              if [ ! -f "dist/$sox_dll" ] && [ -f "${BINDIR}/$sox_dll" ]; then
+                cp "${BINDIR}/$sox_dll" "dist/$sox_dll"
+              fi
+              if [ ! -f "dist/$sox_dll" ]; then
+                STILL_MISSING+="$sox_dll"$'\n'
+              fi
+            done <<<"$SOX_MISSING"
+            if [ -n "$STILL_MISSING" ]; then
+              echo "::error::sox.exe is missing required bundled DLLs (not in ${BINDIR}):"
+              printf '%s' "$STILL_MISSING"
+              exit 1
+            fi
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
@@ -759,6 +778,12 @@ jobs:
                   codesign --force --sign - "$bin"
                 fi
               done
+          # Sign the bundled sox helper BEFORE the main executable. codesign
+          # validates sibling Mach-Os in MacOS/ when signing the main exe and
+          # fails with "In subcomponent: sox" if sox is still unsigned.
+          if [ -f "dist/FLAC-Chop.app/Contents/MacOS/sox" ]; then
+            codesign --force --sign - "dist/FLAC-Chop.app/Contents/MacOS/sox"
+          fi
           find "dist/FLAC-Chop.app/Contents/MacOS" -type f -print0 \
             | while IFS= read -r -d "" bin; do
                 if file "$bin" | grep -q "Mach-O"; then
