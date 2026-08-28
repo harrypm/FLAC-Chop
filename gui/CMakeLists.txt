@@ -108,6 +108,14 @@ if(WIN32)
     # (NtReadFile/NtCreateFile/NtOpenFile/NtWriteFile/RtlNtStatusToDosError/...)
     # that newer Rust std (>= ~1.75 gnu target) calls for async I/O/stdin.
     target_link_libraries(flac-chop PRIVATE ws2_32 advapi32 userenv bcrypt ntdll)
+    # Static libsox (SoX 14.4.2) references OpenMP (GOMP_*/omp_*) symbols from
+    # its effects/dsp code; supply libgomp on the final link. Only needed for
+    # the in-process static-sox build (MinGW gcc); the shared-sox arm64 build
+    # doesn't set FLAC_CHOP_STATIC_SOX. -lgomp is resolved to libgomp.a by the
+    # -static link option below.
+    if(FLAC_CHOP_STATIC_SOX)
+        target_link_libraries(flac-chop PRIVATE gomp)
+    endif()
 elseif(APPLE)
     target_link_libraries(flac-chop PRIVATE pthread dl m iconv)
 else()

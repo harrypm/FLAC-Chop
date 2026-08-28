@@ -293,14 +293,16 @@ jobs:
           QT_PREFIX="$(cygpath -m "$DEPS/qt6-static")"
           SOX_PREFIX="$(cygpath -m "$DEPS/sox-static")"
           # SoX 14.4.2's effects/dsp code references OpenMP (GOMP_*/omp_*)
-          # symbols; link libgomp statically so the static libsox resolves at
-          # the final link (libgomp.a ships with mingw-w64-x86_64-gcc).
+          # symbols. libgomp can't go in SOX_STATIC_LIBS (cargo only searches
+          # the prefix lib dir, which has libFLAC/libz but not the system
+          # libgomp.a); it's linked at the C++ step via gui/CMakeLists.txt
+          # (-lgomp, resolved to libgomp.a by the -static link) instead.
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_PREFIX_PATH="$QT_PREFIX" \
             -DFLAC_CHOP_STATIC_QT=ON \
             -DFLAC_CHOP_STATIC_SOX=ON \
             -DSOX_STATIC_PREFIX="$SOX_PREFIX" \
-            -DSOX_STATIC_LIBS="FLAC z gomp"
+            -DSOX_STATIC_LIBS="FLAC z"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
 
