@@ -179,6 +179,20 @@ MainWindow::MainWindow(QWidget* parent)
     infoLay->addRow(tr("MSPS (from name):"), m_mspsLabel);
     infoLay->addRow(tr("Total (real):"), m_totalLabel);
     root->addWidget(infoBox);
+    // --- Output directory ---
+    // Where cuts are written. Defaults to the input file's directory (the
+    // original sibling -cut.flac behaviour); the user can Browse for a
+    // dedicated output folder, persisted across sessions via QSettings.
+    auto* outDirBox = new QGroupBox(tr("Output Directory"), central);
+    auto* outDirLay = new QHBoxLayout(outDirBox);
+    m_outDirEdit = new QLineEdit(outDirBox);
+    m_outDirEdit->setPlaceholderText(tr("(same as input file)"));
+    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = next to the input file."));
+    m_outDirBrowseBtn = new QPushButton(tr("Browse..."), outDirBox);
+    outDirLay->addWidget(m_outDirEdit, 1);
+    outDirLay->addWidget(m_outDirBrowseBtn, 0);
+    root->addWidget(outDirBox);
+
     // --- Output processing ---
     auto* outBox = new QGroupBox(tr("Output Processing"), central);
     auto* outLay = new QFormLayout(outBox);
@@ -245,6 +259,16 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::applyCut);
     connect(m_basicFilterCheck, &QCheckBox::toggled,
             this, &MainWindow::applyCut);
+    connect(m_outDirBrowseBtn, &QPushButton::clicked, this, &MainWindow::browseOutDir);
+    connect(m_outDirEdit, &QLineEdit::editingFinished, this, &MainWindow::onOutDirEdited);
+
+    // Restore the persisted output directory (empty = "same as input").
+    {
+        QSettings s;
+        s.beginGroup(QStringLiteral("output"));
+        m_outDirEdit->setText(s.value(QStringLiteral("dir")).toString().trimmed());
+        s.endGroup();
+    }
 
     // Drag & drop: the window accepts file drops; the time box must not swallow them.
     setAcceptDrops(true);
@@ -276,6 +300,8 @@ void MainWindow::setControlsEnabled(bool enabled)
     m_outputBitsCombo->setEnabled(enabled && m_probeOk);
     const quint64 outRate = m_outputModeCombo->currentData().toULongLong();
     m_basicFilterCheck->setEnabled(enabled && m_probeOk && outRate > 0);
+    m_outDirEdit->setEnabled(enabled);
+    m_outDirBrowseBtn->setEnabled(enabled);
 }
 
 void MainWindow::browse()
@@ -289,6 +315,48 @@ void MainWindow::browse()
     if (fn.isEmpty())
         return;
     loadFile(fn);
+}
+
+QString MainWindow::effectiveOutDir() const
+{
+    // User-chosen dir wins; empty (or a dir that doesn't yet exist but the
+    // user typed) falls back to the input file's directory so cuts always land
+    // somewhere sensible by default. Returns "" when no file is loaded.
+    const QString chosen = m_outDirEdit ? m_outDirEdit->text().trimmed() : QString();
+    if (!chosen.isEmpty())
+        return chosen;
+    if (m_inPath.isEmpty())
+        return QString();
+    return QFileInfo(m_inPath).absolutePath();
+}
+
+void MainWindow::persistOutDir(const QString& dir)
+{
+    QSettings s;
+    s.beginGroup(QStringLiteral("output"));
+    s.setValue(QStringLiteral("dir"), dir);
+    s.endGroup();
+}
+
+void MainWindow::browseOutDir()
+{
+    const QString startDir = effectiveOutDir().isEmpty() ? QDir::homePath() : effectiveOutDir();
+    const QString d = QFileDialog::getExistingDirectory(
+        this, tr("Select output directory"), startDir);
+    if (d.isEmpty())
+        return;
+    m_outDirEdit->setText(d);
+    persistOutDir(d);
+    applyCut();
+}
+
+void MainWindow::onOutDirEdited()
+{
+    // editingFinished fires on focus loss / Enter — persist + recompute the
+    // output path preview. Empty text means "same as input" (stock default).
+    const QString d = m_outDirEdit->text().trimmed();
+    persistOutDir(d);
+    applyCut();
 }
 
 void MainWindow::unloadFile()
@@ -353,6 +421,11 @@ void MainWindow::loadFile(const QString& fn)
 
     m_inPath = fn;
     m_pathLabel->setText(QFileInfo(fn).fileName());
+
+    // Show where cuts will land by default: the user-chosen dir if set, else
+    // the input file's directory (so the field isn't blank/confusing on load).
+    if (m_outDirEdit && m_outDirEdit->text().trimmed().isEmpty())
+        m_outDirEdit->setText(QFileInfo(fn).absolutePath());
 
     // Run the probe off the GUI thread. For files with an unknown STREAMINFO
     // total this scans every FLAC frame header (reading the whole file), which
@@ -695,9 +768,13 @@ void MainWindow::applyCut()
         return;
     }
 
-    // output path via the Rust helper
+    // output path via the Rust helper — into the effective output directory
+    // (user-chosen, else the input's directory).
     char buf[4096];
-    if (fc_generate_output_path(m_inPath.toUtf8().constData(), buf, sizeof(buf))) {
+    const QString outDir = effectiveOutDir();
+    const QByteArray outDirB = outDir.toUtf8();
+    if (fc_generate_output_path(m_inPath.toUtf8().constData(),
+                                 outDirB.constData(), buf, sizeof(buf))) {
         m_outPath = QString::fromUtf8(buf);
     } else {
         m_outPath = m_inPath + QStringLiteral("-cut.flac");
@@ -731,6 +808,15 @@ void MainWindow::process()
     const quint64 outHeaderRateHz = m_outputModeCombo->currentData().toULongLong();
     const quint32 outBits = m_outputBitsCombo->currentData().toUInt();
     const qint32 basicFilter = (outHeaderRateHz > 0 && m_basicFilterCheck->isChecked()) ? 1 : 0;
+
+    // Ensure the chosen output directory exists before SoX writes into it.
+    const QString outDir = effectiveOutDir();
+    if (!outDir.isEmpty() && !QDir().exists(outDir)) {
+        if (!QDir().mkpath(outDir)) {
+            m_statusLabel->setText(tr("Cannot create output directory: %1").arg(outDir));
+            return;
+        }
+    }
 
     if (QFile::exists(m_outPath)) {
         auto r = QMessageBox::question(this, tr("Overwrite?"),

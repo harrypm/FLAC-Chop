@@ -1,6 +1,7 @@
 #include <QApplication>
 #include <QIcon>
 #include <QPalette>
+#include <QSize>
 #include <cstdlib>
 #include "mainwindow.h"
 
@@ -39,14 +40,28 @@ int main(int argc, char* argv[])
     app.setApplicationVersion("v1.0.0");
     app.setOrganizationName("FLAC-Chop");
     applyDarkFusion(app);
+    // Multi-size QIcon so the taskbar/dock gets a crisp icon at every size
+    // (16..512) instead of a scaled single raster. Matches ld-analyse's
+    // multi-size icon set. On Windows prefer the .ico (multi-resolution)
+    // then fall back to the PNG set.
     QIcon appIcon;
 #if defined(Q_OS_WIN)
     appIcon = QIcon(":/icons/flac-chop-icon.ico");
-    if (appIcon.isNull())
-        appIcon = QIcon(":/icons/flac-chop-icon.png");
-#else
-    appIcon = QIcon(":/icons/flac-chop-icon.png");
 #endif
+    if (appIcon.isNull() || appIcon.availableSizes().isEmpty()) {
+        appIcon = QIcon();
+        const QSize sizes[] = { QSize(16,16), QSize(32,32), QSize(64,64),
+                                QSize(128,128), QSize(256,256), QSize(512,512) };
+        const char* paths[] = {
+            ":/icons/flac-chop-icon-16.png", ":/icons/flac-chop-icon-32.png",
+            ":/icons/flac-chop-icon-64.png", ":/icons/flac-chop-icon-128.png",
+            ":/icons/flac-chop-icon-256.png", ":/icons/flac-chop-icon-512.png",
+        };
+        for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i)
+            appIcon.addFile(QString::fromLatin1(paths[i]), sizes[i]);
+        // Largest raster as a size-less fallback so unknown sizes still resolve.
+        appIcon.addFile(":/icons/flac-chop-icon.png");
+    }
     app.setWindowIcon(appIcon);
 
     MainWindow w;

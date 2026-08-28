@@ -394,6 +394,7 @@ fn fc_chop_impl(
 #[no_mangle]
 pub extern "C" fn fc_generate_output_path(
     in_path: *const c_char,
+    out_dir: *const c_char,
     out_buf: *mut c_char,
     buf_len: usize,
 ) -> i32 {
@@ -405,7 +406,16 @@ pub extern "C" fn fc_generate_output_path(
             Ok(s) => s,
             Err(_) => return 0,
         };
-        let path = match chop::generate_output_path(i) {
+        // out_dir may be NULL or empty → "next to the source".
+        let d = if out_dir.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(out_dir).to_str() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            }
+        };
+        let path = match chop::generate_output_path(i, d) {
             Some(p) => p,
             None => return 0,
         };

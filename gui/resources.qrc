@@ -1,6 +1,14 @@
 <RCC>
   <qresource prefix="/">
     <file alias="icons/flac-chop-icon.ico">../assets/icons/flac-chop-icon.ico</file>
+    <!-- Multi-size PNGs so Qt can pick a crisp icon for any taskbar/dock
+         size instead of scaling a single raster (ld-analyse approach). -->
+    <file alias="icons/flac-chop-icon-16.png">../assets/icons/flac-chop-icon-16.png</file>
+    <file alias="icons/flac-chop-icon-32.png">../assets/icons/flac-chop-icon-32.png</file>
+    <file alias="icons/flac-chop-icon-64.png">../assets/icons/flac-chop-icon-64.png</file>
+    <file alias="icons/flac-chop-icon-128.png">../assets/icons/flac-chop-icon-128.png</file>
+    <file alias="icons/flac-chop-icon-256.png">../assets/icons/flac-chop-icon-256.png</file>
+    <file alias="icons/flac-chop-icon-512.png">../assets/icons/flac-chop-icon-512.png</file>
     <file alias="icons/flac-chop-icon.png">../assets/icons/flac-chop-icon.png</file>
   </qresource>
 </RCC>

@@ -437,13 +437,21 @@ pub fn chop(in_path: &str, out_path: &str, start_samples: u64, length_samples: u
 /// Build a sibling output path: `<dir>/<stem>-cut.<ext>` (ext defaults to
 /// flac). If that file already exists, `-cut-2`, `-cut-3`, … are tried so an
 /// earlier cut is never silently overwritten by SoX.
-pub fn generate_output_path(in_path: &str) -> Option<String> {
+pub fn generate_output_path(in_path: &str, out_dir: &str) -> Option<String> {
     let p = Path::new(in_path);
     let stem = p.file_stem()?.to_str()?;
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("flac");
-    let parent: PathBuf = match p.parent() {
-        Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
-        _ => PathBuf::from("."),
+    // out_dir selects where the cut is written. An empty out_dir means "next
+    // to the source" (the original sibling -cut.flac behaviour); otherwise the
+    // cut goes into the user-chosen directory. A non-existent out_dir is not
+    // created here — the caller (GUI) ensures it exists before chopping.
+    let parent: PathBuf = if !out_dir.is_empty() {
+        PathBuf::from(out_dir)
+    } else {
+        match p.parent() {
+            Some(par) if !par.as_os_str().is_empty() => par.to_path_buf(),
+            _ => PathBuf::from("."),
+        }
     };
     let mut out = parent.join(format!("{}-cut.{}", stem, ext));
     let mut n = 2u32;
@@ -460,13 +468,13 @@ mod tests {
 
     #[test]
     fn output_path_appends_cut() {
-        let p = generate_output_path("/tmp/foo/bar.flac").unwrap();
+        let p = generate_output_path("/tmp/foo/bar.flac", "").unwrap();
         assert!(p.ends_with("bar-cut.flac"));
     }
 
     #[test]
     fn output_path_no_ext_defaults_flac() {
-        let p = generate_output_path("/tmp/foo/RAW").unwrap();
+        let p = generate_output_path("/tmp/foo/RAW", "").unwrap();
         assert!(p.ends_with("RAW-cut.flac"));
     }
 
@@ -476,7 +484,7 @@ mod tests {
         // current dir ("."). The exact separator differs by platform
         // ("./local-cut.flac" on Unix, ".\\local-cut.flac" on Windows), so
         // assert on the platform-correct form rather than a hard-coded string.
-        let p = generate_output_path("local.flac").unwrap();
+        let p = generate_output_path("local.flac", "").unwrap();
         let expected = {
             let mut pb = std::path::PathBuf::from(".");
             pb.push("local-cut.flac");
@@ -488,17 +496,29 @@ mod tests {
     }
 
     #[test]
+    fn output_path_uses_explicit_out_dir() {
+        // A non-empty out_dir redirects the cut into that directory while
+        // keeping the <stem>-cut.<ext> naming + clobber avoidance.
+        let dir = std::env::temp_dir().join("fc_test_outdir");
+        let _ = std::fs::create_dir_all(&dir);
+        let p = generate_output_path("/tmp/foo/bar.flac", dir.to_str().unwrap()).unwrap();
+        let expected = dir.join("bar-cut.flac").to_string_lossy().into_owned();
+        assert_eq!(p, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn output_path_avoids_clobbering_existing_cut() {
         let dir = std::env::temp_dir().join("fc_test_chop");
         let _ = std::fs::create_dir_all(&dir);
         let input = dir.join("tape.flac");
         std::fs::write(&input, b"").unwrap();
         // First call: no existing cut → plain -cut.flac.
-        let first = generate_output_path(input.to_str().unwrap()).unwrap();
+        let first = generate_output_path(input.to_str().unwrap(), "").unwrap();
         assert!(first.ends_with("tape-cut.flac"));
         // Simulate an existing previous cut → must pick -cut-2.flac.
         std::fs::write(&first, b"").unwrap();
-        let second = generate_output_path(input.to_str().unwrap()).unwrap();
+        let second = generate_output_path(input.to_str().unwrap(), "").unwrap();
         assert!(second.ends_with("tape-cut-2.flac"), "got {second}");
         let _ = std::fs::remove_file(&first);
     }

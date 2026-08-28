@@ -160,6 +160,7 @@ jobs:
           Categories=AudioVideo;Utility;
           Terminal=false
           StartupNotify=true
+          StartupWMClass=FLAC-Chop
           EOF
 
           # AppImage tooling rejects 1024x1024 icons; use a validated 512x512

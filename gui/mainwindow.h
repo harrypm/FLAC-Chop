@@ -36,6 +36,8 @@ private slots:
     void setInFromBox();
     void setOutFromBox();
     void checkForUpdatesManual();
+    void browseOutDir();
+    void onOutDirEdited();
 
 private:
     // HH:MM:SS parsing helpers (accept "SS", "MM:SS", "HH:MM:SS").
@@ -54,6 +56,11 @@ private:
     void setTimeBox(double sec);
     void maybeCheckForUpdates();
     void checkForUpdates(bool manual);
+    // Effective output directory for cuts: the user-chosen dir if non-empty,
+    // else the input file's directory (the original sibling -cut.flac
+    // behaviour). Persisted in QSettings("output/dir").
+    QString effectiveOutDir() const;
+    void persistOutDir(const QString& dir);
 
     QString m_inPath;
     FcProbe m_probe{};
@@ -85,6 +92,8 @@ private:
     QLabel* m_startSampLabel = nullptr;
     QLabel* m_lenSampLabel = nullptr;
     QLabel* m_outPathLabel = nullptr;
+    QLineEdit* m_outDirEdit = nullptr;     // user-chosen output directory
+    QPushButton* m_outDirBrowseBtn = nullptr;
     QComboBox* m_outputModeCombo = nullptr;
     QComboBox* m_outputBitsCombo = nullptr;
     QCheckBox* m_basicFilterCheck = nullptr;
