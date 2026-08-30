@@ -93,6 +93,10 @@ endif()
 
 target_include_directories(flac-chop PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+# Inject the git-derived version (from the top-level CMakeLists.txt) so the
+# GUI reports the real release tag, not a hard-coded string.
+target_compile_definitions(flac-chop PRIVATE FLAC_CHOP_VERSION="${FLAC_CHOP_VERSION}")
+
 # Link the Rust staticlib + the Rust std's native deps (which must be supplied
 # by the C/C++ linker when statically linking a Rust lib). These differ by
 # platform; see https://github.com/rust-lang/cargo/issues/4671.

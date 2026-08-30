@@ -316,6 +316,7 @@ pub extern "C" fn fc_chop(
     output_rate_hz: u64,
     output_bits: u32,
     basic_rf_filter: i32,
+    is_rf: i32,
     out: *mut FcChopResult,
 ) {
     unsafe {
@@ -336,6 +337,7 @@ pub extern "C" fn fc_chop(
                 output_rate_hz,
                 output_bits,
                 basic_rf_filter,
+                is_rf,
                 out,
             )
         }));
@@ -355,6 +357,7 @@ fn fc_chop_impl(
     output_rate_hz: u64,
     output_bits: u32,
     basic_rf_filter: i32,
+    is_rf: i32,
     out: &mut FcChopResult,
 ) {
     unsafe {
@@ -381,6 +384,7 @@ fn fc_chop_impl(
             output_rate_hz: if output_rate_hz > 0 { Some(output_rate_hz) } else { None },
             output_bits: if output_bits > 0 { Some(output_bits) } else { None },
             basic_rf_filter: basic_rf_filter != 0,
+            is_rf: is_rf != 0,
         };
         let r = chop::chop_with_options(i, o, start_samples, length_samples, opts);
         out.ok = if r.ok { 1 } else { 0 };
@@ -395,6 +399,7 @@ fn fc_chop_impl(
 pub extern "C" fn fc_generate_output_path(
     in_path: *const c_char,
     out_dir: *const c_char,
+    stem: *const c_char,
     out_buf: *mut c_char,
     buf_len: usize,
 ) -> i32 {
@@ -415,7 +420,16 @@ pub extern "C" fn fc_generate_output_path(
                 Err(_) => return 0,
             }
         };
-        let path = match chop::generate_output_path(i, d) {
+        // stem may be NULL or empty → "<inputstem>-cut" (stock behaviour).
+        let s = if stem.is_null() {
+            ""
+        } else {
+            match CStr::from_ptr(stem).to_str() {
+                Ok(s) => s,
+                Err(_) => return 0,
+            }
+        };
+        let path = match chop::generate_output_path(i, d, s) {
             Some(p) => p,
             None => return 0,
         };
@@ -437,6 +451,14 @@ pub extern "C" fn fc_sox_available() -> i32 {
     } else {
         0
     }
+}
+
+/// Request cancellation of the in-flight cut (if any). Called from the GUI
+/// thread while `fc_chop` runs on a worker thread; the shell-out backend kills
+/// the sox child promptly.
+#[no_mangle]
+pub extern "C" fn fc_chop_cancel() {
+    chop::cancel_chop();
 }
 
 #[cfg(test)]

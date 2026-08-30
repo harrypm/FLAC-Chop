@@ -59,10 +59,11 @@ void fc_plan(double start_sec, double len_sec, double real_rate_hz,
 void fc_chop(const char* in_path, const char* out_path,
              uint64_t start_samples, uint64_t length_samples,
              uint64_t output_rate_hz, uint32_t output_bits,
-             int32_t basic_rf_filter, FcChopResult* out);
+             int32_t basic_rf_filter, int32_t is_rf, FcChopResult* out);
 int fc_generate_output_path(const char* in_path, const char* out_dir,
-                            char* out_buf, uintptr_t buf_len);
+                            const char* stem, char* out_buf, uintptr_t buf_len);
 int fc_sox_available(void);
+void fc_chop_cancel(void);
 
 #ifdef __cplusplus
 }

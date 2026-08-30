@@ -33,11 +33,18 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QVersionNumber>
+#include <QRegularExpression>
+#include <QRegularExpressionMatch>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <cmath>
 #include "rangeslider.h"
+
+// Git-derived build version (matches QCoreApplication::applicationVersion()).
+#ifndef FLAC_CHOP_VERSION
+#define FLAC_CHOP_VERSION "dev-unknown"
+#endif
 
 static QString ulongStr(quint64 v)
 {
@@ -88,7 +95,8 @@ static QVersionNumber parseReleaseVersion(const QString& raw)
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
-    setWindowTitle(tr("FLAC-Chop — RF capture cutter"));
+    setWindowTitle(tr("FLAC-Chop %1 — RF capture cutter")
+        .arg(QStringLiteral(FLAC_CHOP_VERSION)));
     resize(720, 580);
 
     auto* central = new QWidget(this);
@@ -116,14 +124,38 @@ MainWindow::MainWindow(QWidget* parent)
     });
 
     // --- Input file ---
+    // Read-only QLineEdit (not a flat QLabel) so the input path sits in the
+    // same sunken "in-lay" frame as the Output Directory field — both
+    // top-row boxes then look identical, with clear white text on the dark
+    // Fusion Base background.
     auto* inBox = new QGroupBox(tr("Input File"), central);
     auto* inLay = new QHBoxLayout(inBox);
-    m_pathLabel = new QLabel(tr("(no file selected)"), inBox);
-    m_pathLabel->setWordWrap(true);
+    m_pathLabel = new QLineEdit(inBox);
+    m_pathLabel->setReadOnly(true);
+    m_pathLabel->setText(tr("(no file selected)"));
+    m_pathLabel->setToolTip(tr("Full path of the loaded FLAC file."));
     m_browseBtn = new QPushButton(tr("Browse..."), inBox);
     inLay->addWidget(m_pathLabel, 1);
     inLay->addWidget(m_browseBtn, 0);
-    root->addWidget(inBox);
+
+    // --- Output directory (top row, next to the input file) ---
+    // Where cuts are written. Defaults to the input file's directory (the
+    // original sibling -cut.flac behaviour); the user can Browse for a
+    // dedicated output folder, persisted across sessions via QSettings.
+    auto* outDirBox = new QGroupBox(tr("Output Directory"), central);
+    auto* outDirLay = new QHBoxLayout(outDirBox);
+    m_outDirEdit = new QLineEdit(outDirBox);
+    m_outDirEdit->setPlaceholderText(tr("(same as input file)"));
+    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = next to the input file."));
+    m_outDirBrowseBtn = new QPushButton(tr("Browse..."), outDirBox);
+    outDirLay->addWidget(m_outDirEdit, 1);
+    outDirLay->addWidget(m_outDirBrowseBtn, 0);
+
+    // Input + output side by side at the very top of the window.
+    auto* ioRow = new QHBoxLayout();
+    ioRow->addWidget(inBox, 1);
+    ioRow->addWidget(outDirBox, 1);
+    root->addLayout(ioRow);
 
     // --- Markers: one editable time box + Set IN / Set OUT buttons ---
     // Type a time, click Set IN or Set OUT to drop that marker. The cut is
@@ -179,19 +211,6 @@ MainWindow::MainWindow(QWidget* parent)
     infoLay->addRow(tr("MSPS (from name):"), m_mspsLabel);
     infoLay->addRow(tr("Total (real):"), m_totalLabel);
     root->addWidget(infoBox);
-    // --- Output directory ---
-    // Where cuts are written. Defaults to the input file's directory (the
-    // original sibling -cut.flac behaviour); the user can Browse for a
-    // dedicated output folder, persisted across sessions via QSettings.
-    auto* outDirBox = new QGroupBox(tr("Output Directory"), central);
-    auto* outDirLay = new QHBoxLayout(outDirBox);
-    m_outDirEdit = new QLineEdit(outDirBox);
-    m_outDirEdit->setPlaceholderText(tr("(same as input file)"));
-    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = next to the input file."));
-    m_outDirBrowseBtn = new QPushButton(tr("Browse..."), outDirBox);
-    outDirLay->addWidget(m_outDirEdit, 1);
-    outDirLay->addWidget(m_outDirBrowseBtn, 0);
-    root->addWidget(outDirBox);
 
     // --- Output processing ---
     auto* outBox = new QGroupBox(tr("Output Processing"), central);
@@ -231,10 +250,14 @@ MainWindow::MainWindow(QWidget* parent)
     // --- Process + progress + status ---
     m_processBtn = new QPushButton(tr("Process FLAC"), central);
     m_processBtn->setEnabled(false);
-    m_checkUpdatesBtn = new QPushButton(tr("Check for Updates"), central);
+    m_cancelBtn = new QPushButton(tr("Cancel"), central);
+    m_cancelBtn->setEnabled(false); // only live while a cut is in flight
+    m_cancelBtn->setToolTip(tr("Stop the in-progress cut."));
     auto* actionLay = new QHBoxLayout();
     actionLay->addWidget(m_processBtn, 1);
-    actionLay->addWidget(m_checkUpdatesBtn);
+    actionLay->addWidget(m_cancelBtn, 0);
+    // 'Check for Updates' lives only in the Help menu now (auto-checked on
+    // startup); no button next to Process to keep the action row clean.
     m_progress = new QProgressBar(central);
     m_progress->setRange(0, 1);
     m_progress->setValue(0);
@@ -248,7 +271,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(m_browseBtn, &QPushButton::clicked, this, &MainWindow::browse);
     connect(m_processBtn, &QPushButton::clicked, this, &MainWindow::process);
-    connect(m_checkUpdatesBtn, &QPushButton::clicked, this, &MainWindow::checkForUpdatesManual);
+    connect(m_cancelBtn, &QPushButton::clicked, this, &MainWindow::cancelProcess);
     connect(m_setInBtn, &QPushButton::clicked, this, &MainWindow::setInFromBox);
     connect(m_setOutBtn, &QPushButton::clicked, this, &MainWindow::setOutFromBox);
     connect(m_slider, &QRangeSlider::inValueChanged, this, &MainWindow::onSliderInChanged);
@@ -263,11 +286,16 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_outDirEdit, &QLineEdit::editingFinished, this, &MainWindow::onOutDirEdited);
 
     // Restore the persisted output directory (empty = "same as input").
+    // If a dir was previously chosen (non-empty), auto-follow is off so it
+    // persists; if empty, auto-follow stays on and the field will track the
+    // input file's dir on first load.
     {
         QSettings s;
         s.beginGroup(QStringLiteral("output"));
-        m_outDirEdit->setText(s.value(QStringLiteral("dir")).toString().trimmed());
+        const QString persisted = s.value(QStringLiteral("dir")).toString().trimmed();
         s.endGroup();
+        m_outDirEdit->setText(persisted);
+        m_outDirAutoFollow = persisted.isEmpty();
     }
 
     // Drag & drop: the window accepts file drops; the time box must not swallow them.
@@ -346,6 +374,7 @@ void MainWindow::browseOutDir()
     if (d.isEmpty())
         return;
     m_outDirEdit->setText(d);
+    m_outDirAutoFollow = false; // user explicitly chose a dir — stop auto-following
     persistOutDir(d);
     applyCut();
 }
@@ -355,8 +384,46 @@ void MainWindow::onOutDirEdited()
     // editingFinished fires on focus loss / Enter — persist + recompute the
     // output path preview. Empty text means "same as input" (stock default).
     const QString d = m_outDirEdit->text().trimmed();
+    // If the user clears the field, resume auto-following the input dir.
+    m_outDirAutoFollow = d.isEmpty();
     persistOutDir(d);
     applyCut();
+}
+
+QString MainWindow::renamedOutputStem() const
+{
+    // Rename the output stem to reflect the new altered metadata when the
+    // input name matches the MISRC capture convention `<N>msps_<B>-bit`
+    // (e.g. 20msps_8-bit -> 16msps_6-bit). "Keep source rate/bits" keeps the
+    // original token. Non-matching names return "" (stock <stem>-cut).
+    if (m_inPath.isEmpty())
+        return QString();
+    const QString inStem = QFileInfo(m_inPath).completeBaseName();
+    // Match an optional prefix, then <N>msps_<B>-bit, then an optional suffix.
+    static const QRegularExpression re(QStringLiteral("^(.*?)([0-9]+)msps_([0-9]+)-bit(.*)$"));
+    const auto m = re.match(inStem);
+    if (!m.hasMatch())
+        return QString();
+    const QString prefix = m.captured(1);
+    const QString srcMspsTok = m.captured(2);
+    const QString srcBitsTok = m.captured(3);
+    const QString suffix = m.captured(4);
+
+    // New rate token: the selected output mode (header kHz / 1000 = MSPS), or
+    // keep the source token when "keep source rate".
+    const quint64 outHeaderHz = m_outputModeCombo ? m_outputModeCombo->currentData().toULongLong() : 0;
+    QString mspsTok = srcMspsTok;
+    if (outHeaderHz > 0)
+        mspsTok = QString::number(outHeaderHz / 1000);
+
+    // New bits token: the selected output bit-depth, or keep the source token
+    // when "keep source bit-depth".
+    const uint outBits = m_outputBitsCombo ? m_outputBitsCombo->currentData().toUInt() : 0;
+    QString bitsTok = srcBitsTok;
+    if (outBits > 0)
+        bitsTok = QString::number(outBits);
+
+    return prefix + mspsTok + QStringLiteral("msps_") + bitsTok + QStringLiteral("-bit") + suffix;
 }
 
 void MainWindow::unloadFile()
@@ -421,10 +488,12 @@ void MainWindow::loadFile(const QString& fn)
 
     m_inPath = fn;
     m_pathLabel->setText(QFileInfo(fn).fileName());
+    m_pathLabel->setToolTip(fn);
 
-    // Show where cuts will land by default: the user-chosen dir if set, else
-    // the input file's directory (so the field isn't blank/confusing on load).
-    if (m_outDirEdit && m_outDirEdit->text().trimmed().isEmpty())
+    // Output dir: if auto-following (no explicit user choice yet), update the
+    // field to the NEW input's directory so cuts land next to the new file. If
+    // the user chose a dedicated dir, it persists and is left untouched.
+    if (m_outDirAutoFollow)
         m_outDirEdit->setText(QFileInfo(fn).absolutePath());
 
     // Run the probe off the GUI thread. For files with an unknown STREAMINFO
@@ -768,13 +837,18 @@ void MainWindow::applyCut()
         return;
     }
 
-    // output path via the Rust helper — into the effective output directory
-    // (user-chosen, else the input's directory).
+    // Output path via the Rust helper — into the effective output directory,
+    // with a renamed stem that reflects the new altered metadata
+    // (e.g. 20msps_8-bit -> 16msps_6-bit) when the input name matches the
+    // MISRC capture naming convention.
     char buf[4096];
     const QString outDir = effectiveOutDir();
     const QByteArray outDirB = outDir.toUtf8();
+    const QString stem = renamedOutputStem();
+    const QByteArray stemB = stem.toUtf8();
     if (fc_generate_output_path(m_inPath.toUtf8().constData(),
-                                 outDirB.constData(), buf, sizeof(buf))) {
+                                 outDirB.constData(),
+                                 stemB.constData(), buf, sizeof(buf))) {
         m_outPath = QString::fromUtf8(buf);
     } else {
         m_outPath = m_inPath + QStringLiteral("-cut.flac");
@@ -828,6 +902,8 @@ void MainWindow::process()
 
     setControlsEnabled(false);
     m_progress->setRange(0, 0); // busy indicator
+    m_cancelRequested = false;
+    m_cancelBtn->setEnabled(true);
     const QString bitsText =
         (outBits == 0) ? tr("source depth")
       : (outBits == 6) ? tr("6-bit crush")
@@ -842,15 +918,26 @@ void MainWindow::process()
     const QString outPath = m_outPath;
     const quint64 start = m_plan.start_samples;
     const quint64 len = m_plan.length_samples;
-    auto fut = QtConcurrent::run([inPath, outPath, start, len, outHeaderRateHz, outBits, basicFilter]() -> FcChopResult {
+    const qint32 isRf = m_probe.is_rf ? 1 : 0;
+    auto fut = QtConcurrent::run([inPath, outPath, start, len, outHeaderRateHz, outBits, basicFilter, isRf]() -> FcChopResult {
         FcChopResult r{};
         QByteArray inB = inPath.toUtf8();
         QByteArray outB = outPath.toUtf8();
         fc_chop(inB.constData(), outB.constData(), start, len,
-                outHeaderRateHz, outBits, basicFilter, &r);
+                outHeaderRateHz, outBits, basicFilter, isRf, &r);
         return r;
     });
     m_watcher->setFuture(fut);
+}
+
+void MainWindow::cancelProcess()
+{
+    if (!m_watcher || !m_watcher->isRunning())
+        return;
+    m_cancelRequested = true;
+    fc_chop_cancel(); // tell the Rust core to kill the sox child
+    m_cancelBtn->setEnabled(false); // prevent repeat clicks
+    m_statusLabel->setText(tr("Cancelling…"));
 }
 
 void MainWindow::onChopFinished()
@@ -858,8 +945,16 @@ void MainWindow::onChopFinished()
     FcChopResult r = m_watcher->result();
     m_progress->setRange(0, 1);
     m_progress->setValue(1);
+    m_cancelBtn->setEnabled(false);
 
-    if (r.ok) {
+    if (m_cancelRequested) {
+        // The sox child was killed mid-cut: remove the partial output file so
+        // the next run's clobber-avoidance doesn't see a corrupt -cut.flac.
+        m_cancelRequested = false;
+        if (!m_outPath.isEmpty() && QFile::exists(m_outPath))
+            QFile::remove(m_outPath);
+        m_statusLabel->setText(tr("Cancelled."));
+    } else if (r.ok) {
         m_statusLabel->setText(tr("Done. Output: %1").arg(m_outPath));
     } else {
         QString err = QString::fromUtf8(r.stderr_buf).trimmed();
@@ -905,8 +1000,6 @@ void MainWindow::checkForUpdates(bool manual)
     }
 
     m_updateCheckInFlight = true;
-    if (m_checkUpdatesBtn)
-        m_checkUpdatesBtn->setEnabled(false);
 
     QNetworkRequest req(QUrl(QStringLiteral("https://api.github.com/repos/harrypm/FLAC-Chop/releases/latest")));
     req.setHeader(QNetworkRequest::UserAgentHeader,
@@ -919,8 +1012,6 @@ void MainWindow::checkForUpdates(bool manual)
     connect(reply, &QNetworkReply::finished, this, [this, reply, manual]() {
         auto finish = [this, reply]() {
             m_updateCheckInFlight = false;
-            if (m_checkUpdatesBtn)
-                m_checkUpdatesBtn->setEnabled(true);
             reply->deleteLater();
         };
 

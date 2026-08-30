@@ -18,3 +18,6 @@
 *.swo
 *~
 .DS_Store
+
+# Stray top-level CMake artifacts (from a build run without a build subdir)
+/CMakeFiles/

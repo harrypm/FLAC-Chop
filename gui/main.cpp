@@ -5,6 +5,12 @@
 #include <cstdlib>
 #include "mainwindow.h"
 
+// Git-derived build version, injected by CMake (FLAC_CHOP_VERSION). Falls
+// back to "dev-unknown" when built outside the CMake version step.
+#ifndef FLAC_CHOP_VERSION
+#define FLAC_CHOP_VERSION "dev-unknown"
+#endif
+
 // Dark Fusion palette matching ld-analyse (ld-decode/tools/ld-analyse/main.cpp)
 // so FLAC-Chop visually matches the rest of the DdD/ld-decode toolset.
 static void applyDarkFusion(QApplication& app)
@@ -37,7 +43,7 @@ int main(int argc, char* argv[])
 
     QApplication app(argc, argv);
     app.setApplicationName("FLAC-Chop");
-    app.setApplicationVersion("v1.0.0");
+    app.setApplicationVersion(QStringLiteral(FLAC_CHOP_VERSION));
     app.setOrganizationName("FLAC-Chop");
     applyDarkFusion(app);
     // Multi-size QIcon so the taskbar/dock gets a crisp icon at every size

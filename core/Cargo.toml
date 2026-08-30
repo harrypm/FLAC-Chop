@@ -11,6 +11,12 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 claxon = "0.4"
+# Pure-Rust FLAC Vorbis-comment read+write. Used to rewrite the RF_ tags
+# (RF_TOTAL_SAMPLES / RF_SAMPLE_RATE / DURATION_SECONDS / LENGTH) on a cut
+# output so they reflect the new altered metadata, with ingest metadata
+# (project / tape_id / ...) passed through untouched — same embedding model
+# MISRC-GUI uses (libFLAC Vorbis comments), with no extra runtime binary.
+lofty = "0.18"
 
 [features]
 # Link libSoX statically and run the cut in-process (no external sox binary).

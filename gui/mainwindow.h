@@ -38,6 +38,7 @@ private slots:
     void checkForUpdatesManual();
     void browseOutDir();
     void onOutDirEdited();
+    void cancelProcess();
 
 private:
     // HH:MM:SS parsing helpers (accept "SS", "MM:SS", "HH:MM:SS").
@@ -61,6 +62,10 @@ private:
     // behaviour). Persisted in QSettings("output/dir").
     QString effectiveOutDir() const;
     void persistOutDir(const QString& dir);
+    // Rename the output stem to reflect the new altered metadata
+    // (e.g. 20msps_8-bit -> 16msps_6-bit) when the input name matches the
+    // MISRC `<N>msps_<B>-bit` convention; else empty (stock <stem>-cut).
+    QString renamedOutputStem() const;
 
     QString m_inPath;
     FcProbe m_probe{};
@@ -76,7 +81,7 @@ private:
     double m_outSec = 0.0;
 
     // owned widgets
-    QLabel* m_pathLabel = nullptr;
+    QLineEdit* m_pathLabel = nullptr;   // input file path (read-only, in-lay)
     QPushButton* m_browseBtn = nullptr;
     QLineEdit* m_timeEdit = nullptr;   // the single editable time box
     QPushButton* m_setInBtn = nullptr;
@@ -98,8 +103,8 @@ private:
     QComboBox* m_outputBitsCombo = nullptr;
     QCheckBox* m_basicFilterCheck = nullptr;
     QLabel* m_filterProfileLabel = nullptr;
-    QPushButton* m_checkUpdatesBtn = nullptr;
     QPushButton* m_processBtn = nullptr;
+    QPushButton* m_cancelBtn = nullptr;   // stops an in-flight cut
     QProgressBar* m_progress = nullptr;
     QLabel* m_statusLabel = nullptr;
 
@@ -112,6 +117,8 @@ private:
     bool m_syncing = false;
     bool m_probing = false; // true while fc_probe runs off-thread
     bool m_updateCheckInFlight = false;
+    bool m_cancelRequested = false; // true while a cut cancel is pending
+    bool m_outDirAutoFollow = true; // true: output dir follows the input file's dir until the user explicitly chooses one
 };
 
 #endif // FLACCHOP_MAINWINDOW_H

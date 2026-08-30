@@ -20,12 +20,27 @@
 //!    output sink — reproducing `sox in -r R -b B out trim Ss Ls sinc … dither …`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(not(feature = "static-sox"))]
 use std::process::Command;
+#[cfg(not(feature = "static-sox"))]
+use std::io::Read;
+#[cfg(not(feature = "static-sox"))]
+use std::process::Stdio;
+
+// Cancellation flag for an in-flight cut. The GUI sets this via
+// `cancel_chop()` / `fc_chop_cancel()`; the shell-out backend polls it while
+// waiting on the sox child and kills the child promptly when it is set. The
+// static-sox backend checks it before starting the effects chain (in-process
+// libSoX has no mid-flow cancellation hook, so a static-sox cut can only be
+// stopped before it begins — the shipping builds use the shell-out backend).
+static CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// Optional post-cut processing controls for SoX.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChopOptions {
+    // NOTE: `is_rf` defaults to `false` via `Default` (plain audio), so
+    // existing callers that don't set it get non-RF tag semantics.
     /// Output FLAC header sample rate in Hz (e.g. 20000 for 20 MSPS RF files
     /// that use the /1000 header convention). `None` keeps the source rate.
     pub output_rate_hz: Option<u64>,
@@ -38,6 +53,11 @@ pub struct ChopOptions {
     /// Apply the wiki-aligned basic RF low-pass profile (`sinc -n 2500 0-...`)
     /// when changing output rate.
     pub basic_rf_filter: bool,
+    /// Whether the source is an RF capture (uses the /1000 header convention).
+    /// Drives the post-cut Vorbis-tag rewrite (RF_SAMPLE_RATE = header*1000,
+    /// RF_TOTAL_SAMPLES = streaminfo*1000, + RF_SAMPLE_RATE_KHZ) so the
+    /// output's embedded metadata reflects the new altered capture params.
+    pub is_rf: bool,
 }
 
 /// Map an RF output sample-rate header (Hz) to a basic wiki profile cutoff
@@ -164,23 +184,69 @@ pub fn chop_with_options(
         cmd.arg("dither").arg("-p").arg("6");
     }
 
-    let output = cmd.output();
-    match output {
-        Ok(o) => {
-            let code = o.status.code().unwrap_or(-1);
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            ChopResult {
-                ok: o.status.success(),
-                exit_code: code,
-                stderr,
+    // Spawn sox with a piped stderr so we can both poll for completion (to
+    // support cancellation) and capture its diagnostic output. stdout is
+    // unused (sox writes the cut to the output file, not stdout).
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    CANCEL.store(false, Ordering::Relaxed);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: format!("failed to spawn sox ({}): {e}", sox_program.display()),
             }
         }
-        Err(e) => ChopResult {
-            ok: false,
-            exit_code: -1,
-            stderr: format!("failed to spawn sox ({}): {e}", sox_program.display()),
-        },
+    };
+
+    // Poll try_wait (non-blocking) so a cancel request can kill sox without
+    // waiting for the whole (potentially long) cut to finish. Checked every
+    // 50 ms — low overhead, sub-100ms cancel latency.
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap_or(None) {
+            break s;
+        }
+        if CANCEL.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait(); // reap the killed child
+            let mut stderr = String::new();
+            if let Some(mut se) = child.stderr.take() {
+                let _ = se.read_to_string(&mut stderr);
+            }
+            CANCEL.store(false, Ordering::Relaxed); // consume the flag
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: if stderr.trim().is_empty() {
+                    "cancelled by user".to_string()
+                } else {
+                    stderr
+                },
+            };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+
+    let mut stderr = String::new();
+    if let Some(mut se) = child.stderr.take() {
+        let _ = se.read_to_string(&mut stderr);
     }
+    let code = status.code().unwrap_or(-1);
+    let mut r = ChopResult {
+        ok: status.success(),
+        exit_code: code,
+        stderr,
+    };
+    // Rewrite the RF Vorbis tags on the output to reflect the new cut
+    // (MISRC-GUI embedding model). Non-fatal: the cut already succeeded, so a
+    // tag-rewrite failure is surfaced as a warning in stderr, not a hard fail.
+    if r.ok {
+        rewrite_tags_after_cut(out_path, opts.is_rf, &mut r);
+    }
+    r
 }
 
 #[cfg(not(feature = "static-sox"))]
@@ -286,6 +352,15 @@ pub fn chop_with_options(
     length_samples: u64,
     opts: ChopOptions,
 ) -> ChopResult {
+    CANCEL.store(false, Ordering::Relaxed);
+    // The static-sox backend runs the cut in-process via sox_flow_effects,
+    // which has no mid-flow cancellation hook. Honour a cancel that was
+    // requested before the chain starts; once flow begins it runs to
+    // completion (the shipping builds use the shell-out backend, which can
+    // cancel mid-cut).
+    if CANCEL.load(Ordering::Relaxed) {
+        return ChopResult { ok: false, exit_code: -1, stderr: "cancelled by user".into() };
+    }
     if let Err(e) = ensure_sox_init() {
         return ChopResult { ok: false, exit_code: -1, stderr: e };
     }
@@ -415,7 +490,11 @@ pub fn chop_with_options(
         sox_ffi::sox_close(out_fmt);
         sox_ffi::sox_close(in_fmt);
 
-        ChopResult { ok, exit_code: if ok { 0 } else { -1 }, stderr }
+        let mut r = ChopResult { ok, exit_code: if ok { 0 } else { -1 }, stderr };
+        if r.ok {
+            rewrite_tags_after_cut(out_path, opts.is_rf, &mut r);
+        }
+        r
     }
 }
 
@@ -429,6 +508,31 @@ pub fn sox_available() -> bool {
 // Shared helpers.
 // ===========================================================================
 
+/// Rewrite the RF Vorbis tags on a just-cut output file to reflect the new
+/// altered metadata (MISRC-GUI embedding model). Non-fatal: on failure,
+/// appends a warning to `r.stderr` but leaves `r.ok` true (the cut itself
+/// succeeded).
+fn rewrite_tags_after_cut(out_path: &str, is_rf: bool, r: &mut ChopResult) {
+    match crate::tags::rewrite_cut_tags(std::path::Path::new(out_path), is_rf) {
+        Ok(()) => {}
+        Err(e) => {
+            let note = format!("warning: tag rewrite failed: {e}");
+            if r.stderr.is_empty() {
+                r.stderr = note;
+            } else {
+                r.stderr.push('\n');
+                r.stderr.push_str(&note);
+            }
+        }
+    }
+}
+
+/// Request cancellation of the currently-running cut (if any). Safe to call
+/// from the GUI thread while `chop_with_options` runs on a worker thread.
+pub fn cancel_chop() {
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
 /// Run `sox in out trim <start>s <len>s`. Captures stderr for the GUI.
 pub fn chop(in_path: &str, out_path: &str, start_samples: u64, length_samples: u64) -> ChopResult {
     chop_with_options(in_path, out_path, start_samples, length_samples, ChopOptions::default())
@@ -437,9 +541,16 @@ pub fn chop(in_path: &str, out_path: &str, start_samples: u64, length_samples: u
 /// Build a sibling output path: `<dir>/<stem>-cut.<ext>` (ext defaults to
 /// flac). If that file already exists, `-cut-2`, `-cut-3`, … are tried so an
 /// earlier cut is never silently overwritten by SoX.
-pub fn generate_output_path(in_path: &str, out_dir: &str) -> Option<String> {
+///
+/// `stem_override` (when non-empty) replaces the input's stem, so the GUI can
+/// rename the output to reflect the new altered metadata — e.g. an input named
+/// `20msps_8-bit` cut to 16 MSPS / 6-bit becomes `16msps_6-bit` (matching the
+/// MISRC capture naming convention). Clobber avoidance then appends `-2`,
+/// `-3`, … to that stem.
+pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -> Option<String> {
     let p = Path::new(in_path);
-    let stem = p.file_stem()?.to_str()?;
+    let src_stem = p.file_stem()?.to_str()?;
+    let stem = if !stem_override.is_empty() { stem_override } else { src_stem };
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("flac");
     // out_dir selects where the cut is written. An empty out_dir means "next
     // to the source" (the original sibling -cut.flac behaviour); otherwise the
@@ -453,10 +564,11 @@ pub fn generate_output_path(in_path: &str, out_dir: &str) -> Option<String> {
             _ => PathBuf::from("."),
         }
     };
-    let mut out = parent.join(format!("{}-cut.{}", stem, ext));
+    let suffix = if stem_override.is_empty() { "-cut" } else { "" };
+    let mut out = parent.join(format!("{}{}.{}", stem, suffix, ext));
     let mut n = 2u32;
     while out.exists() && n < 10_000 {
-        out = parent.join(format!("{}-cut-{}.{}", stem, n, ext));
+        out = parent.join(format!("{}{}-{}.{}", stem, suffix, n, ext));
         n += 1;
     }
     Some(out.to_string_lossy().into_owned())
@@ -468,13 +580,13 @@ mod tests {
 
     #[test]
     fn output_path_appends_cut() {
-        let p = generate_output_path("/tmp/foo/bar.flac", "").unwrap();
+        let p = generate_output_path("/tmp/foo/bar.flac", "", "").unwrap();
         assert!(p.ends_with("bar-cut.flac"));
     }
 
     #[test]
     fn output_path_no_ext_defaults_flac() {
-        let p = generate_output_path("/tmp/foo/RAW", "").unwrap();
+        let p = generate_output_path("/tmp/foo/RAW", "", "").unwrap();
         assert!(p.ends_with("RAW-cut.flac"));
     }
 
@@ -484,7 +596,7 @@ mod tests {
         // current dir ("."). The exact separator differs by platform
         // ("./local-cut.flac" on Unix, ".\\local-cut.flac" on Windows), so
         // assert on the platform-correct form rather than a hard-coded string.
-        let p = generate_output_path("local.flac", "").unwrap();
+        let p = generate_output_path("local.flac", "", "").unwrap();
         let expected = {
             let mut pb = std::path::PathBuf::from(".");
             pb.push("local-cut.flac");
@@ -501,9 +613,28 @@ mod tests {
         // keeping the <stem>-cut.<ext> naming + clobber avoidance.
         let dir = std::env::temp_dir().join("fc_test_outdir");
         let _ = std::fs::create_dir_all(&dir);
-        let p = generate_output_path("/tmp/foo/bar.flac", dir.to_str().unwrap()).unwrap();
+        let p = generate_output_path("/tmp/foo/bar.flac", dir.to_str().unwrap(), "").unwrap();
         let expected = dir.join("bar-cut.flac").to_string_lossy().into_owned();
         assert_eq!(p, expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_path_uses_stem_override() {
+        // A non-empty stem_override renames the output to reflect the new
+        // altered metadata (e.g. 20msps_8-bit -> 16msps_6-bit), with no
+        // `-cut` suffix and clobber avoidance as `<stem>-2`.
+        let dir = std::env::temp_dir().join("fc_test_stem");
+        let _ = std::fs::create_dir_all(&dir);
+        let base = dir.join("20msps_8-bit.flac");
+        std::fs::write(&base, b"").unwrap();
+        let p = generate_output_path(base.to_str().unwrap(), dir.to_str().unwrap(), "16msps_6-bit").unwrap();
+        let expected = dir.join("16msps_6-bit.flac").to_string_lossy().into_owned();
+        assert_eq!(p, expected, "got {p}, expected {expected}");
+        // Simulate an existing file -> must pick -2.
+        std::fs::write(&expected, b"").unwrap();
+        let p2 = generate_output_path(base.to_str().unwrap(), dir.to_str().unwrap(), "16msps_6-bit").unwrap();
+        assert!(p2.ends_with("16msps_6-bit-2.flac"), "got {p2}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -514,11 +645,11 @@ mod tests {
         let input = dir.join("tape.flac");
         std::fs::write(&input, b"").unwrap();
         // First call: no existing cut → plain -cut.flac.
-        let first = generate_output_path(input.to_str().unwrap(), "").unwrap();
+        let first = generate_output_path(input.to_str().unwrap(), "", "").unwrap();
         assert!(first.ends_with("tape-cut.flac"));
         // Simulate an existing previous cut → must pick -cut-2.flac.
         std::fs::write(&first, b"").unwrap();
-        let second = generate_output_path(input.to_str().unwrap(), "").unwrap();
+        let second = generate_output_path(input.to_str().unwrap(), "", "").unwrap();
         assert!(second.ends_with("tape-cut-2.flac"), "got {second}");
         let _ = std::fs::remove_file(&first);
     }
