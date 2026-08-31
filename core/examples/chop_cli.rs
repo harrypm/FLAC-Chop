@@ -35,12 +35,18 @@ fn main() {
         std::process::exit(1);
     }
 
+    // fc_plan computes sample counts for SoX, which reads the file at its
+    // STREAMINFO (on-disk) rate — NOT the real RF rate. For /1000 RF captures
+    // the header rate is the /1000 "kHz" value and declared_total_samples is
+    // the real count / 1000; passing the real values would produce counts
+    // 1000× too large for SoX. Pass the STREAMINFO values (header_sample_rate
+    // + declared_total_samples). For non-RF audio these equal the real values.
     let mut plan = flac_chop_core::ffi::FcPlan::default();
     flac_chop_core::ffi::fc_plan(
         start_sec,
         len_sec,
-        probe.real_rate_hz,
-        probe.total_samples,
+        probe.header_sample_rate as f64,
+        probe.declared_total_samples,
         if probe.total_samples_known { 1 } else { 0 },
         &mut plan as *mut _,
     );

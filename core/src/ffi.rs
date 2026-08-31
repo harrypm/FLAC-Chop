@@ -205,10 +205,15 @@ impl Default for FcPlan {
     }
 }
 
-/// Compute a sample-exact cut plan from seconds. `real_rate_hz` is the already-
-/// resolved real sample rate (from `fc_probe`'s `real_rate_hz` field — header
-/// ×1000 for RF captures, or the header rate for real audio). When total
-/// samples are known, the cut is clamped to the file.
+/// Compute a sample-exact cut plan from seconds. The rate and total must be
+/// the **on-disk STREAMINFO** values (header_sample_rate +
+/// declared_total_samples from `fc_probe`), NOT the real-rate values — SoX
+/// reads the file at its STREAMINFO rate. For /1000 RF captures the header
+/// rate is the /1000 "kHz" value (e.g. 20000 for 20 MSPS) and the
+/// declared total is the real count / 1000; passing the real rate/total here
+/// would produce sample counts 1000× too large for SoX. For non-RF audio the
+/// on-disk and real values are identical. When total samples are known, the
+/// cut is clamped to the file.
 #[no_mangle]
 pub extern "C" fn fc_plan(
     start_sec: f64,

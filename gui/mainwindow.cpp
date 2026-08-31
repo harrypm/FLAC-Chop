@@ -393,28 +393,23 @@ void MainWindow::onOutDirEdited()
 QString MainWindow::renamedOutputStem() const
 {
     // Rename the output stem to reflect the new altered metadata when the
-    // input name matches the MISRC capture convention `<N>msps_<B>-bit`
-    // (e.g. 20msps_8-bit -> 16msps_6-bit). "Keep source rate/bits" keeps the
-    // original token. Non-matching names return "" (stock <stem>-cut).
+    // input name matches the MISRC capture naming convention, which (per
+    // MISRC-GUI gui_settings.c) is:  <base>_<rfTag>_<B>-bit_<N>msps[.flac]
+    // i.e. bits first, then rate — e.g.  ..._8-bit_20msps  ->  ..._6-bit_16msps.
+    // "Keep source rate/bits" keeps the original token. Non-matching names
+    // return "" (stock <stem>-cut).
     if (m_inPath.isEmpty())
         return QString();
     const QString inStem = QFileInfo(m_inPath).completeBaseName();
-    // Match an optional prefix, then <N>msps_<B>-bit, then an optional suffix.
-    static const QRegularExpression re(QStringLiteral("^(.*?)([0-9]+)msps_([0-9]+)-bit(.*)$"));
+    // Match an optional prefix, then <B>-bit_<N>msps, then an optional suffix.
+    static const QRegularExpression re(QStringLiteral("^(.*?)([0-9]+)-bit_([0-9]+)msps(.*)$"));
     const auto m = re.match(inStem);
     if (!m.hasMatch())
         return QString();
     const QString prefix = m.captured(1);
-    const QString srcMspsTok = m.captured(2);
-    const QString srcBitsTok = m.captured(3);
+    const QString srcBitsTok = m.captured(2);
+    const QString srcMspsTok = m.captured(3);
     const QString suffix = m.captured(4);
-
-    // New rate token: the selected output mode (header kHz / 1000 = MSPS), or
-    // keep the source token when "keep source rate".
-    const quint64 outHeaderHz = m_outputModeCombo ? m_outputModeCombo->currentData().toULongLong() : 0;
-    QString mspsTok = srcMspsTok;
-    if (outHeaderHz > 0)
-        mspsTok = QString::number(outHeaderHz / 1000);
 
     // New bits token: the selected output bit-depth, or keep the source token
     // when "keep source bit-depth".
@@ -423,7 +418,14 @@ QString MainWindow::renamedOutputStem() const
     if (outBits > 0)
         bitsTok = QString::number(outBits);
 
-    return prefix + mspsTok + QStringLiteral("msps_") + bitsTok + QStringLiteral("-bit") + suffix;
+    // New rate token: the selected output mode (header kHz / 1000 = MSPS), or
+    // keep the source token when "keep source rate".
+    const quint64 outHeaderHz = m_outputModeCombo ? m_outputModeCombo->currentData().toULongLong() : 0;
+    QString mspsTok = srcMspsTok;
+    if (outHeaderHz > 0)
+        mspsTok = QString::number(outHeaderHz / 1000);
+
+    return prefix + bitsTok + QStringLiteral("-bit_") + mspsTok + QStringLiteral("msps") + suffix;
 }
 
 void MainWindow::unloadFile()
@@ -827,8 +829,17 @@ void MainWindow::applyCut()
         return;
     }
 
-    fc_plan(startSec, lenSec, m_probe.real_rate_hz,
-            m_probe.total_samples, m_probe.total_samples_known, &m_plan);
+    // fc_plan computes sample counts for SoX, which reads the file at its
+    // STREAMINFO (on-disk) rate — NOT the real RF rate. For /1000 RF captures
+    // the header rate is 20000 (kHz) and the STREAMINFO total is the real
+    // count / 1000, while real_rate_hz is 20M and total_samples is the real
+    // count (208B). Passing the real values made fc_plan compute 500s as
+    // 10 billion samples, but SoX only has 208M — so it read the whole file.
+    // Pass header_sample_rate + declared_total_samples (the STREAMINFO values
+    // SoX sees) so the sample counts match. For non-RF audio these equal the
+    // real values, so this is a no-op there.
+    fc_plan(startSec, lenSec, m_probe.header_sample_rate,
+            m_probe.declared_total_samples, m_probe.total_samples_known, &m_plan);
 
     if (!m_plan.ok) {
         m_statusLabel->setText(tr("Plan error: %1")
