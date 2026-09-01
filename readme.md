@@ -4,17 +4,35 @@
 <img width="150" height="150" alt="" src="assets/icons/flac-chop-icon-512.png" />
 
 
-A small, cross-platform tool for **sample-exact cutting of RF-capture FLAC files**
+A small, cross-platform tool for **sample-exact cutting of RF-capture files**
 
 (Ideally produced by the [MISRC-GUI](https://github.com/harrypm/MISRC-GUI) pipeline)
 
-A Rust core reads the FLAC metadata directly (no `soxi`/`ffprobe` shell-out) and
+A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
 [SoX](https://sox.sourceforge.net/) performs the actual cut. The GUI is Qt6.
 
 It correctly handles the things that trip up generic audio editors on these
 files: the RF "20 kHz header = 20 MSPS real" convention, the 36-bit
 `total_samples` wrap that long captures hit, and unfinalized/piped captures
 whose FLAC header total is unknown.
+
+## Supported input formats
+
+| Input | Recognized by | Rate source |
+|---|---|---|
+| FLAC (`.flac`, `.ldf`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
+| PCM WAV (`.wav`) | header | header: audio rate as-is; >1 MHz = real RF rate; else /1000 |
+| headerless raw PCM `.u8` `.u16` `.s8` `.s16` (also `.r8`/`.r16`/`.raw`/`.bin`) | extension | filename only: an `<n>msps` hint (e.g. `..._8-bit_20msps.u8`) is REQUIRED |
+
+- Unknown extensions with a `fLaC` or `RIFF` magic header are detected by
+  sniffing the first bytes of the file, so renamed captures just work.
+- Raw PCM files have no header at all: the rate comes only from the filename
+  (`..._20msps.u8` → 20 MSPS) and total samples from the file size. Without an
+  `<n>msps` hint the probe refuses to guess.
+- Raw files are treated as mono (cxadc/DdD RF convention) unless a channel
+  count is set explicitly.
+- Headerless raw RF is pinned to the same /1000 SoX stream rate as the
+  equivalent FLAC, so sinc cutoffs and resample modes behave identically.
 
 
 ## Downloads
@@ -49,12 +67,16 @@ If you build FLAC-Chop from source, SoX still needs to be available on PATH
   downsample to 20/24/28.6 MSPS (plus an experimental 16 MSPS mode), with
   wiki-aligned basic SoX sinc filter presets.
 - Bit-depth control (keep source, 8-bit, or 6-bit crush emulation stored in an
-  8-bit FLAC container).
+  8-bit FLAC container; no dither — pure requantization for maximum
+  compression efficiency and SNR).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 
 ## Using the GUI
 
-1. **Browse** to a `.flac` RF capture (or drag-and-drop one onto the window).
+1. **Browse** to a capture file — FLAC (`.flac`/`.ldf`), PCM WAV, or headerless
+   raw PCM (`.u8`/`.u16`/`.s8`/`.s16`); any file with a matching magic header
+   is accepted too. Drag-and-drop takes any local file and lets the probe
+   decide (a clear error appears if the format is unsupported).
 2. The probe runs on a background thread; the "Total (real)" label shows the
    real-time duration and a provenance tag (`vorbis RF_TOTAL_SAMPLES`,
    `companion file`, `scanned from frames`, or `wrap-corrected +N×2³⁶`). If
@@ -70,20 +92,24 @@ If you build FLAC-Chop from source, SoX still needs to be available on PATH
 ## Headless use
 
 ```bash
-# probe a file (print real rate, total samples, real duration, provenance)
+# probe a file (print sniffed format, real rate, total samples, real duration, provenance)
 cargo run --release --manifest-path core/Cargo.toml --example probe_cli -- file.flac
 
-# cut: chop_cli <in.flac> <out.flac> <start_sec> <len_sec>
+# cut: chop_cli <in> <out.flac> <start_sec> <len_sec>
 cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.flac out.flac 60 10
 ```
-The CLIs run the exact same probe → plan → SoX path as the GUI.
+The CLIs run the exact same probe → plan → SoX path as the GUI and accept the
+same input formats. Headerless raw inputs must carry the rate in their name
+(e.g. `..._8-bit_20msps.u8`).
 
 ## Status & Limitations
 
 - No progress percentage during a cut (SoX doesn't emit sample progress to a
   captured pipe easily); the GUI shows a busy indicator instead.
-- 6-bit RF output is emulated by quantizing to 6-bit precision and storing in
-  an 8-bit FLAC container (SoX/FLAC cannot encode true 6-bit FLAC directly).
+- 6-bit RF output is emulated by pure bit-shift requantization to 6-bit
+  precision stored in an 8-bit FLAC container, with no dither (SoX/FLAC
+  cannot encode true 6-bit FLAC directly; dithering was removed as it adds
+  incompressible noise and hurts compression efficiency and SNR).
 
 ## Author
 

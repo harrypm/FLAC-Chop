@@ -32,9 +32,13 @@ pub const sox_option_no: sox_option_t = 0;
 pub const sox_option_yes: sox_option_t = 1;
 pub const sox_option_default: sox_option_t = 2;
 
-/// `sox_encoding_t` enum. We only need to carry it through opaquely in most
-/// places; `SOX_ENCODING_SIGN2` etc. are not hardcoded here because we always
-/// copy the encoding struct from the opened input file.
+/// `sox_encoding_t` enum values (sox.h `sox_encoding_t`). Only the two raw
+/// PCM encodings are needed — for headerless raw inputs, where the encoding
+/// hint must be given explicitly since there is no header to sniff.
+pub const SOX_ENCODING_UNKNOWN: sox_encoding_t = 0;
+pub const SOX_ENCODING_SIGN2: sox_encoding_t = 1;
+pub const SOX_ENCODING_UNSIGNED: sox_encoding_t = 2;
+
 pub type sox_encoding_t = c_int;
 
 /// `sox_signalinfo_t` — transcribed from sox.h.

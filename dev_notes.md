@@ -601,3 +601,129 @@ arm64 is CI-built + arch/dep-verified but NOT runtime-tested on an arm64
 device locally. The windows-11-arm runner provisioned with no queue issue;
 the dtolnay stable-aarch64-pc-windows-gnullvm toolchain + CLANGARM64 Qt6
 linked cleanly on the first run.
+
+---
+
+## 2026-08-31 (session) — 6-bit profile: remove dither, pure MISRC-style requant
+
+### Problem (user-reported)
+"16msps 6-bit profile needs fixing ... massive bSNR diff and the quality is
+noisyer, 40msps is clean 20msps is very slightly lower but 6-bit modes just
+take a massive dip in quality ... make an adjusted PAL profile more in-line
+with the original GUI radio script/math"; then: "remove dither entirely as it
+affects compression efficiency".
+
+### Root cause (verified against hard data)
+- Old 6-bit impl: `sox ... -b 8 out trim sinc dither -p 6` — TPDF dither on
+  a full-scale 6-bit grid. Measured on the 16 msps test cut (48M samples vs
+  the 8-bit baseline): mean|dev| = 433.5 s16, rms dev = 527.8 s16 ≈ 2.06 int8
+  LSB of pure added noise on a signal with rms 830 — and 29 distinct levels.
+- MISRC-GUI reference math (extract.c / misrc_capture.c): bit-depth reduce is
+  a pure arithmetic shift + saturate (`true12 >> 4`), NO dither; full ADC
+  range maps to container full range (`pad` convention = <<4 fill; DdD 10-bit
+  unpack in lddecode does the same: `(val-512) << 6`).
+- SoX auto-dithers every 8-bit write by default (CLI -D disables it):
+  measured 2,134,448 of 6,400,000 samples differ between -D and default on a
+  1s real trim — so even plain 8-bit cuts were getting auto-dither noise.
+
+### Fix (core/src/chop.rs, both backends)
+- `-D` (global --no-dither) on every sox invocation: no dither anywhere.
+- 6-bit = pure requantization onto a 64-level grid across the source full
+  scale, stored filling the 8-bit container (values = 4·round(v/4), MISRC
+  full-scale convention, never clipped). SoX has no mid-chain quantizer, so
+  it is two passes: pass 1 `vol 0.25` + 8-bit sink rounding, pass 2 `vol 4`
+  (lossless integer rescale). Same logic in shell-out (two sox runs + temp
+  file, cancel-safe cleanup) and static-sox (two chains, temp file).
+- `dither -p 6` removed everywhere; docs updated (readme.md, module docs).
+- New `core/examples/chop_convert_cli.rs` exposes the GUI conversion path
+  (rate + bits + sinc + is_rf) for headless validation.
+
+### Validation (hard data)
+Real source: India-wedding-pal 40 MSPS 8-bit 145 GB file, 4s→15s cut.
+
+RF sample noise added vs the 16 msps 8-bit baseline (rms, s16 units):
+- old `dither -p 6`: 527.8
+- no-dither 6-bit grid (rust core output == manual reference): 341.97
+  → 3.8 dB less injected noise; 29 distinct levels, all multiples of 4.
+
+File sizes (11 s @ 16 msps): 8-bit 76.5 MB, dithered 6-bit 48.1 MB,
+no-dither 6-bit 43.8 MB (−9% vs dithered, −43% vs 8-bit).
+
+Decode bPSNR (vhs-decode --system PAL --tf VHS --ts SP -f N -t 4, n=451
+fields, same command as the previous test set):
+- 40 msps 6-bit: 29.82 → 32.13 dB (+2.31; 8-bit ref 32.69)
+- 16 msps 6-bit: 27.53 → 30.22 dB (+2.69; 8-bit ref 32.12)
+
+Validation: cargo test --release 62/62 pass; GUI relinks and runs; both
+cuts generated through the actual core path (probe → plan → chop) with
+RF_ Vorbis tags rewritten (metaflac verified).
+
+---
+
+## 2026-09-01 (session) — multi-format inputs: WAV / raw PCM / .ldf / magic sniffing
+
+### Goal (user request)
+"Test something practical, also add support for .u8/.u16/.s8/.s16 and
+recognize .ldf as flac and for unknown file extensions check if they have
+wav/flac headers."
+
+### What was implemented
+**`core/src/probe.rs`** — container-agnostic probe:
+- `sniff_format()`: magic-based sniffing (`fLaC` → FLAC, `RIFF`+`WAVE` → WAV)
+  with extension fallback (`.ldf` → FLAC, `.u8/.u16/.s8/.s16/.r8/.r16` → raw,
+  `.raw`/`.bin` → u8). New `InputFormat` enum carried in `ProbeResult.format`.
+- WAV parsing rewritten as a RIFF chunk walker (fmt + data, odd-byte padding,
+  WAVE_FORMAT_EXTENSIBLE), replacing the incomplete parse.
+- `probe()` dispatches FLAC / WAV / raw. Raw: total = file_size /
+  bytes-per-sample; rate ONLY from the `<n>msps` filename hint (hard error
+  without one). WAV rate rule: audio rates as-is, header >1 MHz = real RF,
+  else /1000 (via `rate::resolve_wav_rate`).
+
+**`core/src/chop.rs`** — `ChopOptions` gained `input_format`,
+`input_rate_hz`, `input_channels` (None = sniff/derive). `sox_input_args()`
+builds the pre-input-path SoX args: FLAC → none; WAV → `-r` pin only for
+real-rate RF headers (>1 MHz, pinned to /1000 so sinc cutoffs keep
+FLAC-path semantics); raw → `-t <type> -r <rate> -c <ch>` where rate =
+real/1000 for RF (identical to the equivalent FLAC's stream rate) or the
+real rate for audio. Both backends consume it (shell-out args; static-sox
+passes encoding/signal hints to `sox_open_read`).
+
+**`core/src/ffi.rs` + `gui/flacchop.h`** — `FcProbe.format: u32` appended
+(ABI-append-only; 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16). Header updated in
+lockstep; `fc_chop` relies on chop-time auto-sniffing.
+
+**GUI/CLI** — file dialog filters + drop acceptance extended
+(`.flac .ldf .wav .u8 .u16 .s8 .s16 .r8 .r16 .raw .bin`; drops of any local
+file are handed to the probe, which reports clear errors for junk). Probe
+info label shows `raw PCM (rate from filename)` for format ≥ 2;
+`flac-chop --probe` prints the sniffed format. `probe_cli` prints it too.
+
+### Validation (hard data)
+`cargo test` 70 unit + 6 ffi integration pass (incl. new sniff/WAV/raw/rate
+tests). GUI relinks (cmake --build build: Built target flac-chop).
+
+Real-data end-to-end (source: flac-chop-test/03_16msps_8bit.flac, an 11 s
+16 MSPS RF cut; copies in flac-chop-test/fmt-test/):
+- probe agreement across formats (all: real_rate 16000000 Hz, is_rf=true,
+  total 176000000, 11.000 s): .xyz (FLAC magic) → flac; .wav (16000 kHz-
+  convention header) → wav; .u8 (176000000 bytes) → raw u8, rate from the
+  `16msps` filename hint, total from file size.
+- identical 4 s→6 s cut through chop_cli on all four inputs (original FLAC,
+  .xyz, .wav, .u8): plans identical (start 64,000,000 + len 32,000,000 at
+  16e6 Hz, is_rf=true); decoded cut outputs (sox → u8) are byte-identical
+  (md5 c3b0b967cc4ca5d07f5ade7d830723e9 for all four; explicit cmp PASS).
+- raw-sourced cut carries rewritten RF tags: RF_SAMPLE_RATE=16000000,
+  RF_TOTAL_SAMPLES=32000000000, RF_SAMPLE_RATE_KHZ=16000; soxi: 32,000,000
+  samples = 2.000 real s at 16 MSPS.
+
+### Honest caveats
+- Raw inputs assume mono (cxadc/DdD convention); stereo raw needs an explicit
+  channel override (GUI doesn't expose one yet — stereo raw must go via WAV).
+- 16-bit raw files are treated as little-endian (cxadc/DdD convention); no
+  big-endian detection.
+- The static-sox backend passes the equivalent encoding/signal hints to
+  `sox_open_read` and compiles, but is validated by unit tests only — a
+  prebuilt static libsox isn't part of the default local build, so the
+  end-to-end real-data test above ran the default shell-out backend.
+- chop_cli now mirrors the GUI and passes `is_rf` from the probe (previously
+  default options under-reported RF for headless runs).

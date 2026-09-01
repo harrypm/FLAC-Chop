@@ -90,6 +90,9 @@ pub struct ProbeResult {
     /// True if the file is treated as RF (header rate was multiplied by 1000
     /// or an msps hint was used). False for real audio files.
     pub is_rf: bool,
+    /// Sniffed input container format (FLAC / WAV / raw PCM width+sign).
+    /// Drives the SoX `-t` input type in the cutter for headerless raw PCM.
+    pub format: InputFormat,
 }
 
 impl Default for ProbeResult {
@@ -114,6 +117,7 @@ impl Default for ProbeResult {
             audio_offset: 0,
             real_rate_hz: 0.0,
             is_rf: false,
+            format: InputFormat::Flac,
         }
     }
 }
@@ -560,21 +564,171 @@ fn check_total_samples(
     (false, None)
 }
 
-/// Open `path` and read its FLAC STREAMINFO, then correct the 36-bit
-/// `total_samples` wrap if present. Never reads audio frames.
+/// Detected input container format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFormat {
+    /// Native FLAC (also `.ldf` and unknown extensions with an `fLaC` marker).
+    Flac,
+    /// RIFF/WAVE (PCM).
+    Wav,
+    /// Headerless raw PCM: unsigned 8-bit (cxadc 8-bit mode).
+    U8,
+    /// Headerless raw signed 8-bit.
+    S8,
+    /// Headerless raw unsigned 16-bit little-endian (cxadc tenbit/u16).
+    U16,
+    /// Headerless raw signed 16-bit little-endian (DdD s16 / general s16le).
+    S16,
+}
+
+impl InputFormat {
+    /// SoX `-t` filetype (or None when SoX can sniff it from the header or
+    /// extension itself, e.g. `.flac`/`.wav`).
+    pub fn sox_type(&self) -> Option<&'static str> {
+        match self {
+            InputFormat::Flac => None, // sniffed from the fLaC marker
+            Wav => None,
+            InputFormat::U8 => Some("u8"),
+            S8 => Some("s8"),
+            U16 => Some("u16"),
+            S16 => Some("s16"),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Flac => "flac",
+            Wav => "wav",
+            U8 => "u8",
+            S8 => "s8",
+            U16 => "u16",
+            S16 => "s16",
+        }
+    }
+}
+
+use InputFormat::{Flac, S16, S8, U16, U8, Wav};
+
+/// Sniff the container format: FLAC/WAV by magic header, raw PCM by the
+/// common ld-decode/cxadc file extensions (.u8/.s8/.u16/.s16/.r8/.r16),
+/// .ldf (which is native FLAC from the vhs-decode pipeline), and anything
+/// else by header magic. Returns Err for files we cannot handle.
+pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
+    use std::io::Read;
+    let mut f = File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let mut magic = [0u8; 12];
+    let n = f.read(&mut magic).map_err(|e| e.to_string())?;
+    if n >= 4 && &magic[..4] == b"fLaC" {
+        return Ok(Flac);
+    }
+    if n >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
+        return Ok(Wav);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "u8" | "r8" => Ok(InputFormat::U8),
+        "s8" => Ok(S8),
+        "u16" | "r16" => Ok(U16),
+        "s16" => Ok(S16),
+        // .ldf is the vhs-decode pipeline's native FLAC extension; a .ldf
+        // whose magic is missing is corrupt anyway, so routing it to the FLAC
+        // prober yields the right "not a valid FLAC stream" error.
+        "ldf" => Ok(Flac),
+        "raw" | "bin" => {
+            // 8-bit vs 16-bit raw is ambiguous without a header; the cxadc
+            // 8-bit mode is by far the most common, so default to u8 and say so.
+            Ok(InputFormat::U8)
+        }
+        _ => Err(format!(
+            "unsupported file type (extension .{ext}): expected FLAC (fLaC marker), WAV (RIFF), or raw u8/s8/u16/s16 RF data"
+        )),
+    }
+}
+
+/// Parse a PCM RIFF/WAVE header. Returns
+/// `(sample_rate, bits_per_sample, channels, data_offset, data_len)`.
+/// Walks RIFF chunks (skipping unknown ones like JUNK/LIST/bext) to find
+/// `fmt ` and `data`, honouring the odd-chunk pad byte. Handles streaming
+/// writers that store 0 or 0xFFFFFFFF as the data size (clamped to EOF).
+fn parse_wav(path: &Path) -> Result<(u32, u16, u16, u64, u64), String> {
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| format!("stat failed: {e}"))?
+        .len();
+    let mut f = File::open(path).map_err(|e| format!("open failed: {e}"))?;
+    let mut riff = [0u8; 12];
+    f.read_exact(&mut riff).map_err(|e| e.to_string())?;
+    if &riff[..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+    let mut fmt: Option<(u32, u16, u16)> = None; // (rate, bits, channels)
+    let mut data: Option<(u64, u64)> = None;     // (offset, len)
+    let mut pos: u64 = 12;
+    loop {
+        if fmt.is_some() && data.is_some() {
+            break;
+        }
+        if pos + 8 > file_size {
+            break;
+        }
+        let mut hdr = [0u8; 8];
+        f.seek(SeekFrom::Start(pos)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut hdr).map_err(|e| e.to_string())?;
+        let len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as u64;
+        let body = pos + 8;
+        if &hdr[..4] == b"fmt " {
+            let mut buf = [0u8; 40];
+            let n = (len as usize).min(buf.len());
+            f.read_exact(&mut buf[..n]).map_err(|e| e.to_string())?;
+            let audio_format = u16::from_le_bytes([buf[0], buf[1]]);
+            let channels = u16::from_le_bytes([buf[2], buf[3]]);
+            let rate = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+            let bits = u16::from_le_bytes([buf[14], buf[15]]);
+            // Accept PCM (0x0001) and WAVE_FORMAT_EXTENSIBLE (0xFFFE) PCM.
+            if !(audio_format == 0x0001 || audio_format == 0xFFFE) {
+                return Err(format!(
+                    "WAV fmt is not PCM (format tag 0x{audio_format:04x}) — only PCM WAV is supported"
+                ));
+            }
+            if !matches!(bits, 8 | 16) || channels == 0 || channels > 8 {
+                return Err(format!(
+                    "WAV: unsupported PCM layout ({bits}-bit, {channels} ch) — expected 8/16-bit mono/stereo"
+                ));
+            }
+            fmt = Some((rate, bits, channels));
+        } else if &hdr[..4] == b"data" {
+            // Streaming writers store 0 or 0xFFFFFFFF as the data size; clamp
+            // the data span to EOF in every case.
+            let real_len = if len == 0 || len == u32::MAX as u64 {
+                file_size.saturating_sub(body)
+            } else {
+                len.min(file_size.saturating_sub(body))
+            };
+            data = Some((body, real_len));
+        }
+        // Advance past the chunk body + the odd-size pad byte.
+        pos = body + len + (len & 1);
+    }
+    let (rate, bits, channels) =
+        fmt.ok_or("WAV: no fmt chunk (not a PCM WAV)")?;
+    let (data_offset, data_len) = data.ok_or("WAV: no data chunk")?;
+    if rate == 0 || bits == 0 {
+        return Err("WAV: zero sample rate or bit depth in fmt chunk".into());
+    }
+    Ok((rate, bits, channels, data_offset, data_len))
+}
+
+/// Open `path` and probe it: FLAC (STREAMINFO + 36-bit wrap correction),
+/// WAV (fmt + data chunk), or headerless raw PCM (rate from the <n>msps
+/// filename hint only). Dispatches on the sniffed container format.
 pub fn probe(path: &Path) -> ProbeResult {
     let mut r = ProbeResult::default();
 
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            r.error = format!("open failed: {e}");
-            return r;
-        }
-    };
-
-    // File size from stat (no read) — needed for the wrap check.
-    let file_size = match file.metadata() {
+    // File size from stat (no read) — needed by every probe path.
+    let file_size = match std::fs::metadata(path) {
         Ok(m) => m.len(),
         Err(e) => {
             r.error = format!("stat failed: {e}");
@@ -583,23 +737,140 @@ pub fn probe(path: &Path) -> ProbeResult {
     };
     r.file_size = file_size;
 
+    // Sniff: FLAC/WAV by magic (so unknown extensions with the right magic
+    // work), raw PCM by the common cxadc/DdD extensions, .ldf as FLAC.
+    let fmt = match sniff_format(path) {
+        Ok(f) => f,
+        Err(e) => {
+            r.error = e;
+            return r;
+        }
+    };
+    r.format = fmt;
+
+    // A bare .raw/.bin has no way to tell 8-bit from 16-bit: sniff_format
+    // defaults to u8 (the cxadc 8-bit mode is by far the most common) — warn.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if ext == "raw" || ext == "bin" {
+        add_warning(
+            &mut r,
+            "headerless .raw/.bin: assumed unsigned 8-bit mono; use .u8/.s8/.u16/.s16 extensions to disambiguate",
+        );
+    }
+
+    match fmt {
+        InputFormat::Flac => probe_flac(path, &mut r),
+        InputFormat::Wav => probe_wav(path, &mut r),
+        InputFormat::U8 | InputFormat::S8 | InputFormat::U16 | InputFormat::S16 => {
+            probe_raw(path, &mut r, fmt)
+        }
+    }
+    r
+}
+
+/// Probe a PCM RIFF/WAVE file: the fmt chunk carries the true rate/bits/
+/// channels and the data chunk gives an exact sample count (no wrap issues,
+/// no scanning). Real-rate RF WAVs (>1 MHz header) are reported with the
+/// /1000 convention applied on the real rate so all downstream cut math
+/// matches the FLAC pipeline; SoX reads such inputs pinned to that rate.
+fn probe_wav(path: &Path, r: &mut ProbeResult) {
+    let (rate, bits, ch, data_offset, data_len) = match parse_wav(path) {
+        Ok(v) => v,
+        Err(e) => {
+            r.error = e;
+            return;
+        }
+    };
+    r.ok = true;
+    r.header_sample_rate = u64::from(rate);
+    r.bits_per_sample = u32::from(bits);
+    r.channels = u32::from(ch);
+    r.audio_offset = data_offset;
+    let bytes_per_sample = u64::from(ch) * (u64::from(bits) / 8);
+    r.total_samples = if bytes_per_sample > 0 {
+        data_len / bytes_per_sample
+    } else {
+        0
+    };
+    r.total_samples_known = true;
+    let (real, is_rf) = crate::rate::resolve_wav_rate(u64::from(rate));
+    r.real_rate_hz = real;
+    r.is_rf = is_rf;
+    if is_rf && rate > 1_000_000 {
+        add_warning(
+            r,
+            "WAV stores the real RF rate; SoX reads the input pinned to the /1000 convention so cut math matches the FLAC pipeline",
+        );
+    }
+}
+
+/// Probe headerless raw PCM: everything is inferred. Width/signedness come
+/// from the sniffed format, channels default to 1 (cxadc/DdD RF captures are
+/// mono), the sample count is exact from the file size, and the REAL rate can
+/// only come from an `<n>msps` filename hint — without it the rate is
+/// unknowable, which is a hard error (never guess).
+fn probe_raw(path: &Path, r: &mut ProbeResult, fmt: InputFormat) {
+    let msps = match crate::msps::extract_msps(&path.to_string_lossy()) {
+        Some(m) if m > 0.0 => m,
+        _ => {
+            r.error = format!(
+                "raw {} audio has no header, so the sample rate is unknowable: rename the file with the rate (e.g. ..._8-bit_20msps.u8) — the <n>msps hint is required",
+                fmt.as_str()
+            );
+            return;
+        }
+    };
+    r.ok = true;
+    r.bits_per_sample = match fmt {
+        InputFormat::U8 | InputFormat::S8 => 8,
+        _ => 16,
+    };
+    r.channels = 1; // cxadc/DdD RF captures are mono (no header to say otherwise)
+    r.audio_offset = 0;
+    r.real_rate_hz = msps * 1_000_000.0;
+    r.is_rf = true;
+    // The /1000-convention header equivalent this file would carry in the
+    // FLAC pipeline (20 MSPS → 20000 Hz), so the GUI rate label stays sane.
+    r.header_sample_rate = (msps * 1000.0) as u64;
+    r.total_samples = r.file_size / u64::from(r.bits_per_sample / 8);
+    r.total_samples_known = true;
+}
+
+/// The FLAC probe body: STREAMINFO + 36-bit wrap correction + RF vorbis
+/// tags (see the module docs). Never reads audio frames unless the header
+/// total is unknown and no companion exists (frame-header scan).
+fn probe_flac(path: &Path, r: &mut ProbeResult) {
+    // Handle for the claxon metadata-only reader (moved into the reader).
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            r.error = format!("open failed: {e}");
+            return;
+        }
+    };
+
     // Walk metadata block headers on a separate handle to find the audio
     // offset (claxon doesn't expose where its metadata-only reader stopped).
     let mut off_file = match File::open(path) {
         Ok(f) => f,
         Err(e) => {
             r.error = format!("open failed: {e}");
-            return r;
+            return;
         }
     };
     let audio_offset = match find_audio_offset(&mut off_file) {
         Ok(o) => o,
         Err(e) => {
             r.error = e;
-            return r;
+            return;
         }
     };
     r.audio_offset = audio_offset;
+    let file_size = r.file_size;
 
     // metadata_only + read_vorbis_comment => claxon parses the metadata blocks
     // (STREAMINFO + Vorbis comment) and stops before any audio frame. Reading
@@ -613,7 +884,7 @@ pub fn probe(path: &Path) -> ProbeResult {
         Ok(rd) => rd,
         Err(e) => {
             r.error = format!("not a valid FLAC stream: {e}");
-            return r;
+            return;
         }
     };
 
@@ -695,7 +966,7 @@ pub fn probe(path: &Path) -> ProbeResult {
             let implied = ts as f64 / tag_sr as f64;
             if (implied - dur).abs() > 1.0 {
                 add_warning(
-                    &mut r,
+                    r,
                     &format!(
                         "vorbis RF_TOTAL_SAMPLES={} / RF_SAMPLE_RATE={} = {:.3}s but DURATION_SECONDS={}; mismatch",
                         ts, tag_sr, implied, dur
@@ -722,7 +993,7 @@ pub fn probe(path: &Path) -> ProbeResult {
             if uncompressed < audio_bytes as u128 {
                 if uncompressed * 1000 >= audio_bytes as u128 {
                     add_warning(
-                        &mut r,
+                        r,
                         &format!(
                             "vorbis RF_TOTAL_SAMPLES ({}) too small for the {}-byte audio payload; interpreting it as a /1000-unit count (×1000)",
                             ts, audio_bytes
@@ -731,7 +1002,7 @@ pub fn probe(path: &Path) -> ProbeResult {
                     vorbis_total = Some(ts.saturating_mul(1000));
                 } else {
                     add_warning(
-                        &mut r,
+                        r,
                         &format!(
                             "vorbis RF_TOTAL_SAMPLES ({}) inconsistent with the {}-byte audio payload; ignoring the tag",
                             ts, audio_bytes
@@ -831,7 +1102,7 @@ pub fn probe(path: &Path) -> ProbeResult {
                     let uncompressed = scanned.saturating_mul(bytes_per_sample);
                     if bytes_per_sample > 0 && uncompressed < audio_bytes {
                         add_warning(
-                            &mut r,
+                            r,
                             &format!(
                                 "scanned {} samples * {}/ch-byte = {} bytes < audio payload {} bytes; scan may be misaligned",
                                 scanned, bytes_per_sample, uncompressed, audio_bytes
@@ -846,13 +1117,11 @@ pub fn probe(path: &Path) -> ProbeResult {
                     // No frames found — leave known=false; the GUI shows unknown.
                 }
                 Err(e) => {
-                    add_warning(&mut r, &format!("frame scan failed: {e}"));
+                    add_warning(r, &format!("frame scan failed: {e}"));
                 }
             }
         }
     }
-
-    r
 }
 
 #[cfg(test)]
@@ -863,7 +1132,9 @@ mod tests {
     fn missing_file_is_reported_not_panicked() {
         let r = probe(Path::new("/nonexistent/nope.flac"));
         assert!(!r.ok);
-        assert!(r.error.contains("open failed"));
+        // The first failure is the stat() in the dispatcher (before sniffing
+        // or opening the file).
+        assert!(r.error.contains("stat failed"), "got: {}", r.error);
     }
 
     #[test]
@@ -1150,5 +1421,130 @@ mod tests {
             check_total_samples(declared, audio_bytes, 65535, 65535, None, None, 1, 8);
         assert!(!trust);
         assert_eq!(corrected, None);
+    }
+
+    // --- WAV / raw PCM / sniffing --------------------------------------
+
+    /// Synthesize a PCM WAV: RIFF/WAVE + fmt (PCM) + data with `n_samples`
+    /// frames. `data_len_override` simulates streaming writers (0/0xFFFFFFFF).
+    fn make_wav(rate: u32, bits: u16, channels: u16, frames: usize) -> Vec<u8> {
+        let frame_bytes = (bits / 8) as usize * channels as usize;
+        let data_bytes = frames * frame_bytes;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&((4 + 8 + 16 + 8 + data_bytes) as u32).to_le_bytes());
+        v.extend_from_slice(b"WAVE");
+        // fmt chunk (16 bytes, PCM)
+        v.extend_from_slice(b"fmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        v.extend_from_slice(&channels.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * channels as u32 * (bits / 8) as u32).to_le_bytes());
+        v.extend_from_slice(&((channels * (bits / 8)) as u16).to_le_bytes());
+        v.extend_from_slice(&bits.to_le_bytes());
+        // data chunk
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&((frames * channels as usize * (bits / 8) as usize) as u32).to_le_bytes());
+        v.extend(std::iter::repeat(0u8).take(frames * channels as usize * (bits / 8) as usize));
+        v
+    }
+
+    #[test]
+    fn wav_probe_48k_stereo_16bit() {
+        let wav = make_wav(48_000, 16, 2, 1000);
+        let p = write_temp("fc_test_wav_audio.wav", &wav);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(r.format, InputFormat::Wav);
+        assert_eq!(r.header_sample_rate, 48_000);
+        assert_eq!(r.bits_per_sample, 16);
+        assert_eq!(r.channels, 2);
+        assert_eq!(r.total_samples, 1000);
+        assert!(r.total_samples_known);
+        assert!(!r.is_rf);
+        assert_eq!(r.real_rate_hz, 48_000.0);
+        assert!(r.audio_offset > 0); // points at the data chunk
+    }
+
+    #[test]
+    fn wav_real_rate_rf_header_detected() {
+        // cxadc wav writers that store the true MHz rate: is_rf, real rate
+        // kept, warning added (SoX pins the input to the /1000 convention).
+        let p = write_temp(
+            "fc_test_wav_rf.wav",
+            &make_wav(28_600_000, 8, 1, 1000),
+        );
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!(r.is_rf);
+        assert_eq!(r.real_rate_hz, 28_600_000.0);
+        assert_eq!(r.bits_per_sample, 8);
+        assert!(r.warnings.contains("/1000"), "got: {}", r.warnings);
+    }
+
+    #[test]
+    fn raw_u8_with_msps_hint_probes_from_size() {
+        // 40 000 bytes at 40 msps → exactly 40 000 u8 samples at 40 MHz real.
+        let dir = std::env::temp_dir();
+        let p = dir.join("fc_probe_8-bit_40msps.u8");
+        std::fs::write(&p, vec![7u8; 40_000]).unwrap();
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(r.format, InputFormat::U8);
+        assert_eq!(r.total_samples, 40_000);
+        assert_eq!(r.real_rate_hz, 40_000_000.0);
+        assert!(r.is_rf);
+        assert_eq!(r.bits_per_sample, 8);
+        assert_eq!(r.channels, 1);
+        assert!(r.total_samples_known);
+    }
+
+    #[test]
+    fn raw_without_rate_hint_is_a_hard_error() {
+        // No header + no <n>msps hint → the rate is unknowable: hard error,
+        // never a guess (a wrong rate silently corrupts every cut).
+        let p = write_temp("fc_test_nohint.bin", &[0u8; 16]);
+        let r = probe(&p);
+        assert!(!r.ok);
+        assert!(r.error.contains("msps"), "got: {}", r.error);
+    }
+
+    #[test]
+    fn sniff_magic_beats_extension() {
+        // An unknown extension carrying an fLaC marker must probe as FLAC.
+        let flac = make_flac_with_tags(20_000, 200_000_000, &[]);
+        let p = write_temp("fc_test_magic.xyz", &flac);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(r.format, InputFormat::Flac);
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(sniff_format(&p).unwrap(), InputFormat::Flac);
+    }
+
+    #[test]
+    fn sniff_unknown_ext_without_magic_is_an_error() {
+        let p = write_temp("fc_test_junk.unknownext", &[0u8; 64]);
+        assert!(sniff_format(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn sniff_raw_extensions_and_ldf() {
+        // Extensions map to the right raw format without any file content.
+        let cases = [
+            ("tape.u8", InputFormat::U8),
+            ("tape.r8", InputFormat::U8),
+            ("tape.s8", InputFormat::S8),
+            ("tape.u16", InputFormat::U16),
+            ("tape.r16", InputFormat::U16),
+            ("tape.s16", InputFormat::S16),
+            ("tape.lds_ldf.ldf", InputFormat::Flac),
+        ];
+        for (name, want) in cases {
+            let p = write_temp(name, b"");
+            assert_eq!(sniff_format(&p).unwrap(), want, "ext: {name}");
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }

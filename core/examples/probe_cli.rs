@@ -17,6 +17,12 @@ fn main() {
         std::process::exit(1);
     }
     println!("ok                 : true");
+    // Sniffed container format (0=flac 1=wav 2=u8 3=s8 4=u16 5=s16).
+    static FMT_NAMES: [&str; 6] = ["flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16"];
+    println!(
+        "format             : {}",
+        if (r.format as usize) < FMT_NAMES.len() { FMT_NAMES[r.format as usize] } else { "?" }
+    );
     println!("header_sample_rate : {} Hz", r.header_sample_rate);
     println!("bits_per_sample    : {}", r.bits_per_sample);
     println!("channels           : {}", r.channels);

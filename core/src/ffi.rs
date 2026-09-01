@@ -81,6 +81,10 @@ pub struct FcProbe {
     /// field was appended to the struct — the C header (flacchop.h) must be
     /// regenerated to match before the GUI links against this build.
     pub warnings: [c_char; 512],
+    /// Sniffed input container format: 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16.
+    /// Appended at the end of the struct (ABI-append-only) — flacchop.h must
+    /// be updated in lockstep.
+    pub format: u32,
 }
 
 impl Default for FcProbe {
@@ -107,6 +111,7 @@ impl Default for FcProbe {
             msps_known: 0,
             error: [0; 256],
             warnings: [0; 512],
+            format: 0,
         }
     }
 }
@@ -177,6 +182,8 @@ fn fc_probe_impl(path: *const c_char, out: &mut FcProbe) {
         out.msps = m;
         out.msps_known = 1;
     }
+    // 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16 (probe::InputFormat discriminants).
+    out.format = res.format as u32;
     set_str(&mut out.warnings, &res.warnings);
 }
 
@@ -205,15 +212,18 @@ impl Default for FcPlan {
     }
 }
 
-/// Compute a sample-exact cut plan from seconds. The rate and total must be
-/// the **on-disk STREAMINFO** values (header_sample_rate +
-/// declared_total_samples from `fc_probe`), NOT the real-rate values — SoX
-/// reads the file at its STREAMINFO rate. For /1000 RF captures the header
-/// rate is the /1000 "kHz" value (e.g. 20000 for 20 MSPS) and the
-/// declared total is the real count / 1000; passing the real rate/total here
-/// would produce sample counts 1000× too large for SoX. For non-RF audio the
-/// on-disk and real values are identical. When total samples are known, the
-/// cut is clamped to the file.
+/// Compute a sample-exact cut plan from seconds. `real_rate_hz` is the
+/// already-resolved real sample rate (from `fc_probe`'s `real_rate_hz` field —
+/// header ×1000 for RF captures, or the header rate for real audio).
+/// `total_samples` is the real total (from `fc_probe`, possibly from the
+/// RF_TOTAL_SAMPLES Vorbis tag). SoX reads each FLAC frame as one real RF
+/// sample, so the real rate is correct for computing sample counts.
+///
+/// Note: for /1000 RF captures, SoX trusts the STREAMINFO total_samples
+/// (the real count / 1000, e.g. 208M not 208B) and won't read beyond it.
+/// This limits the maximum cuttable range to ~10.4 s at 20 MHz for a typical
+/// VHS capture — a separate STREAMINFO-rewrite fix is needed for longer cuts.
+/// When total samples are known, the cut is clamped to the file.
 #[no_mangle]
 pub extern "C" fn fc_plan(
     start_sec: f64,
@@ -390,6 +400,11 @@ fn fc_chop_impl(
             output_bits: if output_bits > 0 { Some(output_bits) } else { None },
             basic_rf_filter: basic_rf_filter != 0,
             is_rf: is_rf != 0,
+            // Input format/rate/channels: sniffed from the file itself (magic
+            // or extension); raw PCM derives its rate from the <n>msps hint.
+            input_format: None,
+            input_rate_hz: None,
+            input_channels: None,
         };
         let r = chop::chop_with_options(i, o, start_samples, length_samples, opts);
         out.ok = if r.ok { 1 } else { 0 };

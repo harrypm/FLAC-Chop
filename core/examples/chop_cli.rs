@@ -35,18 +35,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    // fc_plan computes sample counts for SoX, which reads the file at its
-    // STREAMINFO (on-disk) rate — NOT the real RF rate. For /1000 RF captures
-    // the header rate is the /1000 "kHz" value and declared_total_samples is
-    // the real count / 1000; passing the real values would produce counts
-    // 1000× too large for SoX. Pass the STREAMINFO values (header_sample_rate
-    // + declared_total_samples). For non-RF audio these equal the real values.
     let mut plan = flac_chop_core::ffi::FcPlan::default();
     flac_chop_core::ffi::fc_plan(
         start_sec,
         len_sec,
-        probe.header_sample_rate as f64,
-        probe.declared_total_samples,
+        probe.real_rate_hz,
+        probe.total_samples,
         if probe.total_samples_known { 1 } else { 0 },
         &mut plan as *mut _,
     );
@@ -65,7 +59,19 @@ fn main() {
         plan.start_samples, plan.length_samples, plan.real_sample_rate_hz, probe.is_rf
     );
 
-    let r = flac_chop_core::chop::chop(in_path, out_path, plan.start_samples, plan.length_samples);
+    let opts = flac_chop_core::chop::ChopOptions {
+        // Mirror the GUI: is_rf comes from the probe (drives the /1000 rate
+        // pin for raw/WAV inputs and the post-cut RF Vorbis-tag rewrite).
+        is_rf: probe.is_rf,
+        ..Default::default()
+    };
+    let r = flac_chop_core::chop::chop_with_options(
+        in_path,
+        out_path,
+        plan.start_samples,
+        plan.length_samples,
+        opts,
+    );
     if r.ok {
         println!("ok: wrote {}", out_path);
     } else {

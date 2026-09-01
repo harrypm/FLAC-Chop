@@ -60,6 +60,21 @@ pub fn resolve_real_rate(header_rate: u64, msps_hint: Option<f64>) -> (f64, bool
     (header_rate as f64 * 1000.0, true)
 }
 
+/// Resolve the real rate for a container whose header stores the fmt/WAVE
+/// rate directly (WAV). Standard audio rates are used as-is; a header rate
+/// above 1 MHz is a real-rate RF capture (some cxadc/DdD wav writers record
+/// the true MHz rate instead of the /1000 convention); anything else
+/// (e.g. 20000) is the /1000 RF convention. Returns `(real_rate_hz, is_rf)`.
+pub fn resolve_wav_rate(header_rate: u64) -> (f64, bool) {
+    if is_audio_rate(header_rate) {
+        return (header_rate as f64, false);
+    }
+    if header_rate > 1_000_000 {
+        return (header_rate as f64, true);
+    }
+    (header_rate as f64 * 1000.0, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +141,23 @@ mod tests {
         // 20000 must NOT match 22050 (it's ~9.3% off, > 5% tol) → RF.
         let (_, rf) = resolve_real_rate(20_000, None);
         assert!(rf);
+    }
+
+    #[test]
+    fn wav_audio_rate_used_as_is() {
+        assert_eq!(resolve_wav_rate(48_000), (48_000.0, false));
+        assert_eq!(resolve_wav_rate(96_000), (96_000.0, false));
+    }
+
+    #[test]
+    fn wav_real_rate_rf_header_used_as_is() {
+        // Some cxadc/DdD wav writers store the true MHz rate.
+        assert_eq!(resolve_wav_rate(40_000_000), (40_000_000.0, true));
+        assert_eq!(resolve_wav_rate(28_600_000), (28_600_000.0, true));
+    }
+
+    #[test]
+    fn wav_khz_convention_header_assumes_msps() {
+        assert_eq!(resolve_wav_rate(20_000), (20_000_000.0, true));
     }
 }

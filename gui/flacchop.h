@@ -35,6 +35,9 @@ struct FcProbe {
     // Non-fatal diagnostics (tag-unit corrections, scan misalignment, vorbis
     // mismatches), "; "-joined. Empty when everything checked out.
     char warnings[512];
+    // Sniffed input container format (appended at the end — ABI-append-only):
+    // 0=flac 1=wav 2=u8(raw) 3=s8(raw) 4=u16(raw) 5=s16(raw).
+    uint32_t format;
 };
 
 struct FcPlan {

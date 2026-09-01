@@ -338,8 +338,9 @@ void MainWindow::browse()
         return;
     const QString startDir = m_inPath.isEmpty() ? QDir::homePath() : QFileInfo(m_inPath).absolutePath();
     const QString fn = QFileDialog::getOpenFileName(
-        this, tr("Select FLAC file"), startDir,
-        tr("FLAC files (*.flac);;All files (*)"));
+        this, tr("Select capture file"), startDir,
+        tr("RF captures (*.flac *.ldf *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.raw *.bin)"
+           ";;FLAC files (*.flac);;All files (*)"));
     if (fn.isEmpty())
         return;
     loadFile(fn);
@@ -619,10 +620,10 @@ void MainWindow::dropEvent(QDropEvent* e)
     if (!u.isLocalFile())
         return;
     const QString fn = u.toLocalFile();
-    if (!fn.endsWith(".flac", Qt::CaseInsensitive)) {
-        m_statusLabel->setText(tr("Dropped file is not .flac: %1").arg(fn));
-        return;
-    }
+    // Accept anything that looks like a capture: the core probe sniffs FLAC
+    // / WAV by magic header (so unknown extensions with the right magic
+    // work) and maps the raw PCM extensions. Anything else fails the probe
+    // with a clear error in the status line.
     e->acceptProposedAction();
     loadFile(fn);
 }
@@ -718,9 +719,17 @@ void MainWindow::setProbeInfo()
         m_totalLabel->setStyleSheet(QString());
         return;
     }
-    m_headerRateLabel->setText(tr("%1 Hz (header)").arg(m_probe.header_sample_rate));
-    m_bitsChLabel->setText(tr("%1-bit / %2 ch")
-        .arg(m_probe.bits_per_sample).arg(m_probe.channels));
+    if (m_probe.format >= 2) {
+        // Headerless raw PCM: there is no header to report; the rate label
+        // points at the filename (the <n>msps hint is the only rate source).
+        static const char* kRawNames[] = { "", "", "raw u8", "raw s8", "raw u16", "raw s16" };
+        const QString fmtName = (m_probe.format <= 5)
+            ? QString::fromLatin1(kRawNames[m_probe.format])
+            : QStringLiteral("?");
+        m_headerRateLabel->setText(tr("raw PCM (%1, rate from filename)").arg(fmtName));
+    } else {
+        m_headerRateLabel->setText(tr("%1 Hz (header)").arg(m_probe.header_sample_rate));
+    }
     if (m_probe.is_rf)
         m_mspsLabel->setText(tr("RF — %1 Hz real")
             .arg(m_probe.real_rate_hz, 0, 'f', 0));
@@ -829,17 +838,16 @@ void MainWindow::applyCut()
         return;
     }
 
-    // fc_plan computes sample counts for SoX, which reads the file at its
-    // STREAMINFO (on-disk) rate — NOT the real RF rate. For /1000 RF captures
-    // the header rate is 20000 (kHz) and the STREAMINFO total is the real
-    // count / 1000, while real_rate_hz is 20M and total_samples is the real
-    // count (208B). Passing the real values made fc_plan compute 500s as
-    // 10 billion samples, but SoX only has 208M — so it read the whole file.
-    // Pass header_sample_rate + declared_total_samples (the STREAMINFO values
-    // SoX sees) so the sample counts match. For non-RF audio these equal the
-    // real values, so this is a no-op there.
-    fc_plan(startSec, lenSec, m_probe.header_sample_rate,
-            m_probe.declared_total_samples, m_probe.total_samples_known, &m_plan);
+    // fc_plan computes sample counts for SoX's trim command. The `s` suffix
+    // means sample counts, and SoX reads the file at its native frame rate —
+    // each FLAC frame is one real RF sample. For /1000 RF captures the STREAMINFO
+    // header rate is the /1000 "kHz" value (20000) but each sample IS a real
+    // 20 MHz sample, so the real rate (20M) must be used to compute the sample
+    // count for a given duration. The STREAMINFO total_samples (208M) limits
+    // how many SoX will read (≈10.4 s at 20 MHz); fc_plan clamps to the real
+    // total_samples (208B) so requests beyond the file are handled gracefully.
+    fc_plan(startSec, lenSec, m_probe.real_rate_hz,
+            m_probe.total_samples, m_probe.total_samples_known, &m_plan);
 
     if (!m_plan.ok) {
         m_statusLabel->setText(tr("Plan error: %1")

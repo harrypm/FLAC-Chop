@@ -47,11 +47,15 @@ static void applyDarkFusion(QApplication& app)
 // smoke/automation harness for the whole cut pipeline on real RF captures.
 //
 // Usage:
-//   flac-chop <in.flac> <out.flac|outDir> <start_sec> <len_sec>
+//   flac-chop <in> <out.flac|outDir> <start_sec> <len_sec>
 //            [--rate 16000|20000|24000|28600] [--bits 8|6]
 //            [--no-filter]
-//   flac-chop --probe <in.flac>
+//   flac-chop --probe <in>
 //   flac-chop --version
+//
+// Inputs: FLAC (.flac/.ldf + fLaC-magic files), PCM WAV, and headerless raw
+// PCM (.u8/.u16/.s8/.s16/.r8/.r16; .raw/.bin assumed u8). Raw files must
+// carry the rate in their name (e.g. ..._8-bit_20msps.u8).
 //
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).
@@ -70,7 +74,10 @@ static int runCli(int argc, char* argv[])
         const QByteArray pb = args[2].toUtf8();
         fc_probe(pb.constData(), &p);
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
+        static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16" };
         std::printf("ok                 : true\n");
+        std::printf("format             : %s\n",
+                    p.format <= 5 ? kFmtNames[p.format] : "?");
         std::printf("header_sample_rate : %llu Hz\n", (unsigned long long)p.header_sample_rate);
         std::printf("bits_per_sample    : %u\n", p.bits_per_sample);
         std::printf("channels           : %u\n", p.channels);
@@ -107,8 +114,8 @@ static int runCli(int argc, char* argv[])
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
         // plan with STREAMINFO values (SoX reads at the on-disk rate)
         FcPlan plan{};
-        fc_plan(startSec, lenSec, p.header_sample_rate,
-                p.declared_total_samples, p.total_samples_known, &plan);
+        fc_plan(startSec, lenSec, p.real_rate_hz,
+                p.total_samples, p.total_samples_known, &plan);
         if (!plan.ok) { std::fprintf(stderr, "plan error: %s\n", plan.error); return 1; }
         // resolve output path: if outArg is a dir (or doesn't end in .flac),
         // generate via fc_generate_output_path with a renamed stem.
