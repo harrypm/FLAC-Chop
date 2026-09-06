@@ -167,6 +167,10 @@ fn wav_header_real_rate(in_path: &str) -> Result<Option<f64>, String> {
 /// (kHz) for SoX `sinc`.
 fn rf_filter_cutoff_khz(output_rate_hz: u64) -> Option<u32> {
     match output_rate_hz {
+        // 10 MSPS HiFi FM profile (vhs-decode 40msps-to-10msps-8-bit-HiFi.sh:
+        // `sinc -n 2500 0-3050` — FM subcarriers sit below ~2.3 MHz, leaving
+        // generous margin under the 5 MHz Nyquist of the 10 kHz stream).
+        10_000 => Some(3050),
         // 16 MSPS (experimental VHS profile)
         16_000 => Some(7650),
         // 20 MSPS VHS profile
@@ -324,6 +328,7 @@ pub fn chop_with_options(
         Ok(a) => a,
         Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
     };
+    let si_note = maybe_repair_streaminfo(in_fmt, in_path);
 
     let six_bit = matches!(opts.output_bits, Some(6));
     let tmp_path = if six_bit {
@@ -426,9 +431,20 @@ pub fn chop_with_options(
         let _ = std::fs::remove_file(tmp_path.as_ref().unwrap());
     }
 
-    // Rewrite the RF Vorbis tags on the output to reflect the new cut
-    // (MISRC-GUI embedding model). Non-fatal: the cut already succeeded, so a
-    // tag-rewrite failure is surfaced as a warning in stderr, not a hard fail.
+    if r.ok {
+        if let Err(msg) = validate_cut_output(out_path, &r.stderr) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
+    if !si_note.is_empty() {
+        r.stderr = if r.stderr.is_empty() {
+            si_note
+        } else {
+            format!("{si_note}\n{}", r.stderr)
+        };
+    }
     if r.ok {
         rewrite_tags_after_cut(out_path, opts.is_rf, &mut r);
     }
@@ -781,11 +797,17 @@ pub fn chop_with_options(
 
     // Sniff the input container and build the sox_open_read hints for
     // headerless raw PCM / real-rate RF WAV rate pins (None for FLAC/WAV).
+    let (in_fmt, hints) = match opts
+        .input_format
+        .map_or_else(|| probe::sniff_format(Path::new(in_path)), Ok)
+        .and_then(|f| in_hints_for(f, in_path, &opts).map(|h| (f, h)))
+    {
+        Ok(v) => v,
+        Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+    };
+    let si_note = maybe_repair_streaminfo(in_fmt, in_path);
+
     let result: Result<(), String> = (|| {
-        let in_fmt = opts
-            .input_format
-            .map_or_else(|| probe::sniff_format(Path::new(in_path)), Ok)?;
-        let hints = in_hints_for(in_fmt, in_path, &opts)?;
         let six_bit = matches!(opts.output_bits, Some(6));
         unsafe {
             if six_bit {
@@ -828,6 +850,20 @@ pub fn chop_with_options(
         Ok(()) => ChopResult { ok: true, exit_code: 0, stderr: String::new() },
         Err(e) => ChopResult { ok: false, exit_code: -1, stderr: e },
     };
+    if r.ok {
+        if let Err(msg) = validate_cut_output(out_path, &r.stderr) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = msg;
+        }
+    }
+    if !si_note.is_empty() {
+        r.stderr = if r.stderr.is_empty() {
+            si_note
+        } else {
+            format!("{si_note}\n{}", r.stderr)
+        };
+    }
     // Rewrite the RF Vorbis tags on the output to reflect the new cut
     // (MISRC-GUI embedding model). Non-fatal: the cut already succeeded, so a
     // tag-rewrite failure is surfaced as a warning in stderr, not a hard fail.
@@ -847,12 +883,85 @@ pub fn sox_available() -> bool {
 // Shared helpers.
 // ===========================================================================
 
+/// Repair a mis-declared STREAMINFO total on a FLAC input before the cut.
+/// Some capture writers never seek back to finalize the header: the MISRC
+/// HiFi writer stores the real count / 1000, so SoX trusts the declared total
+/// and refuses every cut past it ("Start position is after expected end of
+/// audio"). When the probe has an authoritative count (RF_TOTAL_SAMPLES tag)
+/// that differs from the declared value and fits the 36-bit field, patch the
+/// field in place ([`crate::streaminfo`]). Returns a note/warning for stderr
+/// (possibly empty) — a failed repair never blocks the cut.
+fn maybe_repair_streaminfo(fmt: InputFormat, in_path: &str) -> String {
+    if fmt != InputFormat::Flac {
+        return String::new();
+    }
+    let p = probe::probe(Path::new(in_path));
+    if !p.ok || !p.total_samples_known || !p.total_samples_from_vorbis {
+        // No authoritative count (or not worth re-checking) → nothing to do.
+        return String::new();
+    }
+    let declared = p.declared_total_samples;
+    let real = p.total_samples;
+    if declared == 0 || real == declared {
+        return String::new();
+    }
+    match crate::streaminfo::repair_declared_total(Path::new(in_path), declared, real) {
+        Ok(true) => format!(
+            "note: repaired STREAMINFO declared total ({declared} → {real}, per the RF_TOTAL_SAMPLES tag) — the capture writer never finalized the header"
+        ),
+        Ok(false) => String::new(),
+        Err(e) => format!("warning: STREAMINFO repair skipped: {e}"),
+    }
+}
+
+/// Sanity-check a successful SoX run before declaring the cut good. Two
+/// failure classes both produce `sox exit 0` + a corrupt output file:
+/// 1. The input's STREAMINFO total lies (trimmed/piped writers) and SoX's
+///    trim cannot reach the planned start — it emits "audio shorter than
+///    expected" and writes a header-only FLAC (metadata, zero frames).
+/// 2. Any other in-flight failure that still exits 0.
+/// A real cut is always ≥ 1 audio frame; the metadata blocks alone are
+/// ~110 bytes, so < 200 bytes means no frames were written.
+fn validate_cut_output(out_path: &str, stderr: &str) -> Result<(), String> {
+    if stderr.contains("audio shorter than expected") {
+        return Err(format!(
+            "the input's declared sample count is larger than the audio it actually holds (trimmed/piped capture) — sox could not reach the cut start: {stderr}"
+        ));
+    }
+    let len = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
+    if len < 200 {
+        return Err(format!(
+            "sox wrote no audio frames ({len}-byte output) — the input's header total is unreliable or the cut window is past the real end of the stream"
+        ));
+    }
+    Ok(())
+}
+
 /// Rewrite the RF Vorbis tags on a just-cut output file to reflect the new
 /// altered metadata (MISRC-GUI embedding model). Non-fatal: on failure,
 /// appends a warning to `r.stderr` but leaves `r.ok` true (the cut itself
-/// succeeded).
+/// succeeded). The rewrite is a manual metadata splice (src/tags.rs) that
+/// self-verifies before renaming over the output, so a failure never damages
+/// the cut; the catch_unwind is belt-and-braces in case a dependency still
+/// panics on a pathological file.
 fn rewrite_tags_after_cut(out_path: &str, is_rf: bool, r: &mut ChopResult) {
-    match crate::tags::rewrite_cut_tags(std::path::Path::new(out_path), is_rf) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::tags::rewrite_cut_tags(std::path::Path::new(out_path), is_rf)
+    }));
+    let inner = match outcome {
+        Ok(v) => v,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown cause".to_string()
+            };
+            Err(format!("tag writer panicked: {msg}"))
+        }
+    };
+    match inner {
         Ok(()) => {}
         Err(e) => {
             let note = format!("warning: tag rewrite failed: {e}");
@@ -995,11 +1104,51 @@ mod tests {
 
     #[test]
     fn rf_filter_profiles_match_expected_presets() {
+        assert_eq!(rf_filter_cutoff_khz(10_000), Some(3050));
         assert_eq!(rf_filter_cutoff_khz(16_000), Some(7650));
         assert_eq!(rf_filter_cutoff_khz(20_000), Some(9650));
         assert_eq!(rf_filter_cutoff_khz(24_000), Some(9400));
         assert_eq!(rf_filter_cutoff_khz(28_600), Some(9400));
         assert_eq!(rf_filter_cutoff_khz(12_000), None);
+    }
+
+    #[test]
+    fn validate_rejects_shorter_than_expected_warning() {
+        // sox exit-0 + WARN trim: audio shorter than expected → hard fail.
+        let dir = std::env::temp_dir().join("fc_test_validate");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("header_only.flac");
+        std::fs::write(&out, [0u8; 110]).unwrap();
+        let err = validate_cut_output(
+            out.to_str().unwrap(),
+            "sox WARN trim: Last 2 position(s) not reached (audio shorter than expected).",
+        )
+        .unwrap_err();
+        assert!(err.contains("larger than the audio"), "got: {err}");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn validate_rejects_frameless_output() {
+        // Header-only FLAC (metadata ~110 bytes, zero frames) must fail even
+        // without the stderr warning (covers the static-sox backend).
+        let dir = std::env::temp_dir().join("fc_test_validate");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("frameless.flac");
+        std::fs::write(&out, [0u8; 110]).unwrap();
+        let err = validate_cut_output(out.to_str().unwrap(), "").unwrap_err();
+        assert!(err.contains("no audio frames"), "got: {err}");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn validate_accepts_output_with_frames() {
+        let dir = std::env::temp_dir().join("fc_test_validate");
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("real.flac");
+        std::fs::write(&out, [0u8; 4096]).unwrap();
+        assert!(validate_cut_output(out.to_str().unwrap(), "").is_ok());
+        let _ = std::fs::remove_file(&out);
     }
 
     fn opts(rf: bool) -> ChopOptions {

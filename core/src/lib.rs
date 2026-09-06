@@ -17,6 +17,7 @@ pub mod ffi;
 pub mod msps;
 pub mod probe;
 pub mod rate;
+pub mod streaminfo;
 pub mod vorbis;
 pub mod tags;
 

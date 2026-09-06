@@ -48,7 +48,7 @@ static void applyDarkFusion(QApplication& app)
 //
 // Usage:
 //   flac-chop <in> <out.flac|outDir> <start_sec> <len_sec>
-//            [--rate 16000|20000|24000|28600] [--bits 8|6]
+//            [--rate 10000|16000|20000|24000|28600] [--bits 8|6]
 //            [--no-filter]
 //   flac-chop --probe <in>
 //   flac-chop --version
@@ -169,7 +169,7 @@ static int runCli(int argc, char* argv[])
         "CLI:\n"
         "  flac-chop <in.flac> <out.flac|dir> <start_sec> <len_sec>\
 "
-        "          [--rate 16000|20000|24000|28600] [--bits 8|6] [--no-filter]\n"
+        "          [--rate 10000|16000|20000|24000|28600] [--bits 8|6] [--no-filter]\n"
         "  flac-chop --probe <in.flac>\n"
         "  flac-chop --version\n",
         FLAC_CHOP_VERSION);

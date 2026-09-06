@@ -64,12 +64,24 @@ If you build FLAC-Chop from source, SoX still needs to be available on PATH
 - IN / OUT markers via a single time box + Set IN / Set OUT buttons (ld-analyse
   style), with a dual-handle slider.
 - Optional output processing modes for RF captures: keep source rate, or
-  downsample to 20/24/28.6 MSPS (plus an experimental 16 MSPS mode), with
-  wiki-aligned basic SoX sinc filter presets.
+  downsample to 10 (HiFi FM) / 16 / 20 / 24 / 28.6 MSPS, with wiki-aligned
+  basic SoX sinc filter presets.
 - Bit-depth control (keep source, 8-bit, or 6-bit crush emulation stored in an
   8-bit FLAC container; no dither — pure requantization for maximum
   compression efficiency and SNR).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
+- Self-healing FLAC headers: when a capture's STREAMINFO `total_samples` was
+  never finalized (some MISRC HiFi writers store the real count / 1000), the
+  true count is recovered from the `RF_TOTAL_SAMPLES` Vorbis tag and the
+  header is repaired in place before cutting — without it SoX refuses every
+  cut past the mis-declared end.
+- Cut outputs are validated (a SoX run that exits 0 but writes a header-only
+  file is a hard failure) and the cut's RF Vorbis tags are rewritten to the
+  new altered metadata **in place** — the same method the MISRC-GUI recorder
+  uses (grow the comment into adjacent padding / trim the vendor string), so
+  no temp file and no full-file rewrite is ever needed. Files that cannot fit
+  get a full verified splice that leaves 4096 bytes of padding behind (the
+  old lofty-based writer was dropped: its FLAC writer corrupts files).
 
 ## Using the GUI
 
@@ -97,6 +109,10 @@ cargo run --release --manifest-path core/Cargo.toml --example probe_cli -- file.
 
 # cut: chop_cli <in> <out.flac> <start_sec> <len_sec>
 cargo run --release --manifest-path core/Cargo.toml --example chop_cli -- file.flac out.flac 60 10
+
+# cut + convert: chop_convert_cli <in> <out> <start_sec> <len_sec> <out_rate_khz|0=keep> <out_bits|0=source> [filter 0/1]
+# e.g. cut to 10 MSPS (HiFi FM) 6-bit with the sinc profile:
+cargo run --release --manifest-path core/Cargo.toml --example chop_convert_cli -- file.flac out.flac 60 10 10000 6 1
 ```
 The CLIs run the exact same probe → plan → SoX path as the GUI and accept the
 same input formats. Headerless raw inputs must carry the rate in their name

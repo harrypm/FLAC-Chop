@@ -59,6 +59,7 @@ static QString ulongStr(quint64 v)
 static QString rfFilterProfileText(quint64 outHeaderRateHz)
 {
     switch (outHeaderRateHz) {
+    case 10000: return QStringLiteral("sinc -n 2500 0-3050");
     case 16000: return QStringLiteral("sinc -n 2500 0-7650");
     case 20000: return QStringLiteral("sinc -n 2500 0-9650");
     case 24000: return QStringLiteral("sinc -n 2500 0-9400");
@@ -70,6 +71,7 @@ static QString rfFilterProfileText(quint64 outHeaderRateHz)
 static QString modeDisplay(quint64 outHeaderRateHz)
 {
     switch (outHeaderRateHz) {
+    case 10000: return QStringLiteral("10 MSPS (HiFi FM)");
     case 16000: return QStringLiteral("16 MSPS");
     case 20000: return QStringLiteral("20 MSPS");
     case 24000: return QStringLiteral("24 MSPS");
@@ -547,10 +549,11 @@ void MainWindow::onProbeFinished()
         if (m_probe.is_rf) {
             struct ModeEntry { quint64 headerRateHz; const char* label; };
             const ModeEntry modes[] = {
+                {10000, "10 MSPS (HiFi FM)"},
+                {16000, "16 MSPS (VHS experimental)"},
                 {20000, "20 MSPS"},
                 {24000, "24 MSPS"},
                 {28600, "28.6 MSPS (8fsc)"},
-                {16000, "16 MSPS (VHS experimental)"},
             };
             for (const auto& m : modes) {
                 const double outRealHz = double(m.headerRateHz) * 1000.0;

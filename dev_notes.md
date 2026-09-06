@@ -727,3 +727,85 @@ Real-data end-to-end (source: flac-chop-test/03_16msps_8bit.flac, an 11 s
   end-to-end real-data test above ran the default shell-out backend.
 - chop_cli now mirrors the GUI and passes `is_rf` from the probe (previously
   default options under-reported RF for headless runs).
+
+## 2026-09-06 — STREAMINFO repair validation + lofty tag-write corruption fix
+
+### Context
+The MISRC HiFi writer never finalizes STREAMINFO: a 2,165,570,800-sample
+capture declares 2,165,571 (real/1000). SoX trusts the declared total and
+refuses every cut past it, and worse, exits 0 with a header-only output.
+`streaminfo.rs` (added earlier this session) patches the 36-bit total in place
+from the authoritative `RF_TOTAL_SAMPLES` tag before cutting.
+
+### Bug found by validation: lofty 0.18 tag rewrite corrupts cut outputs
+Ran the full pipeline on a real capture (VHS_PAL_SP_Tape_03 hifi_rf_8-bit
+10msps, 972,426,305 B, declared 2,165,571 / tag 2,165,570,800, header rate
+10000 Hz = /1000 convention). The cut + STREAMINFO repair worked, but the
+lofty-based `rewrite_cut_tags` produced a file that FAILS `flac -t`
+(LOST_SYNC). Hard data on the corrupt file (vs a manual sox reference of the
+same cut):
+- metadata blocks claim frames start at 1,295; they physically start at 1,296
+  (stray 0x04 byte after the PADDING block, first frame sync 0xFF clobbered)
+- `chop[1296:] == ref[221:]` over all 20,476,532 remaining bytes → the entire
+  frame stream was intact but displaced by exactly one byte
+- isolated repro: `tag_rewrite_cli` on a known-good sox output reproduces the
+  corruption with no sox involved → the lofty `save_to_path` writer is at
+  fault (second lofty defect after the padding-less panic).
+Note: lofty reports success (no panic), so the existing catch_unwind guard
+did not fire — silent corruption.
+
+### Fix: manual FLAC metadata splice (tags.rs rewritten, lofty dropped)
+`splice_vorbis_comment`: parse the metadata chain, replace the
+VORBIS_COMMENT payload (drop owned keys, append fresh values from the output's
+own STREAMINFO, keep vendor + all other comments), copy every other block and
+the audio frames byte-for-byte, self-verify (chain re-parses to its own end;
+file size == new metadata + original frames exactly; frame sync at the new
+frame start), then atomic rename. lofty removed from Cargo.toml.
+
+### Validation (hard data, copies in /tmp/fc-val — original untouched)
+`cargo test`: 81 core + 6 ffi pass. GUI relinks (Built target flac-chop).
+Real capture, cut 100 s + 5 s at the 10 MSPS HiFi profile (`sinc -n 2500
+0-3050`):
+- unrepaired copy: sox trim 1e9s → "Start position is after expected end of
+  audio", exit 0, 220-byte header-only output (the bug the repair fixes)
+- chop's in-place repair == independent python 36-bit patch: 0 differing
+  bytes in the header
+- 8-bit: `flac -t` ok; decoded audio md5 9e4211e7b276476ad37488640cdf89b6 ==
+  manual sox reference (bit-identical)
+- 6-bit: `flac -t` ok; 50,000,000 samples, zero non-multiples-of-4 (pure 6-bit
+  grid, no dither), peak 40; RF tags rewritten
+  (RF_TOTAL_SAMPLES=50000000000, RF_SAMPLE_RATE=10000000,
+  RF_SAMPLE_RATE_KHZ=10000, DURATION_SECONDS=5000.000000, LENGTH=5000000)
+- splice rewrite alone on a known-good sox output: `flac -t` ok, decoded
+  audio unchanged, tags updated correctly
+
+### MISRC-GUI in-place tag method adopted (same day, follow-up)
+Copied the metadata writing method from MISRC-GUI (`misrc_tools/common/
+flac_writer.c` reserves a 4096-byte PADDING right after the VORBIS_COMMENT;
+`gui_record_finalize_flac_metadata` updates tags in place via
+`FLAC__metadata_simple_iterator` with `use_padding=true` — explicitly
+replacing "the old chain-write path which rewrote the entire multi-GB FLAC
+file to a temp copy").
+
+`rewrite_cut_tags` now updates the VC block in place (no temp file, no
+full-file rewrite, frames never touched):
+1. adjacent PADDING absorbs the delta (MISRC `set_block(use_padding=true)`
+   equivalent) — applies to MISRC-GUI-written captures as-is;
+2. SoX cut layout (STREAMINFO → VC → frames, no padding): the vendor string
+   is trimmed by exactly the growth (or a PADDING block is inserted for the
+   slack on shrink) so the region covers the same bytes;
+3. only when nothing fits (huge growth, tiny vendor) does the full splice
+   run — and it now leaves a MISRC-style 4096-byte PADDING after the VC so
+   the fallback cannot recur on that file.
+Two bugs caught by the new tests before any real data touched: the inserted
+PADDING header was written as type 0 (0x80) instead of type 1 (0x81), and the
+fallback path did not grow an existing too-small padding to 4096.
+
+Validation (hard data, real capture copies in /tmp/fc-val):
+- `cargo test`: 85 core + 6 ffi pass.
+- In-place rewrite on the real sox cut: file size unchanged
+  (20476753 B), no `.tmp-tagsplice` left, `flac -t` ok, decoded audio
+  bit-identical to the manual reference, RF tags updated.
+- Full end-to-end chop (repair + cut + in-place tags): `flac -t` ok, decoded
+  md5 9e4211e7b276476ad37488640cdf89b6 == manual sox reference.
+- GUI relinks (Built target flac-chop).

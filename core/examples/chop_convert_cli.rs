@@ -9,7 +9,7 @@ use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 6 {
+    if args.len() != 7 && args.len() != 8 {
         eprintln!(
             "usage: chop_convert_cli <in.flac> <out.flac> <start_sec> <len_sec> <out_rate_khz|0=keep> <out_bits|0=source> [filter]"
         );
@@ -20,6 +20,9 @@ fn main() {
     let start_sec: f64 = args[3].parse().expect("start_sec not a number");
     let len_sec: f64 = args[4].parse().expect("len_sec not a number");
     let rate_khz: u64 = args[5].parse().expect("rate_khz not a number");
+    let bits: u32 = args[6].parse().expect("out_bits not a number (0 = keep source)");
+    // Optional filter flag (default 1 = apply the wiki-aligned sinc profile).
+    let filter: u32 = if args.len() == 8 { args[7].parse().expect("filter not 0/1") } else { 1 };
 
     let probe = flac_chop_core::probe::probe(Path::new(in_path));
     if !probe.ok {
@@ -50,8 +53,8 @@ fn main() {
 
     let opts = flac_chop_core::chop::ChopOptions {
         output_rate_hz: if rate_khz > 0 { Some(rate_khz) } else { None },
-        output_bits: Some(6), // 6-bit crush profile under test
-        basic_rf_filter: true,
+        output_bits: if bits > 0 { Some(bits) } else { None },
+        basic_rf_filter: filter != 0,
         is_rf: probe.is_rf,
         // Sniff the input container; raw PCM rate comes from the <n>msps hint.
         input_format: None,

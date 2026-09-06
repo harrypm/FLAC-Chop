@@ -1022,6 +1022,26 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
         r.total_samples_known = true;
         r.total_samples_from_vorbis = true;
     } else if known && audio_offset > 0 && file_size > audio_offset {
+        // Over-declaration sanity (mirror of the wrap check): a header total
+        // whose uncompressed size is >1000× the audio payload implies <0.1%
+        // compression — impossible for RF content (noise sits at ~97%), so
+        // the header lies (trimmed/piped writer that never seeked back).
+        // Warn so a later "audio shorter than expected" cut failure is
+        // explainable; the count itself stays as declared (a full frame scan
+        // just to confirm is not worth the I/O at probe time).
+        let hdr_bytes = u64::from(si.channels) * u64::from(si.bits_per_sample / 8);
+        if hdr_bytes > 0 {
+            let uncompressed = (declared as u128) * (hdr_bytes as u128);
+            if uncompressed > (audio_bytes as u128) * 1000 {
+                add_warning(
+                    r,
+                    &format!(
+                        "STREAMINFO declares {} samples but the {}-byte audio payload is >1000× too small for that — the header total is suspect (trimmed/piped capture); cuts near the end may fail",
+                        declared, audio_bytes
+                    ),
+                );
+            }
+        }
         let (trustworthy, corrected) = check_total_samples(
             declared,
             audio_bytes,
