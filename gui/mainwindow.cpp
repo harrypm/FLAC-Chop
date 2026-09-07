@@ -11,6 +11,11 @@
 #include <QCheckBox>
 #include <QPushButton>
 #include <QProgressBar>
+#include <QTabWidget>
+#include <QTableWidget>
+#include <QTableWidgetItem>
+#include <QHeaderView>
+#include <QAbstractItemView>
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
@@ -103,9 +108,20 @@ MainWindow::MainWindow(QWidget* parent)
 
     auto* central = new QWidget(this);
     setCentralWidget(central);
+    // The outer layout just hosts the tab bar with no margins so the tabs sit
+    // flush at the top; each page carries its own 12 px margin.
     auto* root = new QVBoxLayout(central);
-    root->setContentsMargins(12, 12, 12, 12);
-    root->setSpacing(10);
+    root->setContentsMargins(0, 0, 0, 0);
+    root->setSpacing(0);
+
+    m_tabs = new QTabWidget(central);
+    root->addWidget(m_tabs);
+
+    // --- Chop page (the existing cutter UI) ---
+    auto* chopPage = new QWidget(m_tabs);
+    auto* chopLay = new QVBoxLayout(chopPage);
+    chopLay->setContentsMargins(12, 12, 12, 12);
+    chopLay->setSpacing(10);
 
     // --- Top menu bar ---
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
@@ -130,7 +146,7 @@ MainWindow::MainWindow(QWidget* parent)
     // same sunken "in-lay" frame as the Output Directory field — both
     // top-row boxes then look identical, with clear white text on the dark
     // Fusion Base background.
-    auto* inBox = new QGroupBox(tr("Input File"), central);
+    auto* inBox = new QGroupBox(tr("Input File"), chopPage);
     auto* inLay = new QHBoxLayout(inBox);
     m_pathLabel = new QLineEdit(inBox);
     m_pathLabel->setReadOnly(true);
@@ -144,7 +160,7 @@ MainWindow::MainWindow(QWidget* parent)
     // Where cuts are written. Defaults to the input file's directory (the
     // original sibling -cut.flac behaviour); the user can Browse for a
     // dedicated output folder, persisted across sessions via QSettings.
-    auto* outDirBox = new QGroupBox(tr("Output Directory"), central);
+    auto* outDirBox = new QGroupBox(tr("Output Directory"), chopPage);
     auto* outDirLay = new QHBoxLayout(outDirBox);
     m_outDirEdit = new QLineEdit(outDirBox);
     m_outDirEdit->setPlaceholderText(tr("(same as input file)"));
@@ -157,13 +173,13 @@ MainWindow::MainWindow(QWidget* parent)
     auto* ioRow = new QHBoxLayout();
     ioRow->addWidget(inBox, 1);
     ioRow->addWidget(outDirBox, 1);
-    root->addLayout(ioRow);
+    chopLay->addLayout(ioRow);
 
     // --- Markers: one editable time box + Set IN / Set OUT buttons ---
     // Type a time, click Set IN or Set OUT to drop that marker. The cut is
     // only ever changed by an explicit action (button or slider drag), never
     // by typing alone, so there is no textChanged -> recompute feedback loop.
-    auto* markerBox = new QGroupBox(tr("Markers (real time, HH:MM:SS)"), central);
+    auto* markerBox = new QGroupBox(tr("Markers (real time, HH:MM:SS)"), chopPage);
     auto* markerLay = new QGridLayout(markerBox);
     markerLay->setColumnStretch(0, 1);
     auto* timeLab = new QLabel(tr("Time:"), markerBox);
@@ -189,18 +205,18 @@ MainWindow::MainWindow(QWidget* parent)
     markerLay->addWidget(m_outLabel, 2, 1, 1, 3);
     markerLay->addWidget(durRowLab, 3, 0);
     markerLay->addWidget(m_durLabel, 3, 1, 1, 3);
-    root->addWidget(markerBox);
+    chopLay->addWidget(markerBox);
 
     // --- Navigate: IN/OUT range slider (0.1 s resolution) ---
-    auto* navBox = new QGroupBox(tr("Navigate — drag IN (green) / OUT (red) (0.1 s)"), central);
+    auto* navBox = new QGroupBox(tr("Navigate — drag IN (green) / OUT (red) (0.1 s)"), chopPage);
     auto* navLay = new QVBoxLayout(navBox);
     m_slider = new QRangeSlider(navBox);
     m_slider->setEnabled(false);
     navLay->addWidget(m_slider);
-    root->addWidget(navBox);
+    chopLay->addWidget(navBox);
 
     // --- Source info ---
-    auto* infoBox = new QGroupBox(tr("Source Info (from FLAC STREAMINFO + filename)"), central);
+    auto* infoBox = new QGroupBox(tr("Source Info (from FLAC STREAMINFO + filename)"), chopPage);
     auto* infoLay = new QFormLayout(infoBox);
     m_headerRateLabel = new QLabel(QStringLiteral("—"), infoBox);
     m_bitsChLabel = new QLabel(QStringLiteral("—"), infoBox);
@@ -212,10 +228,10 @@ MainWindow::MainWindow(QWidget* parent)
     infoLay->addRow(tr("Bits / Channels:"), m_bitsChLabel);
     infoLay->addRow(tr("MSPS (from name):"), m_mspsLabel);
     infoLay->addRow(tr("Total (real):"), m_totalLabel);
-    root->addWidget(infoBox);
+    chopLay->addWidget(infoBox);
 
     // --- Output processing ---
-    auto* outBox = new QGroupBox(tr("Output Processing"), central);
+    auto* outBox = new QGroupBox(tr("Output Processing"), chopPage);
     auto* outLay = new QFormLayout(outBox);
     m_outputModeCombo = new QComboBox(outBox);
     m_outputModeCombo->addItem(tr("Keep source rate"), quint64(0));
@@ -235,10 +251,10 @@ MainWindow::MainWindow(QWidget* parent)
     outLay->addRow(tr("Bit-depth:"), m_outputBitsCombo);
     outLay->addRow(QString(), m_basicFilterCheck);
     outLay->addRow(tr("Filter profile:"), m_filterProfileLabel);
-    root->addWidget(outBox);
+    chopLay->addWidget(outBox);
 
     // --- Preview ---
-    auto* prevBox = new QGroupBox(tr("Preview"), central);
+    auto* prevBox = new QGroupBox(tr("Preview"), chopPage);
     auto* prevLay = new QFormLayout(prevBox);
     m_startSampLabel = new QLabel(QStringLiteral("—"), prevBox);
     m_lenSampLabel = new QLabel(QStringLiteral("—"), prevBox);
@@ -247,12 +263,12 @@ MainWindow::MainWindow(QWidget* parent)
     prevLay->addRow(tr("Start sample:"), m_startSampLabel);
     prevLay->addRow(tr("Length samples:"), m_lenSampLabel);
     prevLay->addRow(tr("Output file:"), m_outPathLabel);
-    root->addWidget(prevBox);
+    chopLay->addWidget(prevBox);
 
     // --- Process + progress + status ---
-    m_processBtn = new QPushButton(tr("Process FLAC"), central);
+    m_processBtn = new QPushButton(tr("Process FLAC"), chopPage);
     m_processBtn->setEnabled(false);
-    m_cancelBtn = new QPushButton(tr("Cancel"), central);
+    m_cancelBtn = new QPushButton(tr("Cancel"), chopPage);
     m_cancelBtn->setEnabled(false); // only live while a cut is in flight
     m_cancelBtn->setToolTip(tr("Stop the in-progress cut."));
     auto* actionLay = new QHBoxLayout();
@@ -260,16 +276,89 @@ MainWindow::MainWindow(QWidget* parent)
     actionLay->addWidget(m_cancelBtn, 0);
     // 'Check for Updates' lives only in the Help menu now (auto-checked on
     // startup); no button next to Process to keep the action row clean.
-    m_progress = new QProgressBar(central);
+    m_progress = new QProgressBar(chopPage);
     m_progress->setRange(0, 1);
     m_progress->setValue(0);
     m_progress->setTextVisible(false);
-    m_statusLabel = new QLabel(tr("Ready — select a FLAC file."), central);
+    m_statusLabel = new QLabel(tr("Ready — select a FLAC file."), chopPage);
     m_statusLabel->setWordWrap(true);
-    root->addLayout(actionLay);
-    root->addWidget(m_progress);
-    root->addWidget(m_statusLabel);
-    root->addStretch(1);
+    chopLay->addLayout(actionLay);
+    chopLay->addWidget(m_progress);
+    chopLay->addWidget(m_statusLabel);
+    chopLay->addStretch(1);
+
+    m_tabs->addTab(chopPage, tr("Chop"));
+
+    // --- Metadata Editor page ---
+    // Read-only STREAMINFO summary + an editable Vorbis-comment table that
+    // writes back to the source FLAC in place via fc_replace_comments. The
+    // write runs off-thread (it may splice a temp copy for large growth).
+    auto* metaPage = new QWidget(m_tabs);
+    auto* metaLay = new QVBoxLayout(metaPage);
+    metaLay->setContentsMargins(12, 12, 12, 12);
+    metaLay->setSpacing(10);
+
+    auto* siBox = new QGroupBox(tr("Stream Info (read-only)"), metaPage);
+    auto* siLay = new QFormLayout(siBox);
+    m_metaFormatLabel = new QLabel(QStringLiteral("—"), siBox);
+    m_metaHeaderRateLabel = new QLabel(QStringLiteral("—"), siBox);
+    m_metaBitsChLabel = new QLabel(QStringLiteral("—"), siBox);
+    m_metaRealRateLabel = new QLabel(QStringLiteral("—"), siBox);
+    m_metaTotalSamplesLabel = new QLabel(QStringLiteral("—"), siBox);
+    m_metaFileSizeLabel = new QLabel(QStringLiteral("—"), siBox);
+    for (auto* lbl : {m_metaFormatLabel, m_metaHeaderRateLabel, m_metaBitsChLabel,
+                      m_metaRealRateLabel, m_metaTotalSamplesLabel, m_metaFileSizeLabel}) {
+        lbl->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    }
+    siLay->addRow(tr("Format:"), m_metaFormatLabel);
+    siLay->addRow(tr("Header rate:"), m_metaHeaderRateLabel);
+    siLay->addRow(tr("Bits / Channels:"), m_metaBitsChLabel);
+    siLay->addRow(tr("Real rate:"), m_metaRealRateLabel);
+    siLay->addRow(tr("Total samples:"), m_metaTotalSamplesLabel);
+    siLay->addRow(tr("File size:"), m_metaFileSizeLabel);
+    metaLay->addWidget(siBox);
+
+    auto* vcBox = new QGroupBox(tr("Vorbis Comments (editable)"), metaPage);
+    auto* vcLay = new QVBoxLayout(vcBox);
+    m_metaTable = new QTableWidget(0, 2, vcBox);
+    m_metaTable->setHorizontalHeaderLabels({tr("Field"), tr("Value")});
+    m_metaTable->verticalHeader()->setVisible(false);
+    m_metaTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_metaTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_metaTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_metaTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
+    m_metaTable->setToolTip(tr("Edit any field/value, or add/remove rows. Field names must be A-Z a-z 0-9 _ (saved upper-case)."));
+    vcLay->addWidget(m_metaTable);
+
+    auto* metaEditRow = new QHBoxLayout();
+    m_metaAddBtn = new QPushButton(tr("Add"), vcBox);
+    m_metaRemoveBtn = new QPushButton(tr("Remove"), vcBox);
+    m_metaUpBtn = new QPushButton(tr("Move Up"), vcBox);
+    m_metaDownBtn = new QPushButton(tr("Move Down"), vcBox);
+    m_metaAddBtn->setToolTip(tr("Append a new blank row."));
+    m_metaRemoveBtn->setToolTip(tr("Remove the selected row."));
+    m_metaUpBtn->setToolTip(tr("Move the selected row up."));
+    m_metaDownBtn->setToolTip(tr("Move the selected row down."));
+    metaEditRow->addWidget(m_metaAddBtn);
+    metaEditRow->addWidget(m_metaRemoveBtn);
+    metaEditRow->addWidget(m_metaUpBtn);
+    metaEditRow->addWidget(m_metaDownBtn);
+    metaEditRow->addStretch(1);
+    m_metaReloadBtn = new QPushButton(tr("Reload"), vcBox);
+    m_metaSaveBtn = new QPushButton(tr("Save to file"), vcBox);
+    m_metaSaveBtn->setToolTip(tr("Write the comments back to the source FLAC in place."));
+    metaEditRow->addWidget(m_metaReloadBtn);
+    metaEditRow->addWidget(m_metaSaveBtn);
+    vcLay->addLayout(metaEditRow);
+
+    m_metaStatusLabel = new QLabel(tr("Load a FLAC file to edit its metadata."), vcBox);
+    m_metaStatusLabel->setWordWrap(true);
+    vcLay->addWidget(m_metaStatusLabel);
+    metaLay->addWidget(vcBox);
+    metaLay->addStretch(1);
+
+    m_tabs->addTab(metaPage, tr("Metadata Editor"));
+    setMetaEnabled(false);
 
     connect(m_browseBtn, &QPushButton::clicked, this, &MainWindow::browse);
     connect(m_processBtn, &QPushButton::clicked, this, &MainWindow::process);
@@ -286,6 +375,13 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::applyCut);
     connect(m_outDirBrowseBtn, &QPushButton::clicked, this, &MainWindow::browseOutDir);
     connect(m_outDirEdit, &QLineEdit::editingFinished, this, &MainWindow::onOutDirEdited);
+    // --- Metadata Editor tab ---
+    connect(m_metaAddBtn, &QPushButton::clicked, this, &MainWindow::addMetaRow);
+    connect(m_metaRemoveBtn, &QPushButton::clicked, this, &MainWindow::removeMetaRow);
+    connect(m_metaUpBtn, &QPushButton::clicked, this, &MainWindow::moveMetaRowUp);
+    connect(m_metaDownBtn, &QPushButton::clicked, this, &MainWindow::moveMetaRowDown);
+    connect(m_metaSaveBtn, &QPushButton::clicked, this, &MainWindow::saveMetadata);
+    connect(m_metaReloadBtn, &QPushButton::clicked, this, &MainWindow::reloadMetadata);
 
     // Restore the persisted output directory (empty = "same as input").
     // If a dir was previously chosen (non-empty), auto-follow is off so it
@@ -311,6 +407,10 @@ MainWindow::MainWindow(QWidget* parent)
     m_probeWatcher = new QFutureWatcher<FcProbe>(this);
     connect(m_probeWatcher, &QFutureWatcher<FcProbe>::finished,
             this, &MainWindow::onProbeFinished);
+
+    m_metaWatcher = new QFutureWatcher<FcMetaResult>(this);
+    connect(m_metaWatcher, &QFutureWatcher<FcMetaResult>::finished,
+            this, &MainWindow::onMetaSaveFinished);
     m_net = new QNetworkAccessManager(this);
 
     if (!fc_sox_available()) {
@@ -336,7 +436,7 @@ void MainWindow::setControlsEnabled(bool enabled)
 
 void MainWindow::browse()
 {
-    if (m_probing)
+    if (m_probing || (m_metaWatcher && m_metaWatcher->isRunning()))
         return;
     const QString startDir = m_inPath.isEmpty() ? QDir::homePath() : QFileInfo(m_inPath).absolutePath();
     const QString fn = QFileDialog::getOpenFileName(
@@ -501,16 +601,24 @@ void MainWindow::loadFile(const QString& fn)
     if (m_outDirAutoFollow)
         m_outDirEdit->setText(QFileInfo(fn).absolutePath());
 
+    startProbe();
+}
+
+void MainWindow::startProbe()
+{
     // Run the probe off the GUI thread. For files with an unknown STREAMINFO
     // total this scans every FLAC frame header (reading the whole file), which
     // can take minutes on large captures — doing it on the GUI thread would
     // freeze the window. Show a busy indicator + status while it runs.
+    // Assumes m_inPath is already set; does NOT unload (loadFile did that, and
+    // a metadata-save refresh wants to keep the current IN/OUT markers).
     m_probing = true;
     setControlsEnabled(false);
+    setMetaEnabled(false);
     m_progress->setRange(0, 0); // busy indicator
     m_statusLabel->setText(tr("Probing… (scanning frame headers if the total is unknown)"));
 
-    const QString path = fn;
+    const QString path = m_inPath;
     auto fut = QtConcurrent::run([path]() -> FcProbe {
         FcProbe r{};
         QByteArray b = path.toUtf8();
@@ -538,6 +646,9 @@ void MainWindow::onProbeFinished()
         m_processBtn->setEnabled(false);
         m_setInBtn->setEnabled(false);
         m_setOutBtn->setEnabled(false);
+        m_probeIsRefresh = false;
+        setMetaStreamInfo();
+        loadMetadata();
         return;
     }
 
@@ -572,15 +683,25 @@ void MainWindow::onProbeFinished()
         m_basicFilterCheck->setChecked(true);
     }
 
-    // On load, put the IN/OUT markers at each end of the tape: IN at the
-    // start (00:00:00) and OUT at the full real duration, so the slider's
-    // handles sit at each end. m_inSec/m_outSec are the single source of
-    // truth; we set them here, then push to the slider + time box with
-    // signals blocked so no recompute fires to clobber them.
+    // Set the IN/OUT markers. On a fresh load they sit at each end of the tape
+    // (IN=00:00:00, OUT=full real duration). On a refresh (a re-probe triggered
+    // by a metadata save) the existing markers are kept but clamped to the new
+    // total, so a user's IN/OUT selection survives editing RF_TOTAL_SAMPLES.
+    // m_inSec/m_outSec are the single source of truth; we set them here, then
+    // push to the slider + time box with signals blocked so no recompute fires.
     m_syncing = true;
+    const bool refresh = m_probeIsRefresh;
+    m_probeIsRefresh = false;
     if (m_probe.total_samples_known && m_totalSec > 0.0) {
-        m_inSec = 0.0;
-        m_outSec = m_totalSec;
+        if (refresh) {
+            // Clamp the existing markers into the new tape range (keep ≥0.1 s).
+            if (m_inSec < 0.0) m_inSec = 0.0;
+            if (m_outSec > m_totalSec) m_outSec = m_totalSec;
+            if (m_outSec - m_inSec < 0.1) { m_inSec = 0.0; m_outSec = m_totalSec; }
+        } else {
+            m_inSec = 0.0;
+            m_outSec = m_totalSec;
+        }
     } else {
         m_inSec = 0.0;
         m_outSec = 0.0;
@@ -602,6 +723,8 @@ void MainWindow::onProbeFinished()
             m_statusLabel->setText(tr("Probed OK. Type a time + Set IN/OUT, or drag the slider, then Process."));
     }
     setControlsEnabled(true);
+    setMetaStreamInfo();
+    loadMetadata();
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent* e)
@@ -614,6 +737,10 @@ void MainWindow::dropEvent(QDropEvent* e)
 {
     if (m_probing) {
         m_statusLabel->setText(tr("Already probing a file — wait for it to finish."));
+        return;
+    }
+    if (m_metaWatcher && m_metaWatcher->isRunning()) {
+        m_statusLabel->setText(tr("A metadata save is in progress — wait for it to finish."));
         return;
     }
     const auto urls = e->mimeData()->urls();
@@ -1170,4 +1297,255 @@ QString MainWindow::secsToHms(double s)
     int ms = int(std::round((s - whole) * 1000.0));
     if (ms == 1000) { ms = 0; sec++; if (sec == 60) { sec = 0; m++; if (m == 60) { m = 0; h++; } } }
     return QString::asprintf("%02d:%02d:%02d.%03d", h, m, sec, ms);
+}
+
+// --- Metadata Editor tab ----------------------------------------------------
+
+static QString formatBytes(quint64 bytes)
+{
+    const double kb = 1024.0, mb = kb * 1024.0, gb = mb * 1024.0, tb = gb * 1024.0;
+    if (bytes >= tb) return QStringLiteral("%1 TB").arg(bytes / tb, 0, 'f', 2);
+    if (bytes >= gb) return QStringLiteral("%1 GB").arg(bytes / gb, 0, 'f', 2);
+    if (bytes >= mb) return QStringLiteral("%1 MB").arg(bytes / mb, 0, 'f', 2);
+    if (bytes >= kb) return QStringLiteral("%1 KB").arg(bytes / kb, 0, 'f', 1);
+    return QStringLiteral("%1 B").arg(bytes);
+}
+
+void MainWindow::setMetaStreamInfo()
+{
+    // Read-only STREAMINFO summary at the top of the editor page.
+    static const char* kFmtNames[] = { "FLAC", "PCM WAV", "raw u8", "raw s8", "raw u16", "raw s16" };
+    if (!m_probeOk) {
+        for (auto* lbl : {m_metaFormatLabel, m_metaHeaderRateLabel, m_metaBitsChLabel,
+                          m_metaRealRateLabel, m_metaTotalSamplesLabel, m_metaFileSizeLabel})
+            lbl->setText(QStringLiteral("—"));
+        return;
+    }
+    m_metaFormatLabel->setText((m_probe.format <= 5)
+        ? QString::fromLatin1(kFmtNames[m_probe.format])
+        : tr("unknown"));
+    if (m_probe.format >= 2)
+        m_metaHeaderRateLabel->setText(tr("raw PCM (rate from filename)"));
+    else
+        m_metaHeaderRateLabel->setText(tr("%1 Hz").arg(m_probe.header_sample_rate));
+    m_metaBitsChLabel->setText(tr("%1-bit / %2 ch")
+        .arg(m_probe.bits_per_sample).arg(m_probe.channels));
+    if (m_probe.is_rf)
+        m_metaRealRateLabel->setText(tr("%1 Hz (RF, %2 MSPS)")
+            .arg(m_probe.real_rate_hz, 0, 'f', 0).arg(m_probe.msps, 0, 'f', 0));
+    else
+        m_metaRealRateLabel->setText(tr("%1 Hz").arg(m_probe.real_rate_hz, 0, 'f', 0));
+    if (m_probe.total_samples_known)
+        m_metaTotalSamplesLabel->setText(tr("%1 (declared %2)")
+            .arg(ulongStr(m_probe.total_samples)).arg(ulongStr(m_probe.declared_total_samples)));
+    else
+        m_metaTotalSamplesLabel->setText(tr("unknown (no STREAMINFO total)"));
+    m_metaFileSizeLabel->setText(tr("%1 (%2 bytes)")
+        .arg(formatBytes(m_probe.file_size)).arg(ulongStr(m_probe.file_size)));
+}
+
+void MainWindow::setMetaEnabled(bool on)
+{
+    // Only FLAC files carry an editable Vorbis comment block.
+    const bool editable = on && m_probeOk && m_probe.format == 0;
+    m_metaTable->setEnabled(editable);
+    m_metaAddBtn->setEnabled(editable);
+    m_metaRemoveBtn->setEnabled(editable);
+    m_metaUpBtn->setEnabled(editable);
+    m_metaDownBtn->setEnabled(editable);
+    m_metaReloadBtn->setEnabled(editable);
+    m_metaSaveBtn->setEnabled(editable);
+}
+
+void MainWindow::loadMetadata()
+{
+    // Read every Vorbis comment from the source FLAC via the packed-blob FFI
+    // and fill the editor table. Non-FLAC / no-file → cleared + disabled.
+    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0) {
+        m_metaTable->setRowCount(0);
+        setMetaEnabled(false);
+        if (m_probeOk && m_probe.format != 0)
+            m_metaStatusLabel->setText(tr("Metadata editing is only available for FLAC files (this file is %1).")
+                .arg(m_metaFormatLabel->text()));
+        else
+            m_metaStatusLabel->setText(tr("Load a FLAC file to edit its metadata."));
+        return;
+    }
+
+    const QByteArray pathB = m_inPath.toUtf8();
+    QByteArray err(256, '\0');
+    const uintptr_t size = fc_comments_blob_size(pathB.constData(), err.data(), err.size());
+    if (size == 0) {
+        m_metaTable->setRowCount(0);
+        setMetaEnabled(false);
+        m_metaStatusLabel->setText(tr("Could not read metadata: %1").arg(QString::fromUtf8(err)));
+        return;
+    }
+    QByteArray blob(int(size), '\0');
+    QByteArray err2(256, '\0');
+    const int ok = fc_read_comments_blob(pathB.constData(), blob.data(), blob.size(),
+                                         err2.data(), err2.size());
+    if (!ok) {
+        m_metaTable->setRowCount(0);
+        setMetaEnabled(false);
+        m_metaStatusLabel->setText(tr("Could not read metadata: %1").arg(QString::fromUtf8(err2)));
+        return;
+    }
+
+    // Parse the little-endian blob: u32 count, then per comment u32 len + bytes.
+    const uchar* p = reinterpret_cast<const uchar*>(blob.constData());
+    const uchar* end = p + blob.size();
+    auto rdU32 = [&p, end](bool& okb) -> quint32 {
+        if (p + 4 > end) { okb = false; return 0; }
+        const quint32 v = quint32(p[0]) | (quint32(p[1]) << 8)
+                         | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
+        p += 4;
+        return v;
+    };
+    bool okb = true;
+    const quint32 count = rdU32(okb);
+    m_metaTable->setRowCount(int(count));
+    for (quint32 i = 0; i < count && okb; ++i) {
+        const quint32 len = rdU32(okb);
+        if (!okb || p + len > end) { okb = false; break; }
+        const QString kv = QString::fromUtf8(reinterpret_cast<const char*>(p), int(len));
+        p += len;
+        const int eq = kv.indexOf(QLatin1Char('='));
+        const QString key = eq >= 0 ? kv.left(eq) : kv;
+        const QString val = eq >= 0 ? kv.mid(eq + 1) : QString();
+        m_metaTable->setItem(int(i), 0, new QTableWidgetItem(key));
+        m_metaTable->setItem(int(i), 1, new QTableWidgetItem(val));
+    }
+    if (!okb) {
+        m_metaTable->setRowCount(0);
+        setMetaEnabled(false);
+        m_metaStatusLabel->setText(tr("Could not read metadata: malformed comment blob."));
+        return;
+    }
+    m_metaStatusLabel->setText(tr("%1 comment(s) loaded. Edit fields, then Save to write in place.").arg(count));
+    setMetaEnabled(true);
+}
+
+void MainWindow::reloadMetadata()
+{
+    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0)
+        return;
+    loadMetadata();
+}
+
+void MainWindow::saveMetadata()
+{
+    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0)
+        return;
+    if (m_probing || (m_watcher && m_watcher->isRunning()) || (m_metaWatcher && m_metaWatcher->isRunning()))
+        return;
+
+    // Gather non-empty rows into "KEY=value" C strings. A fully-blank row is
+    // skipped (a no-op); a row with an empty field name but a value is an error.
+    QVector<QByteArray> commentBavs;
+    for (int i = 0; i < m_metaTable->rowCount(); ++i) {
+        const QTableWidgetItem* kIt = m_metaTable->item(i, 0);
+        const QTableWidgetItem* vIt = m_metaTable->item(i, 1);
+        const QString key = kIt ? kIt->text().trimmed() : QString();
+        const QString val = vIt ? vIt->text() : QString();
+        if (key.isEmpty() && val.isEmpty())
+            continue; // blank row — skip
+        if (key.isEmpty()) {
+            m_metaStatusLabel->setText(tr("Row %1: field name is empty — enter a name or clear the row.").arg(i + 1));
+            return;
+        }
+        commentBavs.append((key + QLatin1Char('=') + val).toUtf8());
+    }
+
+    setMetaEnabled(false);
+    m_progress->setRange(0, 0); // busy indicator (shared with the Chop page)
+    m_metaStatusLabel->setText(tr("Saving metadata…"));
+    m_statusLabel->setText(tr("Saving metadata to %1…").arg(m_inPath));
+
+    const QString path = m_inPath;
+    auto fut = QtConcurrent::run([path, commentBavs]() -> FcMetaResult {
+        FcMetaResult r;
+        QByteArray pathB = path.toUtf8();
+        QByteArray err(256, '\0');
+        // Build the C string pointer array inside the lambda so the pointers
+        // reference the lambda's own QByteArray copy (captured by value).
+        QVector<const char*> ptrs;
+        ptrs.reserve(commentBavs.size());
+        for (const QByteArray& b : commentBavs)
+            ptrs.append(b.constData());
+        const int ok = fc_replace_comments(pathB.constData(), ptrs.constData(),
+                                           uint32_t(ptrs.size()),
+                                           err.data(), err.size());
+        r.ok = (ok != 0);
+        r.error = QString::fromUtf8(err);
+        return r;
+    });
+    m_metaWatcher->setFuture(fut);
+}
+
+void MainWindow::onMetaSaveFinished()
+{
+    m_progress->setRange(0, 1);
+    m_progress->setValue(1);
+    const FcMetaResult r = m_metaWatcher->result();
+    if (r.ok) {
+        m_metaStatusLabel->setText(tr("Metadata saved. Re-probing to refresh both tabs…"));
+        m_statusLabel->setText(tr("Metadata saved to %1.").arg(m_inPath));
+        // Re-probe so the Chop page reflects any changed RF_TOTAL_SAMPLES /
+        // RF_SAMPLE_RATE, and reload the editor from the freshly written file.
+        // The refresh keeps the current IN/OUT markers (clamped to the new total).
+        m_probeIsRefresh = true;
+        startProbe();
+    } else {
+        const QString err = r.error.trimmed().isEmpty() ? tr("unknown error") : r.error.trimmed();
+        m_metaStatusLabel->setText(tr("Save failed: %1").arg(err));
+        m_statusLabel->setText(tr("Metadata save failed: %1").arg(err));
+        setMetaEnabled(true);
+    }
+}
+
+void MainWindow::addMetaRow()
+{
+    const int row = m_metaTable->rowCount();
+    m_metaTable->insertRow(row);
+    m_metaTable->setItem(row, 0, new QTableWidgetItem(QString()));
+    m_metaTable->setItem(row, 1, new QTableWidgetItem(QString()));
+    m_metaTable->setCurrentCell(row, 0);
+    m_metaTable->editItem(m_metaTable->item(row, 0));
+}
+
+void MainWindow::removeMetaRow()
+{
+    const int row = m_metaTable->currentRow();
+    if (row < 0)
+        return;
+    m_metaTable->removeRow(row);
+}
+
+void MainWindow::moveMetaRowUp()
+{
+    const int row = m_metaTable->currentRow();
+    if (row <= 0)
+        return;
+    for (int col = 0; col < 2; ++col) {
+        QTableWidgetItem* a = m_metaTable->takeItem(row, col);
+        QTableWidgetItem* b = m_metaTable->takeItem(row - 1, col);
+        m_metaTable->setItem(row, col, b);
+        m_metaTable->setItem(row - 1, col, a);
+    }
+    m_metaTable->setCurrentCell(row - 1, 0);
+}
+
+void MainWindow::moveMetaRowDown()
+{
+    const int row = m_metaTable->currentRow();
+    if (row < 0 || row >= m_metaTable->rowCount() - 1)
+        return;
+    for (int col = 0; col < 2; ++col) {
+        QTableWidgetItem* a = m_metaTable->takeItem(row, col);
+        QTableWidgetItem* b = m_metaTable->takeItem(row + 1, col);
+        m_metaTable->setItem(row, col, b);
+        m_metaTable->setItem(row + 1, col, a);
+    }
+    m_metaTable->setCurrentCell(row + 1, 0);
 }

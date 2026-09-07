@@ -9,6 +9,11 @@
 //! cut), while leaving ingest metadata (`project`, `tape_id`, `operator`,
 //! `location`, `notes`, …) untouched (SoX already passed them through).
 //!
+//! It also exposes a general Vorbis-comment editor API
+//! ([`read_all_comments`] / [`replace_all_comments`]) used by the GUI's
+//! Metadata Editor tab to view and rewrite every comment on the *source* file
+//! in place — the same in-place / splice write path the cut-tag rewrite uses.
+//!
 //! Tag schema (from MISRC-GUI `gui_record.c` + the capture pipeline):
 //!
 //! ```text
@@ -151,6 +156,28 @@ fn update_vorbis_comment_in_place(path: &Path, updates: &[(&str, String)]) -> Re
         comments.push(format!("{key}={val}"));
     }
 
+    write_vc_in_place_core(path, &blocks, frames_start, src_len, vc_idx, &vendor, &comments)
+}
+
+/// Core in-place VC writer: write `comments` (a full "KEY=value" list) over the
+/// existing VORBIS_COMMENT block at `vc_idx`, equalizing the covered byte
+/// region against the adjacent PADDING block / the vendor string so every other
+/// byte of the file (including all audio frames) stays untouched and no temp
+/// file is needed. `src_len` is the file size before the write (reused from the
+/// caller). Returns `Ok(true)` when applied, `Ok(false)` when it cannot fit
+/// (the caller falls back to the full splice), `Err` on I/O or
+/// malformed-container errors. The file is only written after every fallible
+/// step has passed, and the self-check refuses to leave a broken file behind
+/// silently.
+fn write_vc_in_place_core(
+    path: &Path,
+    blocks: &[MetaBlock],
+    frames_start: u64,
+    src_len: u64,
+    vc_idx: usize,
+    vendor: &str,
+    comments: &[String],
+) -> Result<bool, String> {
     // Byte offset of the VC block, the block layout around it, and the total
     // byte size of the region the rewrite must cover exactly.
     let vc_off: u64 = 4 + blocks[..vc_idx].iter().map(|b| 4 + b.payload.len() as u64).sum::<u64>();
@@ -164,7 +191,7 @@ fn update_vorbis_comment_in_place(path: &Path, updates: &[(&str, String)]) -> Re
     // Build the equal-size replacement region for a given vendor string.
     // `None` = the update cannot be represented with this vendor.
     let build_region = |vendor: &str| -> Option<Vec<u8>> {
-        let payload = build_vorbis_comment(vendor, &comments);
+        let payload = build_vorbis_comment(vendor, comments);
         if payload.len() > 0xff_ffff {
             return None;
         }
@@ -219,14 +246,14 @@ fn update_vorbis_comment_in_place(path: &Path, updates: &[(&str, String)]) -> Re
     // Try the original vendor first (covers delta == 0, shrink-with-slack, and
     // any growth the adjacent padding absorbs); otherwise trim the vendor by
     // exactly the shortfall.
-    let new_len = build_vorbis_comment(&vendor, &comments).len();
+    let new_len = build_vorbis_comment(vendor, comments).len();
     let delta = new_len as i64 - old_len as i64;
     let shortfall = match pad_follows {
         Some(pad) => (delta - pad as i64).max(0), // growth past the padding
         None => delta.max(0),                     // no padding: growth needs the trim
     };
     let region = if shortfall == 0 {
-        match build_region(&vendor) {
+        match build_region(vendor) {
             Some(r) => r,
             None => return Ok(false),
         }
@@ -358,22 +385,15 @@ fn build_vorbis_comment(vendor: &str, comments: &[String]) -> Vec<u8> {
     out
 }
 
-/// Splice a fresh VORBIS_COMMENT block into the FLAC at `path`, replacing the
-/// existing one (or inserted after STREAMINFO if absent), with `updates`
-/// applied on top of the existing comments: every existing comment whose KEY
-/// is named in `updates` is dropped, then the updated values are appended in
-/// order. All other metadata blocks and the audio frames are copied
-/// byte-for-byte.
-///
-/// Only used when the in-place update cannot fit (rare: growth past the
-/// adjacent padding with a vendor string too short to trim). The new file is
-/// written to a sibling temp file, self-verified (chain lengths add up, first
-/// frame sync present at the declared offset, file is exactly metadata plus
-/// the original frames), then renamed over `path`. The result carries a
-/// MISRC-style 4096-byte PADDING right after the VC so subsequent updates fit
-/// in place.
+/// Apply a set of key-targeted `updates` via a full verified splice: the
+/// existing VC block is rewritten (or one is inserted after STREAMINFO when
+/// absent) with `updates` applied on top of the existing comments, a
+/// MISRC-style 4096-byte PADDING is left after the VC, and the audio frames are
+/// copied byte-for-byte. Used by the cut rewrite path when the in-place update
+/// cannot fit. The GUI editor uses [`replace_all_comments`] (full list) which
+/// calls [`splice_vc_core`] directly.
 fn splice_vorbis_comment(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
-    let (mut blocks, frames_start) = parse_metadata_chain(path)?;
+    let (blocks, frames_start) = parse_metadata_chain(path)?;
 
     // Existing Vorbis comments (vendor + comment list), or empty defaults.
     let (vendor, mut comments) = match blocks.iter().find(|b| b.kind == 4) {
@@ -390,7 +410,25 @@ fn splice_vorbis_comment(path: &Path, updates: &[(&str, String)]) -> Result<(), 
     for (key, val) in updates {
         comments.push(format!("{key}={val}"));
     }
-    let new_payload = build_vorbis_comment(&vendor, &comments);
+
+    splice_vc_core(path, blocks, frames_start, &vendor, &comments)
+}
+
+/// Core full-splice VC writer: rebuild the metadata chain with a VC block
+/// carrying exactly `comments` (full "KEY=value" list) and `vendor`, swapping
+/// the existing VC in place or inserting one after the STREAMINFO when none
+/// exists, leaving a MISRC-style 4096-byte PADDING after the VC, and copying the
+/// original audio frames byte-for-byte. Self-verifies (chain lengths add up,
+/// first frame sync present at the declared offset, file is exactly metadata
+/// plus the original frames), then renames a sibling temp file over `path`.
+fn splice_vc_core(
+    path: &Path,
+    mut blocks: Vec<MetaBlock>,
+    frames_start: u64,
+    vendor: &str,
+    comments: &[String],
+) -> Result<(), String> {
+    let new_payload = build_vorbis_comment(vendor, comments);
     if new_payload.len() > 0xff_ffff {
         return Err(format!("vorbis comment too large ({} bytes)", new_payload.len()));
     }
@@ -506,6 +544,87 @@ fn splice_vorbis_comment(path: &Path, updates: &[(&str, String)]) -> Result<(), 
 
     std::fs::rename(&tmp_path, path).map_err(|e| format!("rename: {e}"))?;
     Ok(())
+}
+
+/// Read every Vorbis comment in the FLAC at `path` as `(key, value)` pairs, in
+/// file order. The vendor string is returned too (it is preserved on write by
+/// [`replace_all_comments`]). Returns an empty list (and empty vendor) when the
+/// file has no VORBIS_COMMENT block. Errors on a malformed container or I/O
+/// failure — never on a simply tag-less file.
+pub fn read_all_comments(path: &Path) -> Result<(String, Vec<(String, String)>), String> {
+    let (blocks, _frames) = parse_metadata_chain(path)?;
+    let (vendor, comments) = match blocks.iter().find(|b| b.kind == 4) {
+        Some(b) => parse_vorbis_comment(&b.payload)?,
+        None => return Ok((String::new(), Vec::new())),
+    };
+    // Split each "KEY=value" on the FIRST '=' only — values may contain '='.
+    let pairs = comments
+        .iter()
+        .map(|c| match c.find('=') {
+            Some(i) => (c[..i].to_string(), c[i + 1..].to_string()),
+            None => (c.clone(), String::new()),
+        })
+        .collect();
+    Ok((vendor, pairs))
+}
+
+/// Replace the entire VORBIS_COMMENT block on the FLAC at `path` with exactly
+/// `comments` (a full `(key, value)` list, in order). The existing vendor
+/// string is preserved (or a `"FLAC-Chop"` default is used when the file has no
+/// VC block). Keys must be non-empty and match `[A-Za-z0-9_]+`; they are
+/// uppercased on write (Vorbis field names are case-insensitive). Values are
+/// arbitrary UTF-8 (may be empty, may contain `=`).
+///
+/// Writes in place (adjacent PADDING / vendor trim) with a verified temp-file
+/// splice fallback that leaves MISRC-style 4096-byte padding behind, exactly
+/// like the cut-tag rewrite path.
+pub fn replace_all_comments(path: &Path, comments: &[(String, String)]) -> Result<(), String> {
+    // Validate + build the "KEY=value" comment strings. Keys uppercased per
+    // Vorbis convention; values left untouched (may hold '=' / be empty).
+    let mut comment_strs: Vec<String> = Vec::with_capacity(comments.len());
+    for (i, (k, v)) in comments.iter().enumerate() {
+        if k.is_empty() {
+            return Err(format!("comment {i}: field name is empty"));
+        }
+        if !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return Err(format!(
+                "comment {i}: field name {:?} has invalid characters (allowed: A-Z a-z 0-9 _)",
+                k
+            ));
+        }
+        comment_strs.push(format!("{}={}", k.to_ascii_uppercase(), v));
+    }
+
+    let (blocks, frames_start) = parse_metadata_chain(path)?;
+    // Preserve the existing vendor string (default when no VC block exists).
+    let vendor = match blocks.iter().find(|b| b.kind == 4) {
+        Some(b) => parse_vorbis_comment(&b.payload).map(|(v, _)| v)?,
+        None => "FLAC-Chop".to_string(),
+    };
+
+    let src_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let orig_frames_len = src_len
+        .checked_sub(frames_start)
+        .ok_or_else(|| format!("frame start {frames_start} past end of file ({src_len})"))?;
+    if orig_frames_len == 0 {
+        return Err("no audio frames after metadata".to_string());
+    }
+
+    // Try the in-place update first (only when a VC block already exists — the
+    // in-place path cannot insert a new block). On Ok(false) (cannot fit) or
+    // when there is no VC, fall back to the full splice, which inserts a VC
+    // and leaves MISRC-style padding so the next edit fits in place.
+    let applied = match blocks.iter().position(|b| b.kind == 4) {
+        Some(vc_idx) => write_vc_in_place_core(
+            path, &blocks, frames_start, src_len, vc_idx, &vendor, &comment_strs,
+        )?,
+        None => false,
+    };
+    if applied {
+        Ok(())
+    } else {
+        splice_vc_core(path, blocks, frames_start, &vendor, &comment_strs)
+    }
 }
 
 /// Read `(header_sample_rate, total_samples)` from a FLAC's STREAMINFO via
@@ -843,5 +962,176 @@ mod tests {
         // /dev/null is not FLAC — must return an error, not panic.
         let r = read_streaminfo(Path::new("/dev/null"));
         assert!(r.is_err());
+    }
+
+    fn read_vendor(p: &Path) -> String {
+        let (blocks, _) = parse_metadata_chain(p).unwrap();
+        let vc = blocks.iter().find(|b| b.kind == 4).unwrap();
+        parse_vorbis_comment(&vc.payload).unwrap().0
+    }
+
+    // --- read_all_comments / replace_all_comments (GUI Metadata Editor path) --
+
+    #[test]
+    fn read_all_comments_returns_pairs() {
+        let p = write_minimal_flac(
+            "fc_test_read_all.flac",
+            &["PROJECT=demo", "OPERATOR=harry", "RF_TOTAL_SAMPLES=42"],
+        );
+        let (vendor, pairs) = read_all_comments(&p).unwrap();
+        assert_eq!(vendor, "test");
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0], ("PROJECT".to_string(), "demo".to_string()));
+        assert_eq!(pairs[1], ("OPERATOR".to_string(), "harry".to_string()));
+        assert_eq!(pairs[2], ("RF_TOTAL_SAMPLES".to_string(), "42".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_all_comments_value_with_equals_is_kept_intact() {
+        // Values may contain '=' — only the FIRST '=' splits key from value.
+        let p = write_minimal_flac("fc_test_read_eq.flac", &["NOTES=a=b=c"]);
+        let (_, pairs) = read_all_comments(&p).unwrap();
+        assert_eq!(pairs, vec![("NOTES".to_string(), "a=b=c".to_string())]);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_all_comments_no_vc_is_empty_not_error() {
+        // STREAMINFO-only FLAC (no VC block) → empty list, not an error.
+        let p = std::env::temp_dir().join("fc_test_read_novc.flac");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(b"fLaC").unwrap();
+            let mut si = [0u8; 34];
+            si[10..18].copy_from_slice(&((10000u64 << 44) | 4096).to_be_bytes());
+            f.write_all(&[0x80, 0x00, 0x00, 34]).unwrap();
+            f.write_all(&si).unwrap();
+            f.write_all(&[0xFF, 0xF8, 0x00, 0x01]).unwrap();
+        }
+        let (vendor, pairs) = read_all_comments(&p).unwrap();
+        assert!(vendor.is_empty());
+        assert!(pairs.is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn read_all_comments_refuses_non_flac() {
+        let p = std::env::temp_dir().join("fc_test_read_notflac.bin");
+        std::fs::write(&p, b"not flac").unwrap();
+        assert!(read_all_comments(&p).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_rewrites_full_set_inplace() {
+        // Adjacent 4-byte PADDING absorbs the small shrink; file size and
+        // frames stay identical. Covers removal (OPERATOR dropped), addition
+        // (NOTES added), and lower-case key uppercasing ("project"→PROJECT).
+        let p = write_minimal_flac(
+            "fc_test_replace_inplace.flac",
+            &["PROJECT=demo", "RF_TOTAL_SAMPLES=999", "OPERATOR=harry"],
+        );
+        let size_before = std::fs::metadata(&p).unwrap().len();
+        let frames_before = read_frames(&p);
+        replace_all_comments(
+            &p,
+            &[
+                ("project".to_string(), "demo".to_string()),
+                ("RF_TOTAL_SAMPLES".to_string(), "999".to_string()),
+                ("NOTES".to_string(), "hi".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len(),
+            size_before,
+            "in-place replace must keep the file size"
+        );
+        assert_eq!(read_frames(&p), frames_before, "frames must be untouched");
+        let c = read_comments(&p);
+        assert!(
+            c.contains(&"PROJECT=demo".to_string()),
+            "lower-case key must be upper-cased: {c:?}"
+        );
+        assert!(c.contains(&"RF_TOTAL_SAMPLES=999".to_string()));
+        assert!(c.contains(&"NOTES=hi".to_string()));
+        assert!(!c.contains(&"OPERATOR=harry".to_string()), "removed key must be gone");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_validates_keys() {
+        let p = write_minimal_flac("fc_test_replace_badkey.flac", &["A=1"]);
+        let err = replace_all_comments(&p, &[("".to_string(), "x".to_string())]).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err2 =
+            replace_all_comments(&p, &[("BAD KEY".to_string(), "x".to_string())]).unwrap_err();
+        assert!(err2.contains("invalid"), "{err2}");
+        // File untouched on validation failure (the write never starts).
+        assert!(read_comments(&p).contains(&"A=1".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_preserves_vendor() {
+        let p = write_sox_style_flac("fc_test_replace_vendor.flac", &["A=1"]);
+        let vendor_before = read_vendor(&p);
+        replace_all_comments(&p, &[("B".to_string(), "2".to_string())]).unwrap();
+        assert_eq!(read_vendor(&p), vendor_before, "vendor string must be preserved");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_inserts_vc_when_missing() {
+        // No VC block → the in-place path declines and the splice inserts one,
+        // leaving MISRC-style padding behind.
+        let p = std::env::temp_dir().join("fc_test_replace_insert.flac");
+        {
+            let mut f = File::create(&p).unwrap();
+            f.write_all(b"fLaC").unwrap();
+            let mut si = [0u8; 34];
+            si[10..18].copy_from_slice(&((10000u64 << 44) | 4096).to_be_bytes());
+            f.write_all(&[0x80, 0x00, 0x00, 34]).unwrap();
+            f.write_all(&si).unwrap();
+            f.write_all(&[0xFF, 0xF8, 0x00, 0x01]).unwrap();
+        }
+        replace_all_comments(&p, &[("RF_TOTAL_SAMPLES".to_string(), "42".to_string())]).unwrap();
+        let (blocks, _) = parse_metadata_chain(&p).unwrap();
+        assert_eq!(blocks[0].kind, 0); // SI
+        assert_eq!(blocks[1].kind, 4); // inserted VC
+        assert_eq!(blocks[2].kind, 1); // MISRC padding
+        assert!(read_comments(&p).contains(&"RF_TOTAL_SAMPLES=42".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_splices_when_growth_too_large() {
+        // Growth far past the vendor: in-place declines, the full splice takes
+        // over (file size grows by the new padding), frames copied 1:1.
+        let p = write_sox_style_flac("fc_test_replace_splice.flac", &["A=1"]);
+        let frames_before = read_frames(&p);
+        let big = "x".repeat(500);
+        replace_all_comments(&p, &[("NOTES".to_string(), big.clone())]).unwrap();
+        let (blocks, _) = parse_metadata_chain(&p).unwrap();
+        assert_eq!(blocks[blocks.len() - 2].kind, 4, "VC must sit before the padding");
+        assert_eq!(blocks.last().unwrap().kind, 1, "splice must leave padding last");
+        assert!(read_comments(&p).contains(&format!("NOTES={big}")));
+        assert_eq!(read_frames(&p), frames_before, "frames copied byte-for-byte");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn replace_all_comments_round_trips_with_read() {
+        // read → replace(read-back) → read again must be stable.
+        let p = write_minimal_flac(
+            "fc_test_replace_roundtrip.flac",
+            &["PROJECT=demo", "OPERATOR=harry"],
+        );
+        let (_, pairs) = read_all_comments(&p).unwrap();
+        replace_all_comments(&p, &pairs).unwrap();
+        let (_, pairs2) = read_all_comments(&p).unwrap();
+        assert_eq!(pairs, pairs2);
+        let _ = std::fs::remove_file(&p);
     }
 }

@@ -14,7 +14,16 @@ class QProgressBar;
 class QRangeSlider;
 class QComboBox;
 class QCheckBox;
+class QTabWidget;
+class QTableWidget;
 class QNetworkAccessManager;
+
+// Result of an off-thread metadata save (fc_replace_comments). Carried across
+// the QtConcurrent future so onMetaSaveFinished can report success/failure.
+struct FcMetaResult {
+    bool ok = false;
+    QString error;
+};
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -39,6 +48,13 @@ private slots:
     void browseOutDir();
     void onOutDirEdited();
     void cancelProcess();
+    void addMetaRow();
+    void removeMetaRow();
+    void moveMetaRowUp();
+    void moveMetaRowDown();
+    void saveMetadata();
+    void reloadMetadata();
+    void onMetaSaveFinished();
 
 private:
     // HH:MM:SS parsing helpers (accept "SS", "MM:SS", "HH:MM:SS").
@@ -46,8 +62,13 @@ private:
     static QString secsToHms(double s);
     void loadFile(const QString& fn);
     void unloadFile();
+    void startProbe();
     void setProbeInfo();
     void setControlsEnabled(bool enabled);
+    // --- Metadata Editor tab ---
+    void loadMetadata();         // fill the editor table from the source file
+    void setMetaEnabled(bool on); // gate the editor controls by load/format
+    void setMetaStreamInfo();    // populate the read-only STREAMINFO summary
     // Apply m_inSec/m_outSec to the cut plan + read-only displays. Does NOT
     // touch the slider or the time box (callers do that with signals blocked).
     void applyCut();
@@ -108,17 +129,39 @@ private:
     QProgressBar* m_progress = nullptr;
     QLabel* m_statusLabel = nullptr;
 
+    // --- Metadata Editor tab widgets (Metadata page) ---
+    QTabWidget* m_tabs = nullptr;
+    QTableWidget* m_metaTable = nullptr;
+    QPushButton* m_metaAddBtn = nullptr;
+    QPushButton* m_metaRemoveBtn = nullptr;
+    QPushButton* m_metaUpBtn = nullptr;
+    QPushButton* m_metaDownBtn = nullptr;
+    QPushButton* m_metaSaveBtn = nullptr;
+    QPushButton* m_metaReloadBtn = nullptr;
+    QLabel* m_metaStatusLabel = nullptr;
+    // read-only STREAMINFO summary at the top of the editor page
+    QLabel* m_metaFormatLabel = nullptr;
+    QLabel* m_metaHeaderRateLabel = nullptr;
+    QLabel* m_metaBitsChLabel = nullptr;
+    QLabel* m_metaRealRateLabel = nullptr;
+    QLabel* m_metaTotalSamplesLabel = nullptr;
+    QLabel* m_metaFileSizeLabel = nullptr;
+
     // last computed plan + output path (filled in applyCut())
     FcPlan m_plan{};
     QString m_outPath;
     QFutureWatcher<FcChopResult>* m_watcher = nullptr;
     QFutureWatcher<FcProbe>* m_probeWatcher = nullptr;
+    QFutureWatcher<FcMetaResult>* m_metaWatcher = nullptr;
     QNetworkAccessManager* m_net = nullptr;
     bool m_syncing = false;
     bool m_probing = false; // true while fc_probe runs off-thread
     bool m_updateCheckInFlight = false;
     bool m_cancelRequested = false; // true while a cut cancel is pending
     bool m_outDirAutoFollow = true; // true: output dir follows the input file's dir until the user explicitly chooses one
+    // true while a re-probe triggered by a metadata save is in flight — then
+    // the Chop page's IN/OUT markers are clamped (not reset to the full tape).
+    bool m_probeIsRefresh = false;
 };
 
 #endif // FLACCHOP_MAINWINDOW_H

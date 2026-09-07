@@ -68,6 +68,22 @@ int fc_generate_output_path(const char* in_path, const char* out_dir,
 int fc_sox_available(void);
 void fc_chop_cancel(void);
 
+// --- Metadata editor (GUI Metadata Editor tab) -----------------------------
+// Read/rewrite every Vorbis comment on a *source* FLAC in place. The read path
+// packs comments into a little-endian blob: u32 LE count, then per comment
+// u32 LE length + "KEY=value" bytes. The vendor string is preserved on write.
+//
+// fc_comments_blob_size returns the blob byte size (>= 4 on success, 0 on
+// error with a message in err). fc_read_comments_blob fills buf (>= that
+// size) and returns 1 on success, 0 on error. fc_replace_comments replaces
+// ALL comments with the n NUL-terminated "KEY=value" strings in `comments`
+// (vendor preserved); returns 1 on success, 0 on error (message in err).
+uintptr_t fc_comments_blob_size(const char* path, char* err, uintptr_t err_len);
+int fc_read_comments_blob(const char* path, char* buf, uintptr_t buf_len,
+                          char* err, uintptr_t err_len);
+int fc_replace_comments(const char* path, const char* const* comments,
+                        uint32_t n, char* err, uintptr_t err_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,7 +9,7 @@ use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::ptr;
 
-use crate::{chop, msps, probe};
+use crate::{chop, msps, probe, tags};
 
 /// Copy `s` (truncated) into a NUL-terminated fixed `[c_char; N]` buffer.
 /// If truncation is needed, it backs off to a UTF-8 character boundary so the
@@ -481,6 +481,179 @@ pub extern "C" fn fc_chop_cancel() {
     chop::cancel_chop();
 }
 
+// --- Metadata editor (GUI Metadata Editor tab) -------------------------------
+//
+// Read / rewrite every Vorbis comment on a *source* FLAC in place, via
+// tags::read_all_comments / tags::replace_all_comments. The read path packs
+// the comments into a flat little-endian blob the C++ side parses:
+//   u32 LE count, then for each comment: u32 LE length + "KEY=value" bytes.
+// The vendor string is preserved automatically on write (not exposed here).
+
+/// Copy `s` (truncated at a UTF-8 boundary) into a NUL-terminated buffer given
+/// as a raw pointer + length. No-op on a null/empty buffer. Used by the
+/// metadata-editor FFI to return error strings into caller-provided buffers.
+fn set_str_ptr(buf: *mut c_char, buf_len: usize, s: &str) {
+    if buf.is_null() || buf_len == 0 {
+        return;
+    }
+    let bytes = s.as_bytes();
+    let mut n = bytes.len().min(buf_len - 1);
+    if n < bytes.len() {
+        // Truncated: step back past any continuation bytes (10xxxxxx) so the
+        // C++ side never receives a half character (QString::fromUtf8 would
+        // render a replacement glyph).
+        while n > 0 && (bytes[n] & 0b1100_0000) == 0b1000_0000 {
+            n -= 1;
+        }
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, n);
+        *buf.add(n) = 0;
+    }
+}
+
+/// Pack `(key, value)` pairs into the little-endian blob format the GUI parses:
+/// `u32 LE count`, then per comment `u32 LE length` + `"KEY=value"` UTF-8 bytes.
+/// Pure helper — used by both the size and read FFI calls so they agree exactly.
+fn pack_comments_blob(comments: &[(String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for (k, v) in comments {
+        let s = format!("{}={}", k, v);
+        let b = s.as_bytes();
+        out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        out.extend_from_slice(b);
+    }
+    out
+}
+
+/// Byte size of the packed Vorbis-comment blob for the FLAC at `path`
+/// (4-byte count header + per-comment 4-byte length + "KEY=value"). Returns
+/// `>= 4` on success (a tag-less file still yields a 4-byte count=0 blob) and
+/// `0` on error (with the message written to `err`). The GUI sizes its buffer
+/// with this, then calls [`fc_read_comments_blob`].
+#[no_mangle]
+pub extern "C" fn fc_comments_blob_size(path: *const c_char, err: *mut c_char, err_len: usize) -> usize {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<usize, String> {
+        if path.is_null() {
+            return Err("null path".to_string());
+        }
+        let p = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|_| "path is not valid UTF-8".to_string())?;
+        let (_, comments) = tags::read_all_comments(std::path::Path::new(p))?;
+        Ok(pack_comments_blob(&comments).len())
+    }));
+    match result {
+        Ok(Ok(size)) => size,
+        Ok(Err(e)) => {
+            set_str_ptr(err, err_len, &e);
+            0
+        }
+        Err(payload) => {
+            set_str_ptr(err, err_len, &format!("read comments panicked: {}", panic_msg(payload)));
+            0
+        }
+    }
+}
+
+/// Pack all Vorbis comments of the FLAC at `path` into `buf` (size `buf_len`),
+/// which must be at least as large as [`fc_comments_blob_size`] reported.
+/// Format: `u32 LE count`, then per comment `u32 LE length` + "KEY=value" bytes.
+/// Returns 1 on success, 0 on error (message in `err`).
+#[no_mangle]
+pub extern "C" fn fc_read_comments_blob(
+    path: *const c_char,
+    buf: *mut c_char,
+    buf_len: usize,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+        if path.is_null() || buf.is_null() {
+            return Err("null path or buffer".to_string());
+        }
+        let p = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|_| "path is not valid UTF-8".to_string())?;
+        let (_, comments) = tags::read_all_comments(std::path::Path::new(p))?;
+        let blob = pack_comments_blob(&comments);
+        if blob.len() > buf_len {
+            return Err(format!("buffer too small: have {}, need {}", buf_len, blob.len()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(blob.as_ptr() as *const c_char, buf, blob.len());
+        }
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) => 1,
+        Ok(Err(e)) => {
+            set_str_ptr(err, err_len, &e);
+            0
+        }
+        Err(payload) => {
+            set_str_ptr(err, err_len, &format!("read comments panicked: {}", panic_msg(payload)));
+            0
+        }
+    }
+}
+
+/// Replace ALL Vorbis comments on the FLAC at `path` with the `n` comments
+/// pointed to by `comments` (each a NUL-terminated "KEY=value" C string). The
+/// existing vendor string is preserved (or a default is used when the file has
+/// no Vorbis comment block). Writes in place (adjacent padding / vendor trim)
+/// with a verified temp-file splice fallback, exactly like the cut-tag rewrite.
+/// Returns 1 on success, 0 on error (message in `err`).
+#[no_mangle]
+pub extern "C" fn fc_replace_comments(
+    path: *const c_char,
+    comments: *const *const c_char,
+    n: u32,
+    err: *mut c_char,
+    err_len: usize,
+) -> i32 {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+        if path.is_null() {
+            return Err("null path".to_string());
+        }
+        let p = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|_| "path is not valid UTF-8".to_string())?;
+        // Collect the C string array into owned (String) pairs, splitting each
+        // "KEY=value" on the FIRST '=' (values may contain '=').
+        let mut pairs: Vec<(String, String)> = Vec::with_capacity(n as usize);
+        if !comments.is_null() {
+            for i in 0..n {
+                let pptr = unsafe { *comments.add(i as usize) };
+                if pptr.is_null() {
+                    return Err(format!("comment {i}: null pointer"));
+                }
+                let cstr = unsafe { CStr::from_ptr(pptr) }
+                    .to_str()
+                    .map_err(|_| format!("comment {i}: not valid UTF-8"))?;
+                let (k, v) = match cstr.find('=') {
+                    Some(eq) => (cstr[..eq].to_string(), cstr[eq + 1..].to_string()),
+                    None => (cstr.to_string(), String::new()),
+                };
+                pairs.push((k, v));
+            }
+        }
+        tags::replace_all_comments(std::path::Path::new(p), &pairs)
+    }));
+    match result {
+        Ok(Ok(())) => 1,
+        Ok(Err(e)) => {
+            set_str_ptr(err, err_len, &e);
+            0
+        }
+        Err(payload) => {
+            set_str_ptr(err, err_len, &format!("replace comments panicked: {}", panic_msg(payload)));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +722,189 @@ mod tests {
         let mut buf = [0 as c_char; 16];
         set_str(&mut buf, "hello");
         assert_eq!(cbuf_to_string(&buf), "hello");
+    }
+
+    // --- metadata-editor FFI -------------------------------------------------
+
+    /// Build a minimal FLAC (10000 Hz / 1 ch / 8-bit) with a VORBIS_COMMENT
+    /// block carrying `comments`, a 4-byte PADDING, and one fake frame — enough
+    /// for the read/replace FFI to operate on (the splice self-check verifies
+    /// the frame sync, not full decodability).
+    fn make_meta_test_flac(name: &str, comments: &[&str]) -> std::path::PathBuf {
+        use std::io::Write;
+        let p = std::env::temp_dir().join(name);
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(b"fLaC").unwrap();
+        // STREAMINFO: 10000 Hz, 1 ch, 8 bps, total 4096 (one block).
+        let packed: u64 = (10000u64 << 44) | (0u64 << 41) | (7u64 << 36) | 4096;
+        let mut si = Vec::new();
+        si.extend_from_slice(&4096u16.to_be_bytes());
+        si.extend_from_slice(&4096u16.to_be_bytes());
+        si.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        si.extend_from_slice(&packed.to_be_bytes());
+        si.extend_from_slice(&[0u8; 16]);
+        f.write_all(&[0x00, 0x00, 0x00, 34]).unwrap();
+        f.write_all(&si).unwrap();
+        // VORBIS_COMMENT (vendor "test" + the requested comments).
+        let mut vc = Vec::new();
+        let vendor = b"test";
+        vc.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        vc.extend_from_slice(vendor);
+        vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+        for c in comments {
+            let b = c.as_bytes();
+            vc.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            vc.extend_from_slice(b);
+        }
+        f.write_all(&[0x04, (vc.len() >> 16) as u8, (vc.len() >> 8) as u8, vc.len() as u8]).unwrap();
+        f.write_all(&vc).unwrap();
+        // PADDING, last block.
+        f.write_all(&[0x81, 0x00, 0x00, 0x04]).unwrap();
+        f.write_all(&[0u8; 4]).unwrap();
+        // One fake frame: 0xFFF8 sync + junk payload.
+        f.write_all(&[0xFF, 0xF8, 0xCC, 0x02, 0x00, 0x0A, 0x1D, 0x4A]).unwrap();
+        p
+    }
+
+    fn parse_blob(buf: &[c_char]) -> Vec<String> {
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+        let mut pos = 0usize;
+        let count = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+            as usize;
+        pos += 4;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let len = u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]])
+                as usize;
+            pos += 4;
+            out.push(std::str::from_utf8(&bytes[pos..pos + len]).unwrap().to_string());
+            pos += len;
+        }
+        out
+    }
+
+    #[test]
+    fn pack_comments_blob_roundtrips() {
+        let comments = vec![
+            ("PROJECT".to_string(), "demo".to_string()),
+            ("NOTES".to_string(), "a=b=c".to_string()), // value with '='
+            ("EMPTY".to_string(), String::new()),
+        ];
+        let blob = pack_comments_blob(&comments);
+        let pairs: Vec<(String, String)> = parse_blob(
+            &blob.iter().map(|&b| b as c_char).collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|s| match s.find('=') {
+            Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
+            None => (s, String::new()),
+        })
+        .collect();
+        assert_eq!(pairs, comments);
+    }
+
+    #[test]
+    fn fc_comments_blob_size_errors_on_missing_file() {
+        let mut err = [0 as c_char; 128];
+        let path = b"/nonexistent/fc_no_such.flac\0";
+        let size = fc_comments_blob_size(path.as_ptr() as *const c_char, err.as_mut_ptr(), err.len());
+        assert_eq!(size, 0, "missing file must report size 0");
+        assert!(err[0] != 0, "an error message must be written");
+        assert!(
+            cbuf_to_string(&err).to_lowercase().contains("open"),
+            "error should mention the open failure: {}",
+            cbuf_to_string(&err)
+        );
+    }
+
+    #[test]
+    fn fc_read_comments_blob_errors_on_missing_file() {
+        let mut err = [0 as c_char; 128];
+        let mut buf = [0 as c_char; 64];
+        let path = b"/nonexistent/fc_no_such2.flac\0";
+        let ok = fc_read_comments_blob(
+            path.as_ptr() as *const c_char,
+            buf.as_mut_ptr(),
+            buf.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(ok, 0);
+        assert!(err[0] != 0);
+    }
+
+    #[test]
+    fn fc_replace_comments_errors_on_missing_file() {
+        let mut err = [0 as c_char; 128];
+        let path = b"/nonexistent/fc_no_such3.flac\0";
+        let ok = fc_replace_comments(
+            path.as_ptr() as *const c_char,
+            std::ptr::null(),
+            0,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(ok, 0);
+        assert!(err[0] != 0);
+    }
+
+    #[test]
+    fn fc_read_and_replace_comments_end_to_end() {
+        let p = make_meta_test_flac("fc_ffi_meta.flac", &["PROJECT=demo", "OPERATOR=harry"]);
+        let path_b = p.to_string_lossy().into_owned() + "\0";
+        let mut err = [0 as c_char; 128];
+
+        // size the blob
+        let size = fc_comments_blob_size(path_b.as_ptr() as *const c_char, err.as_mut_ptr(), err.len());
+        assert!(err[0] == 0, "{}", cbuf_to_string(&err));
+        assert!(size >= 4);
+
+        // read it
+        let mut buf = vec![0 as c_char; size];
+        let ok = fc_read_comments_blob(
+            path_b.as_ptr() as *const c_char,
+            buf.as_mut_ptr(),
+            buf.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(ok, 1, "{}", cbuf_to_string(&err));
+        let got = parse_blob(&buf);
+        assert_eq!(got, vec!["PROJECT=demo".to_string(), "OPERATOR=harry".to_string()]);
+
+        // replace: drop OPERATOR, add NOTES, change PROJECT
+        let new_comments: Vec<std::ffi::CString> = vec![
+            std::ffi::CString::new("PROJECT=demo2").unwrap(),
+            std::ffi::CString::new("NOTES=edited").unwrap(),
+        ];
+        let ptrs: Vec<*const c_char> = new_comments.iter().map(|c| c.as_ptr()).collect();
+        let ok2 = fc_replace_comments(
+            path_b.as_ptr() as *const c_char,
+            ptrs.as_ptr(),
+            ptrs.len() as u32,
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(ok2, 1, "{}", cbuf_to_string(&err));
+
+        // read back the written file
+        let size2 = fc_comments_blob_size(path_b.as_ptr() as *const c_char, err.as_mut_ptr(), err.len());
+        assert!(err[0] == 0);
+        let mut buf2 = vec![0 as c_char; size2];
+        let ok3 = fc_read_comments_blob(
+            path_b.as_ptr() as *const c_char,
+            buf2.as_mut_ptr(),
+            buf2.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(ok3, 1);
+        let got2 = parse_blob(&buf2);
+        assert!(got2.contains(&"PROJECT=demo2".to_string()));
+        assert!(got2.contains(&"NOTES=edited".to_string()));
+        assert!(!got2.contains(&"OPERATOR=harry".to_string()), "removed key must be gone");
+
+        let _ = std::fs::remove_file(&p);
     }
 }
