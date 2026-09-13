@@ -54,6 +54,7 @@ private slots:
     void moveMetaRowDown();
     void saveMetadata();
     void reloadMetadata();
+    void applyTemplate();
     void onMetaSaveFinished();
 
 private:
@@ -69,6 +70,7 @@ private:
     void loadMetadata();         // fill the editor table from the source file
     void setMetaEnabled(bool on); // gate the editor controls by load/format
     void setMetaStreamInfo();    // populate the read-only STREAMINFO summary
+    bool metaHasKey(const QString& key) const; // case-insensitive table lookup
     // Apply m_inSec/m_outSec to the cut plan + read-only displays. Does NOT
     // touch the slider or the time box (callers do that with signals blocked).
     void applyCut();
@@ -138,6 +140,7 @@ private:
     QPushButton* m_metaDownBtn = nullptr;
     QPushButton* m_metaSaveBtn = nullptr;
     QPushButton* m_metaReloadBtn = nullptr;
+    QPushButton* m_metaTemplateBtn = nullptr;
     QLabel* m_metaStatusLabel = nullptr;
     // read-only STREAMINFO summary at the top of the editor page
     QLabel* m_metaFormatLabel = nullptr;

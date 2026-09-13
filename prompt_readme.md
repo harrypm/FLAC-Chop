@@ -104,3 +104,67 @@ at the top of the editor page.
   confirmed on real data in the running GUI yet (per the user-interactable
   rule). Awaiting user confirmation: load a real FLAC, switch to the Metadata
   Editor tab, edit a tag, Save, and report what happens.
+
+## Follow-up prompt: Apply Template button (tagless RF files)
+
+Prompt: add an Apply Template button so files without tagging but with context
+extracted by flac-chop can apply it. Clarified scope via Q&A: populate the
+computed RF tags (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE, RF_SAMPLE_RATE_KHZ,
+DURATION_SECONDS, LENGTH) from probe context + blank ingest rows (PROJECT,
+TAPE_ID, OPERATOR, LOCATION, NOTES) for the user to fill; merge (only add
+missing keys, leave existing values); load into the editor table for review
+then Save; RF captures only.
+
+## Commands run / results
+
+1. `cd core && cargo test` (after adding rf_template_from_probe + FFI + tests)
+   - 109 core tests passed (100 + 9 new template tests); 0 failed. ffi_plan 6.
+2. `cd core && cargo build --release` — Finished; staticlib rebuilt.
+3. `nm -s target/release/libflac_chop_core.a | grep fc_rf_template` — symbol
+   fc_rf_template_from_probe present in the archive index.
+4. `cmake --build build` — Built target flac-chop; compiled mainwindow.cpp;
+   linked. No errors / no warnings.
+5. `./build/gui/flac-chop --version` → `FLAC-Chop v1.0.0-2-g842384b-dirty`.
+
+## What changed
+
+- core/src/ffi.rs: added pub fn rf_template_from_probe(&FcProbe) computing the
+  standard RF tag set from probe context. Resolves the real on-disk count:
+  vorbis/companion/scan totals are already real; a trusted STREAMINFO header
+  may be /1000 (early MISRC schema) or real (later schema) — decided by the
+  same audio-payload sanity check the probe uses (uncompressed < audio_bytes
+  && *1000 fits => scale *1000). Empty for non-RF / unknown-rate. Added
+  fc_rf_template_from_probe C ABI (takes const FcProbe*, writes the packed
+  blob, returns bytes written / 0 on error). 9 unit tests: vorbis total as-is,
+  early-schema header scaled *1000, later-schema header not scaled, unknown
+  total (rate tags only), non-RF empty, companion total is real, FFI blob
+  packing, non-RF empty blob, null-probe error.
+- gui/flacchop.h: declared fc_rf_template_from_probe.
+- gui/mainwindow.{h,cpp}: added m_metaTemplateBtn ("Apply Template") in the
+  editor button row, gated to RF FLAC only in setMetaEnabled. applyTemplate()
+  calls fc_rf_template_from_probe(&m_probe), parses the blob via the shared
+  parseCommentsBlob helper, merges each pair into the table only if the key is
+  missing (case-insensitive metaHasKey), then adds blank PROJECT/TAPE_ID/
+  OPERATOR/LOCATION/NOTES rows (only missing). Status reports rows added.
+  Refactored loadMetadata to reuse parseCommentsBlob (one parser, not two).
+
+## Critical detail verified against hard data
+
+probe.total_samples unit depends on its source (read core/src/probe.rs + the
+vorbis schema tests): vorbis/companion/scan => real on-disk count; trusted
+STREAMINFO header => /1000 count (early schema, e.g. 2165571 for a 216.557 s
+10 MSPS file) OR real count (later schema, 2165570800). A naive
+RF_TOTAL_SAMPLES = probe.total_samples would be 1000x wrong for early-schema
+tagless files. The template uses the audio-payload sanity check to detect
+/1000 units and scale *1000 (validated by the early-schema test:
+2165571 -> 2165571000). The later-schema test confirms no scaling
+(2165570800 stays). Both match what tags::rewrite_cut_tags would produce
+from STREAMINFO for a cut output.
+
+## Status / not yet validated
+
+- Core logic covered by cargo tests (incl. the schema-detection cases).
+- GUI compiles + links + runs, but Apply Template has NOT been confirmed in
+  the running GUI on real data yet. Awaiting user confirmation: load a tagless
+  RF FLAC, click Apply Template, confirm RF_TOTAL_SAMPLES / DURATION_SECONDS
+  look right, fill ingest rows, Save.

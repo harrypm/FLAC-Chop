@@ -344,9 +344,12 @@ MainWindow::MainWindow(QWidget* parent)
     metaEditRow->addWidget(m_metaUpBtn);
     metaEditRow->addWidget(m_metaDownBtn);
     metaEditRow->addStretch(1);
+    m_metaTemplateBtn = new QPushButton(tr("Apply Template"), vcBox);
+    m_metaTemplateBtn->setToolTip(tr("Fill in the standard RF tags (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE, ...) derived from the probe context, plus blank ingest rows (PROJECT, TAPE_ID, ...). Only missing keys are added — review then Save."));
     m_metaReloadBtn = new QPushButton(tr("Reload"), vcBox);
     m_metaSaveBtn = new QPushButton(tr("Save to file"), vcBox);
     m_metaSaveBtn->setToolTip(tr("Write the comments back to the source FLAC in place."));
+    metaEditRow->addWidget(m_metaTemplateBtn);
     metaEditRow->addWidget(m_metaReloadBtn);
     metaEditRow->addWidget(m_metaSaveBtn);
     vcLay->addLayout(metaEditRow);
@@ -382,6 +385,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_metaDownBtn, &QPushButton::clicked, this, &MainWindow::moveMetaRowDown);
     connect(m_metaSaveBtn, &QPushButton::clicked, this, &MainWindow::saveMetadata);
     connect(m_metaReloadBtn, &QPushButton::clicked, this, &MainWindow::reloadMetadata);
+    connect(m_metaTemplateBtn, &QPushButton::clicked, this, &MainWindow::applyTemplate);
 
     // Restore the persisted output directory (empty = "same as input").
     // If a dir was previously chosen (non-empty), auto-follow is off so it
@@ -1311,6 +1315,37 @@ static QString formatBytes(quint64 bytes)
     return QStringLiteral("%1 B").arg(bytes);
 }
 
+// Parse the little-endian comments blob (u32 LE count + per-comment u32 LE
+// len + "KEY=value" bytes) into (key, value) pairs, splitting on the first '='.
+// Returns an empty vector on a malformed blob (the caller reports an error).
+static QVector<QPair<QString, QString>> parseCommentsBlob(const QByteArray& blob)
+{
+    const uchar* p = reinterpret_cast<const uchar*>(blob.constData());
+    const uchar* end = p + blob.size();
+    auto rdU32 = [&p, end](bool& okb) -> quint32 {
+        if (p + 4 > end) { okb = false; return 0; }
+        const quint32 v = quint32(p[0]) | (quint32(p[1]) << 8)
+                         | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
+        p += 4;
+        return v;
+    };
+    bool okb = true;
+    const quint32 count = rdU32(okb);
+    QVector<QPair<QString, QString>> out;
+    out.reserve(int(count));
+    for (quint32 i = 0; i < count && okb; ++i) {
+        const quint32 len = rdU32(okb);
+        if (!okb || p + len > end) { okb = false; break; }
+        const QString kv = QString::fromUtf8(reinterpret_cast<const char*>(p), int(len));
+        p += len;
+        const int eq = kv.indexOf(QLatin1Char('='));
+        out.append({eq >= 0 ? kv.left(eq) : kv, eq >= 0 ? kv.mid(eq + 1) : QString()});
+    }
+    if (!okb)
+        return {};
+    return out;
+}
+
 void MainWindow::setMetaStreamInfo()
 {
     // Read-only STREAMINFO summary at the top of the editor page.
@@ -1355,6 +1390,8 @@ void MainWindow::setMetaEnabled(bool on)
     m_metaDownBtn->setEnabled(editable);
     m_metaReloadBtn->setEnabled(editable);
     m_metaSaveBtn->setEnabled(editable);
+    // The RF tag template is meaningful only for RF captures.
+    m_metaTemplateBtn->setEnabled(editable && m_probe.is_rf);
 }
 
 void MainWindow::loadMetadata()
@@ -1392,37 +1429,28 @@ void MainWindow::loadMetadata()
         return;
     }
 
-    // Parse the little-endian blob: u32 count, then per comment u32 len + bytes.
-    const uchar* p = reinterpret_cast<const uchar*>(blob.constData());
-    const uchar* end = p + blob.size();
-    auto rdU32 = [&p, end](bool& okb) -> quint32 {
-        if (p + 4 > end) { okb = false; return 0; }
-        const quint32 v = quint32(p[0]) | (quint32(p[1]) << 8)
-                         | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
-        p += 4;
-        return v;
-    };
-    bool okb = true;
-    const quint32 count = rdU32(okb);
-    m_metaTable->setRowCount(int(count));
-    for (quint32 i = 0; i < count && okb; ++i) {
-        const quint32 len = rdU32(okb);
-        if (!okb || p + len > end) { okb = false; break; }
-        const QString kv = QString::fromUtf8(reinterpret_cast<const char*>(p), int(len));
-        p += len;
-        const int eq = kv.indexOf(QLatin1Char('='));
-        const QString key = eq >= 0 ? kv.left(eq) : kv;
-        const QString val = eq >= 0 ? kv.mid(eq + 1) : QString();
-        m_metaTable->setItem(int(i), 0, new QTableWidgetItem(key));
-        m_metaTable->setItem(int(i), 1, new QTableWidgetItem(val));
+    // Parse the little-endian blob via the shared helper.
+    const auto pairs = parseCommentsBlob(blob);
+    if (pairs.isEmpty() && blob.size() >= 4) {
+        // A non-empty blob that parsed to zero pairs is malformed (count said
+        // there were entries but the body was truncated). A 4-byte count=0
+        // blob is legit (a tag-less file) and yields zero pairs.
+        const uchar* pp = reinterpret_cast<const uchar*>(blob.constData());
+        const quint32 declared = quint32(pp[0]) | (quint32(pp[1]) << 8)
+                                | (quint32(pp[2]) << 16) | (quint32(pp[3]) << 24);
+        if (declared != 0) {
+            m_metaTable->setRowCount(0);
+            setMetaEnabled(false);
+            m_metaStatusLabel->setText(tr("Could not read metadata: malformed comment blob."));
+            return;
+        }
     }
-    if (!okb) {
-        m_metaTable->setRowCount(0);
-        setMetaEnabled(false);
-        m_metaStatusLabel->setText(tr("Could not read metadata: malformed comment blob."));
-        return;
+    m_metaTable->setRowCount(int(pairs.size()));
+    for (int i = 0; i < pairs.size(); ++i) {
+        m_metaTable->setItem(i, 0, new QTableWidgetItem(pairs[i].first));
+        m_metaTable->setItem(i, 1, new QTableWidgetItem(pairs[i].second));
     }
-    m_metaStatusLabel->setText(tr("%1 comment(s) loaded. Edit fields, then Save to write in place.").arg(count));
+    m_metaStatusLabel->setText(tr("%1 comment(s) loaded. Edit fields, then Save to write in place.").arg(pairs.size()));
     setMetaEnabled(true);
 }
 
@@ -1548,4 +1576,80 @@ void MainWindow::moveMetaRowDown()
         m_metaTable->setItem(row + 1, col, a);
     }
     m_metaTable->setCurrentCell(row + 1, 0);
+}
+
+bool MainWindow::metaHasKey(const QString& key) const
+{
+    // Vorbis field names are case-insensitive; the editor upper-cases on save.
+    const QString up = key.trimmed().toUpper();
+    if (up.isEmpty())
+        return true; // treat blank as "present" so we never add an empty-key row
+    for (int i = 0; i < m_metaTable->rowCount(); ++i) {
+        const QTableWidgetItem* it = m_metaTable->item(i, 0);
+        if (it && it->text().trimmed().toUpper() == up)
+            return true;
+    }
+    return false;
+}
+
+void MainWindow::applyTemplate()
+{
+    // "Apply Template" — fill the editor with the standard RF tags derived
+    // from the probe context (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE,
+    // RF_SAMPLE_RATE_KHZ, DURATION_SECONDS, LENGTH) plus blank ingest rows
+    // (PROJECT, TAPE_ID, OPERATOR, LOCATION, NOTES) for the user to fill in.
+    // Only RF FLAC captures are eligible. Merge semantics: only keys that are
+    // NOT already present are added; existing values are left untouched. The
+    // rows land in the table for review — the user hits Save to write them.
+    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0 || !m_probe.is_rf)
+        return;
+    if (m_metaWatcher && m_metaWatcher->isRunning())
+        return;
+
+    QByteArray blob(4096, '\0');
+    QByteArray err(256, '\0');
+    const uintptr_t n = fc_rf_template_from_probe(&m_probe, blob.data(), blob.size(),
+                                                   err.data(), err.size());
+    if (n == 0) {
+        m_metaStatusLabel->setText(tr("Apply Template failed: %1").arg(QString::fromUtf8(err)));
+        return;
+    }
+    blob.resize(int(n));
+    const auto tmpl = parseCommentsBlob(blob);
+    // parseCommentsBlob returns empty on a malformed body OR a legit count=0
+    // blob; distinguish by re-reading the declared count.
+    if (tmpl.isEmpty() && n >= 4) {
+        const uchar* pp = reinterpret_cast<const uchar*>(blob.constData());
+        const quint32 declared = quint32(pp[0]) | (quint32(pp[1]) << 8)
+                                | (quint32(pp[2]) << 16) | (quint32(pp[3]) << 24);
+        if (declared != 0) {
+            m_metaStatusLabel->setText(tr("Apply Template failed: malformed template blob."));
+            return;
+        }
+    }
+
+    int added = 0;
+    // 1. Computed RF tags (merge: only missing keys).
+    for (const auto& kv : tmpl) {
+        if (!metaHasKey(kv.first)) {
+            const int row = m_metaTable->rowCount();
+            m_metaTable->insertRow(row);
+            m_metaTable->setItem(row, 0, new QTableWidgetItem(kv.first));
+            m_metaTable->setItem(row, 1, new QTableWidgetItem(kv.second));
+            ++added;
+        }
+    }
+    // 2. Blank ingest-metadata rows for the user to fill (merge: only missing).
+    static const char* kIngestFields[] = { "PROJECT", "TAPE_ID", "OPERATOR", "LOCATION", "NOTES" };
+    for (const char* k : kIngestFields) {
+        const QString key = QString::fromLatin1(k);
+        if (!metaHasKey(key)) {
+            const int row = m_metaTable->rowCount();
+            m_metaTable->insertRow(row);
+            m_metaTable->setItem(row, 0, new QTableWidgetItem(key));
+            m_metaTable->setItem(row, 1, new QTableWidgetItem(QString()));
+            ++added;
+        }
+    }
+    m_metaStatusLabel->setText(tr("Template applied: %1 row(s) added. Review the values, then Save to write.").arg(added));
 }

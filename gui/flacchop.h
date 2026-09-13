@@ -84,6 +84,17 @@ int fc_read_comments_blob(const char* path, char* buf, uintptr_t buf_len,
 int fc_replace_comments(const char* path, const char* const* comments,
                         uint32_t n, char* err, uintptr_t err_len);
 
+// Compute the standard RF Vorbis-tag template (RF_SAMPLE_RATE_KHZ,
+// RF_SAMPLE_RATE, RF_TOTAL_SAMPLES, DURATION_SECONDS, LENGTH) from the probe
+// context, for a tagless RF FLAC. Packs into `buf` in the same blob format as
+// fc_read_comments_blob (u32 LE count + per-comment u32 LE len + "KEY=value").
+// Returns bytes written (>= 4; a non-RF probe yields a 4-byte count=0 blob) on
+// success, 0 on error (null pointers / buffer too small — message in `err`).
+// A 4096-byte buffer is always enough. The GUI merges the pairs into the
+// editor table (only missing keys) and the user hits Save to write.
+uintptr_t fc_rf_template_from_probe(const FcProbe* probe, char* buf, uintptr_t buf_len,
+                                    char* err, uintptr_t err_len);
+
 #ifdef __cplusplus
 }
 #endif

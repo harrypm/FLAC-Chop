@@ -654,6 +654,107 @@ pub extern "C" fn fc_replace_comments(
     }
 }
 
+/// Compute the standard RF Vorbis-tag template (KEY=value pairs) from the probe
+/// context, for a tagless RF FLAC that nonetheless carries enough context for
+/// FLAC-Chop to derive the tags (STREAMINFO + filename MSPS + companion). This
+/// is the "Apply Template" path: the values the capture tool would have written
+/// but didn't.
+///
+/// Returns pairs in MISRC push order: `RF_SAMPLE_RATE_KHZ`, `RF_SAMPLE_RATE`,
+/// then (when the total is known) `RF_TOTAL_SAMPLES`, `DURATION_SECONDS`,
+/// `LENGTH`. Empty for non-RF or unknown-rate probes (the GUI gates the button
+/// to RF captures anyway).
+///
+/// The real on-disk sample count is resolved from the probe's `total_samples`:
+/// vorbis / companion / scan sources are already the real count; a trusted
+/// STREAMINFO header may be in `/1000` units (early MISRC schema, e.g.
+/// `2165571` for a 216.557 s / 10 MSPS capture) or real units (later schema,
+/// `2165570800`). We decide with the same audio-payload sanity check the probe
+/// uses for its "header total is suspect" warning: FLAC never expands, so the
+/// real count's uncompressed size must be >= the audio payload; a `/1000` count
+/// is ~1000× too small, so we scale it ×1000.
+pub fn rf_template_from_probe(p: &FcProbe) -> Vec<(String, String)> {
+    if p.is_rf == 0 || p.header_sample_rate == 0 || !(p.real_rate_hz > 0.0) {
+        return Vec::new();
+    }
+    let header_rate = p.header_sample_rate;
+    let real_rate = p.real_rate_hz;
+    let mut pairs = vec![
+        ("RF_SAMPLE_RATE_KHZ".to_string(), header_rate.to_string()),
+        ("RF_SAMPLE_RATE".to_string(), format!("{}", real_rate as u64)),
+    ];
+    if p.total_samples_known != 0 && p.total_samples > 0 {
+        // Vorbis / companion / frame-scan totals are already the real on-disk
+        // count. A trusted STREAMINFO header may be /1000 (early) or real
+        // (later) — scale only when the audio-payload check says /1000.
+        let from_real = p.total_samples_from_vorbis != 0
+            || p.total_samples_from_companion != 0
+            || p.total_samples_scanned != 0;
+        let mut real_total = p.total_samples;
+        if !from_real {
+            let bps = (p.channels as u64) * ((p.bits_per_sample as u64) / 8);
+            let audio_bytes = p.file_size.saturating_sub(p.audio_offset);
+            if bps > 0 && audio_bytes > 0 {
+                let uncompressed = p.total_samples.saturating_mul(bps);
+                // /1000-unit header: uncompressed is ~1000× too small for the
+                // payload but ×1000 covers it. Scale to the real count.
+                if uncompressed < audio_bytes && uncompressed.saturating_mul(1000) >= audio_bytes {
+                    real_total = p.total_samples.saturating_mul(1000);
+                }
+            }
+        }
+        let duration = real_total as f64 / real_rate;
+        let length_ms = (duration * 1000.0).round() as u64;
+        pairs.push(("RF_TOTAL_SAMPLES".to_string(), real_total.to_string()));
+        pairs.push(("DURATION_SECONDS".to_string(), format!("{duration:.6}")));
+        pairs.push(("LENGTH".to_string(), length_ms.to_string()));
+    }
+    pairs
+}
+
+/// Compute the RF tag template from the probe and pack it into `buf` (same blob
+/// format as [`fc_read_comments_blob`]: `u32 LE count` + per-comment `u32 LE
+/// len` + "KEY=value"). Returns the number of bytes written (`>= 4`; a non-RF
+/// probe yields a 4-byte count=0 blob) on success, `0` on error (null pointers
+/// or buffer too small — message in `err`). The template is bounded (<= 5
+/// pairs) so a 4096-byte buffer is always enough. The GUI merges the pairs into
+/// the editor table (only missing keys), adds blank ingest rows, and the user
+/// hits Save to write.
+#[no_mangle]
+pub extern "C" fn fc_rf_template_from_probe(
+    probe: *const FcProbe,
+    buf: *mut c_char,
+    buf_len: usize,
+    err: *mut c_char,
+    err_len: usize,
+) -> usize {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<usize, String> {
+        if probe.is_null() || buf.is_null() {
+            return Err("null probe or buffer".to_string());
+        }
+        let p = unsafe { &*probe };
+        let blob = pack_comments_blob(&rf_template_from_probe(p));
+        if blob.len() > buf_len {
+            return Err(format!("buffer too small: have {}, need {}", buf_len, blob.len()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(blob.as_ptr() as *const c_char, buf, blob.len());
+        }
+        Ok(blob.len())
+    }));
+    match result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            set_str_ptr(err, err_len, &e);
+            0
+        }
+        Err(payload) => {
+            set_str_ptr(err, err_len, &format!("rf template panicked: {}", panic_msg(payload)));
+            0
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,5 +1007,182 @@ mod tests {
         assert!(!got2.contains(&"OPERATOR=harry".to_string()), "removed key must be gone");
 
         let _ = std::fs::remove_file(&p);
+    }
+
+    // --- Apply Template (rf_template_from_probe) ----------------------------
+
+    fn make_probe(
+        is_rf: i32,
+        header_rate: u64,
+        real_rate: f64,
+        total: u64,
+        known: i32,
+        from_vorbis: i32,
+        from_companion: i32,
+        scanned: i32,
+        file_size: u64,
+        audio_offset: u64,
+        bits: u32,
+        channels: u32,
+    ) -> FcProbe {
+        let mut p = FcProbe::default();
+        p.ok = 1;
+        p.is_rf = is_rf;
+        p.header_sample_rate = header_rate;
+        p.real_rate_hz = real_rate;
+        p.total_samples = total;
+        p.total_samples_known = known;
+        p.total_samples_from_vorbis = from_vorbis;
+        p.total_samples_from_companion = from_companion;
+        p.total_samples_scanned = scanned;
+        p.file_size = file_size;
+        p.audio_offset = audio_offset;
+        p.bits_per_sample = bits;
+        p.channels = channels;
+        p
+    }
+
+    fn template_map(p: &FcProbe) -> std::collections::HashMap<String, String> {
+        rf_template_from_probe(p).into_iter().collect()
+    }
+
+    #[test]
+    fn rf_template_vorbis_total_used_as_is() {
+        // 10 MSPS HiFi: vorbis RF_TOTAL_SAMPLES = 2,165,570,800 (already the
+        // real on-disk count). Template must use it without scaling.
+        let p = make_probe(
+            1, 10000, 10_000_000.0, 2_165_570_800, 1, 1, 0, 0,
+            972_426_305, 100, 8, 1,
+        );
+        let m = template_map(&p);
+        assert_eq!(m["RF_SAMPLE_RATE_KHZ"], "10000");
+        assert_eq!(m["RF_SAMPLE_RATE"], "10000000");
+        assert_eq!(m["RF_TOTAL_SAMPLES"], "2165570800");
+        assert_eq!(m["DURATION_SECONDS"], "216.557080");
+        assert_eq!(m["LENGTH"], "216557");
+    }
+
+    #[test]
+    fn rf_template_early_schema_header_scaled_x1000() {
+        // Tagless early-schema RF: STREAMINFO = 2,165,571 (/1000 count). The
+        // audio-payload sanity check (uncompressed < audio_bytes, *1000 fits)
+        // detects /1000 units and scales to the real count.
+        let p = make_probe(
+            1, 10000, 10_000_000.0, 2_165_571, 1, 0, 0, 0,
+            972_426_305, 100, 8, 1,
+        );
+        let m = template_map(&p);
+        assert_eq!(m["RF_TOTAL_SAMPLES"], "2165571000", "early-schema header must be *1000");
+        assert_eq!(m["DURATION_SECONDS"], "216.557100");
+        assert_eq!(m["LENGTH"], "216557");
+    }
+
+    #[test]
+    fn rf_template_later_schema_header_not_scaled() {
+        // Tagless later-schema RF: STREAMINFO = 2,165,570,800 (real count). The
+        // uncompressed size already exceeds the audio payload → no scaling.
+        let p = make_probe(
+            1, 10000, 10_000_000.0, 2_165_570_800, 1, 0, 0, 0,
+            972_426_305, 100, 8, 1,
+        );
+        let m = template_map(&p);
+        assert_eq!(m["RF_TOTAL_SAMPLES"], "2165570800", "later-schema header must not scale");
+        assert_eq!(m["DURATION_SECONDS"], "216.557080");
+    }
+
+    #[test]
+    fn rf_template_unknown_total_only_rate_tags() {
+        // Unfinalized capture, no companion, no scan: total unknown → only the
+        // two rate tags (the rate is still known from the header / filename).
+        let p = make_probe(1, 10000, 10_000_000.0, 0, 0, 0, 0, 0, 1000, 100, 8, 1);
+        let pairs = rf_template_from_probe(&p);
+        assert_eq!(pairs.len(), 2, "only KHZ + RATE when total unknown");
+        assert!(pairs.iter().any(|(k, _)| k == "RF_SAMPLE_RATE_KHZ"));
+        assert!(pairs.iter().any(|(k, _)| k == "RF_SAMPLE_RATE"));
+        assert!(!pairs.iter().any(|(k, _)| k == "RF_TOTAL_SAMPLES"));
+        assert!(!pairs.iter().any(|(k, _)| k == "DURATION_SECONDS"));
+        assert!(!pairs.iter().any(|(k, _)| k == "LENGTH"));
+    }
+
+    #[test]
+    fn rf_template_non_rf_is_empty() {
+        // The RF tag schema is for RF captures — a 48 kHz stereo audio file
+        // yields no template (the GUI gates the button to RF only).
+        let p = make_probe(0, 48000, 48000.0, 1000, 1, 0, 0, 0, 1000, 100, 16, 2);
+        assert!(rf_template_from_probe(&p).is_empty());
+    }
+
+    #[test]
+    fn rf_template_companion_total_is_real() {
+        // Companion-derived total = duration * real_rate = real count; no
+        // /1000 scaling applies (from_companion path).
+        let p = make_probe(
+            1, 20000, 20_000_000.0, 8_807_960_000, 1, 0, 1, 0,
+            40_000_000_000, 200, 8, 1,
+        );
+        let m = template_map(&p);
+        assert_eq!(m["RF_TOTAL_SAMPLES"], "8807960000");
+        assert_eq!(m["RF_SAMPLE_RATE_KHZ"], "20000");
+        assert_eq!(m["RF_SAMPLE_RATE"], "20000000");
+        assert_eq!(m["DURATION_SECONDS"], "440.398000");
+    }
+
+    #[test]
+    fn fc_rf_template_from_probe_packs_blob() {
+        let p = make_probe(
+            1, 10000, 10_000_000.0, 2_165_570_800, 1, 1, 0, 0,
+            972_426_305, 100, 8, 1,
+        );
+        let mut buf = [0 as c_char; 4096];
+        let mut err = [0 as c_char; 128];
+        let n = fc_rf_template_from_probe(
+            &p as *const FcProbe,
+            buf.as_mut_ptr(),
+            buf.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert!(n > 0, "{}", cbuf_to_string(&err));
+        // Parse the blob and check it carries the expected pairs.
+        let entries = parse_blob(&buf[..n]);
+        assert!(entries.iter().any(|e| e == "RF_SAMPLE_RATE_KHZ=10000"), "{:?}", entries);
+        assert!(entries.iter().any(|e| e == "RF_SAMPLE_RATE=10000000"));
+        assert!(entries.iter().any(|e| e == "RF_TOTAL_SAMPLES=2165570800"));
+        assert!(entries.iter().any(|e| e == "DURATION_SECONDS=216.557080"));
+        assert!(entries.iter().any(|e| e == "LENGTH=216557"));
+    }
+
+    #[test]
+    fn fc_rf_template_from_probe_non_rf_yields_empty_blob() {
+        // Non-RF → empty template → the blob is just the 4-byte count=0
+        // header (still a valid blob, not an error).
+        let p = make_probe(0, 48000, 48000.0, 1000, 1, 0, 0, 0, 1000, 100, 16, 2);
+        let mut buf = [0 as c_char; 4096];
+        let mut err = [0 as c_char; 128];
+        let n = fc_rf_template_from_probe(
+            &p as *const FcProbe,
+            buf.as_mut_ptr(),
+            buf.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(n, 4, "empty template packs to a 4-byte count=0 blob");
+        let entries = parse_blob(&buf[..n]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn fc_rf_template_from_probe_null_probe_is_zero() {
+        let mut buf = [0 as c_char; 4096];
+        let mut err = [0 as c_char; 128];
+        let n = fc_rf_template_from_probe(
+            std::ptr::null(),
+            buf.as_mut_ptr(),
+            buf.len(),
+            err.as_mut_ptr(),
+            err.len(),
+        );
+        assert_eq!(n, 0);
+        assert!(err[0] != 0, "an error message must be written");
     }
 }
