@@ -66,9 +66,9 @@ If you build FLAC-Chop from source, SoX still needs to be available on PATH
 - Optional output processing modes for RF captures: keep source rate, or
   downsample to 10 (HiFi FM) / 16 / 20 / 24 / 28.6 MSPS, with wiki-aligned
   basic SoX sinc filter presets.
-- Bit-depth control (keep source, 8-bit, or 6-bit crush emulation stored in an
-  8-bit FLAC container; no dither — pure requantization for maximum
-  compression efficiency and SNR).
+- Bit-depth control (keep source, 8-bit, true **12-bit FLAC** output, or 6-bit
+  crush emulation stored in an 8-bit FLAC container; no dither — pure
+  requantization for maximum compression efficiency and SNR).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 - Self-healing FLAC headers: when a capture's STREAMINFO `total_samples` was
   never finalized (some MISRC HiFi writers store the real count / 1000), the
@@ -117,6 +117,76 @@ cargo run --release --manifest-path core/Cargo.toml --example chop_convert_cli -
 The CLIs run the exact same probe → plan → SoX path as the GUI and accept the
 same input formats. Headerless raw inputs must carry the rate in their name
 (e.g. `..._8-bit_20msps.u8`).
+
+## Command-line usage
+
+The main binary doubles as a full headless CLI (no window opens for any
+non-GUI argument form). It reuses the exact FFI path the GUI uses, so it
+doubles as a smoke/automation harness for the whole cut pipeline.
+
+```
+flac-chop <in> <out.flac|dir> <start> <len>
+          [--units samples|seconds] [--rate 10000|16000|20000|24000|28600]
+          [--bits 8|12|6] [--no-filter]
+flac-chop --probe <in> [--json]
+flac-chop --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
+flac-chop --version
+```
+
+- `<in>`: FLAC (`.flac`/`.ldf`/`fLaC` magic), PCM WAV, or headerless raw PCM
+  (`.u8`/`.u16`/`.s8`/`.s16`; raw needs an `<n>msps` filename hint).
+- `<out>`: a full `.flac` output path OR a directory. A directory gets a
+  renamed stem reflecting the chosen rate/bits (MISRC convention:
+  `<base>_<B>-bit_<N>msps`, e.g. `tape_8-bit_20msps` cut to 16 MSPS 6-bit
+  becomes `tape_6-bit_16msps-cut.flac`), with `-2`, `-3`, … clobber avoidance.
+- `<start>`/`<len>`: real seconds (default) or exact sample counts with
+  `--units samples`. Seconds mode is unchanged from earlier releases
+  (back-compat). Samples mode takes **exact integer real RF sample counts** —
+  the same units as vhs-decode metadata `fileLoc` — passed 1:1 to the cutter
+  and clamped to the probed end of the file exactly like second-derived
+  counts.
+- `--rate <kHz>`: output header rate (the /1000 MSPS convention values:
+  10000/16000/20000/24000/28600). With `--no-filter` the wiki-aligned basic
+  sinc profile is skipped; by default it is applied to the matching preset.
+- `--bits`: `8`, `12` (true 12-bit FLAC output — see below), or `6` (6-bit
+  grid in an 8-bit container, no dither). Omit to keep the source precision.
+- `--probe <in> [--json]`: prints the probe report; `--json` emits stable
+  snake_case JSON covering every probe field (including `warnings` as an
+  array, `format`, `is_rf`, `msps`) — stable for scripting/automation.
+- `--gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]`:
+  launches the GUI pre-loaded with `<file>` and the IN/OUT markers set from
+  `--in`/`--out` (interpreted per `--units`). A bare positional file
+  (`flac-chop file.flac`) opens the GUI pre-loaded the same way.
+
+Exit codes: `0` = ok, `1` = pipeline error (reason on stderr), `2` = usage
+error.
+
+### True 12-bit FLAC output
+
+`--bits 12` writes a **true 12-bit FLAC** — STREAMINFO `bits_per_sample = 12`,
+signed samples on the [-2048, 2047] grid — per the MISRC/HdSDAOH capture
+standard. No command-line encoder can produce this (the `flac` CLI rejects
+`--bps 12`, SoX warns it "can't encode to 12-bit", and ffmpeg silently
+upgrades to 24-bit), so FLAC-Chop encodes the 12-bit stream itself: the cut
+runs through SoX into a 16-bit temp FLAC (12-bit samples left-justified ×16),
+then a second pass decodes it sample-exactly, shifts every sample back onto
+the 12-bit grid (`>>4`), and writes the true 12-bit FLAC. A 12-bit → 12-bit
+cut round-trips **sample-exact**, validated against the `claxon` decoder, the
+reference `flac` CLI decoder, and ffprobe in the test suite.
+
+Two SoX 12-bit limitations the pipeline works around (they are properties of
+SoX, not of the files):
+
+- **SoX cannot READ true 12-bit FLAC at all** (`sox_precision` only accepts
+  byte-aligned bit depths: 8/16/24/32 — verified on SoX 14.4.2 with
+  libFLAC-written 12-bit files). A 12-bit source is therefore fed to SoX as a
+  raw signed 16-bit stream on stdin (decoded with claxon, left-justified ×16 —
+  byte-for-byte what SoX would have read from the equivalent 16-bit FLAC),
+  so every cut of a 12-bit capture (the main MISRC case) works: to 12/16/8/6
+  bits and/or any rate conversion.
+- A plain trim of a 12-bit source (no conversion requested, "keep source
+  precision") skips SoX entirely and runs decode → trim → re-encode in Rust,
+  since SoX can neither read nor write 12-bit FLAC.
 
 ## Status & Limitations
 

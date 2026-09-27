@@ -5,6 +5,8 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <limits>
+
 #include "flacchop.h"
 
 class QLabel;
@@ -30,6 +32,16 @@ class MainWindow : public QMainWindow {
 
 public:
     explicit MainWindow(QWidget* parent = nullptr);
+
+    // CLI --gui pre-load (MISRC-GUI style): open `file` and, once its probe
+    // finishes, set the IN/OUT markers from `inPos`/`outPos`. Positions are
+    // interpreted per `unitsSamples` (true = exact real RF sample counts,
+    // converted to seconds via the probed real rate; false = real seconds).
+    // NaN means "position not given" (keep the default full-tape marker).
+    // An empty `file` opens nothing (the GUI stays as-is). Reuses the exact
+    // load/probe/Set-IN/OUT machinery — no separate code path.
+    void loadFileAndMarkers(const QString& file, double inPos, double outPos,
+                            bool unitsSamples);
 
 protected:
     void dragEnterEvent(QDragEnterEvent* e) override;
@@ -165,6 +177,12 @@ private:
     // true while a re-probe triggered by a metadata save is in flight — then
     // the Chop page's IN/OUT markers are clamped (not reset to the full tape).
     bool m_probeIsRefresh = false;
+
+    // CLI --gui pre-load request, stashed by loadFileAndMarkers and applied
+    // when the fresh-load probe finishes (onProbeFinished). NaN = not given.
+    double m_pendingInPos = std::numeric_limits<double>::quiet_NaN();
+    double m_pendingOutPos = std::numeric_limits<double>::quiet_NaN();
+    bool m_pendingUnitsSamples = false; // --units samples|seconds for the pending positions
 };
 
 #endif // FLACCHOP_MAINWINDOW_H

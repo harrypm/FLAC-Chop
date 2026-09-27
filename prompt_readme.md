@@ -168,3 +168,84 @@ from STREAMINFO for a cut output.
   the running GUI on real data yet. Awaiting user confirmation: load a tagless
   RF FLAC, click Apply Template, confirm RF_TOTAL_SAMPLES / DURATION_SECONDS
   look right, fill ingest rows, Save.
+
+# Prompt log — 2026-09-27
+
+Prompt: continue active work — CLI/GUI feature branch (A1–A6): create the
+12-bit round-trip integration tests, validate the full 12-bit pipeline,
+README CLI section, GUI build + CLI smoke, then commit/push.
+
+## Commands run / results
+
+1. `git status` — branch feature/cli-gui-loading; modified core/src/{chop,lib}.rs,
+   gui/main.cpp, gui/mainwindow.{h,cpp}; untracked core/src/enc12.rs.
+2. Created core/tests/roundtrip12.rs (9 integration tests: 12→12 sample-exact,
+   12→16 ×16, 16→12 >>4, pure-trim true-12-bit default cut, full-length
+   regression, flac -t, flac -d WAV cross-check, RF tag rewrite, 16-bit default).
+3. `cargo test` — first run: 5 roundtrip12 failures. Root-caused each with
+   hard data:
+   - **SoX cannot READ true 12-bit FLAC at all.** A/B: built a libFLAC C-API
+     reference 12-bit encoder (ref12.c, the MISRC method) — `sox ref12.flac -n
+     stat` fails identically to our enc12 output: "data encoding or sample
+     size was not specified". Root cause in SoX source formats.c
+     `sox_precision()`: FLAC precision only for byte-aligned bps (8/16/24/32).
+     `flac -t`/`-d`/metaflac/ffprobe/claxon all accept both files.
+   - **Pipeline consequence:** `--bits 12` cuts FROM 12-bit sources (the main
+     MISRC case) fed the unreadable file to SoX pass 1 → every such cut failed.
+   - Probe schema bug: non-RF audio files carrying numeric RF tags (written by
+     our own cut-tag rewrite) were misread as early-schema (×1000 → 4,000,000
+     instead of 4,000, is_rf flipped true).
+4. Fixes in core/src/chop.rs:
+   - `run_sox_child` gained an optional stdin feeder (writer thread; feed
+     errors fail the cut instead of masking as EOF; cancellation kills the
+     child and the writer gets EPIPE).
+   - 12-bit FLAC sources with conversions: SoX gets the cut as raw s16 on
+     stdin (`-t s16 -r <header_rate> -c <ch> -`) — claxon decode, ×16
+     left-justified (byte-identical to the equivalent 16-bit FLAC). All
+     conversions (12/16/8/6-bit, rate, sinc) work from that stream.
+   - Plain trims of 12-bit sources (no conversion) skip SoX entirely:
+     `chop_12bit_source_pure` = claxon decode → trim → enc12 ("keep source
+     precision" must yield true 12-bit, which SoX cannot write).
+   - static-sox backend: 12-bit FLAC inputs rejected with a clear message
+     (libSoX has the same limitation).
+5. Fixes in core/src/probe.rs: RF tag schema logic (and the payload sanity
+   checks) gated on is_rf — genuine RF files never carry audio-rate headers,
+   so the header classification wins and non-RF cuts keep exact counts.
+   Sanity-2 uncompressed estimate now uses the exact bit depth (12-bit = 1.5
+   B/sample; integer division rounded to 1 and false-tripped the /1000
+   rescale). Verified the later-schema semantics against the actual MISRC-GUI
+   writer (gui_record.c `gui_record_finalize_flac_metadata`):
+   RF_TOTAL_SAMPLES = the raw on-disk encoder count, STREAMINFO patched to
+   /1000 kHz-domain — the probe's as-is later-schema handling was already
+   correct and stays.
+6. Fix in core/src/enc12.rs: STREAMINFO min=max=4096 (canonical fixed-
+   blocksize; a min<max made `flac -t` warn "sample or frame number does not
+   increase correctly").
+7. `cargo test` — all green: 112 core + 6 ffi_plan + 9 roundtrip12.
+8. `cmake --build build` — GUI rebuilt against the updated core (release
+   staticlib). No errors.
+9. CLI smoke on real fixtures (/tmp/fc_smoke): --version; --probe text+JSON
+   (stable snake_case, all fields); cuts in seconds mode, --units samples
+   mode (identical windows), 16→12 (--bits 12), full-length 12-bit source cut
+   (stdin feed), pure-trim 12-bit keep-precision. ffprobe verified every
+   output (s16 (12 bit) / bits_per_raw_sample=12 where expected).
+   - **BUG FOUND by smoke:** full-length 12-bit source cut produced 8192 of
+     10000 samples — the stdin feeder returned on end-of-stream BEFORE
+     flushing the final partial 4096-sample batch. The integration tests
+     missed it (windows never reached the stream tail). Fixed (flush before
+     EOF) + regression test `twelve_bit_source_full_length_conversion_keeps_every_sample`.
+   - Rebuilt + rerun: 10000/10000 samples, no trim warning.
+10. readme.md: added "Command-line usage" section (all commands, units
+    semantics, exit codes, probe JSON, --gui pre-load) + "True 12-bit FLAC
+    output" section documenting the SoX read/write limitations and the
+    stdin-feed workaround. enc12 module docs note the same.
+
+## Status / not yet validated
+
+- Core: all tests green; 12-bit pipeline validated sample-exact via claxon,
+  flac -t, flac -d→WAV, ffprobe.
+- CLI smoke: all paths green on synthetic fixtures (16-bit 48 kHz + true
+  12-bit). NOT yet validated on a real multi-GB MISRC capture in this session.
+- GUI: builds + links; --gui pre-load and the 12-bit selector have NOT been
+  confirmed interactively in the running GUI (per the user-interactable rule)
+  — awaiting user confirmation.

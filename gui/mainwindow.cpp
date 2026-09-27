@@ -239,6 +239,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_outputBitsCombo = new QComboBox(outBox);
     m_outputBitsCombo->addItem(tr("Keep source bit-depth"), uint(0));
     m_outputBitsCombo->addItem(tr("8-bit"), uint(8));
+    m_outputBitsCombo->addItem(tr("12-bit (MISRC true 12-bit FLAC)"), uint(12));
     m_outputBitsCombo->addItem(tr("6-bit crush (stored as 8-bit FLAC)"), uint(6));
     m_outputBitsCombo->setEnabled(false);
     m_basicFilterCheck = new QCheckBox(tr("Apply basic RF filter profile"), outBox);
@@ -608,6 +609,23 @@ void MainWindow::loadFile(const QString& fn)
     startProbe();
 }
 
+void MainWindow::loadFileAndMarkers(const QString& file, double inPos, double outPos,
+                                    bool unitsSamples)
+{
+    // CLI --gui pre-load. Stash the requested IN/OUT positions; they are
+    // applied when the fresh-load probe finishes (onProbeFinished), where the
+    // real rate is known for the --units samples conversion. An empty file is
+    // a no-op (the GUI opens as today); the stash is never touched by a
+    // normal Browse/drop (loadFile), so a --gui with no file cannot leak
+    // markers onto a later user load.
+    if (file.isEmpty())
+        return;
+    m_pendingInPos = inPos;
+    m_pendingOutPos = outPos;
+    m_pendingUnitsSamples = unitsSamples;
+    loadFile(file);
+}
+
 void MainWindow::startProbe()
 {
     // Run the probe off the GUI thread. For files with an unknown STREAMINFO
@@ -709,6 +727,36 @@ void MainWindow::onProbeFinished()
     } else {
         m_inSec = 0.0;
         m_outSec = 0.0;
+    }
+    // CLI --gui pre-load: override the default full-tape markers with the
+    // requested --in/--out positions (converted from real RF samples via the
+    // probed real rate when --units samples was used). Only on a fresh load —
+    // never on a metadata-save refresh. Mirrors the Set IN/OUT clamping rules
+    // (>= 0, within the tape, >= 0.1 s span).
+    if (!refresh
+        && (!std::isnan(m_pendingInPos) || !std::isnan(m_pendingOutPos))) {
+        const double rate = m_probe.real_rate_hz;
+        const bool unitsSamples = m_pendingUnitsSamples;
+        auto toSec = [unitsSamples, rate](double pos) {
+            return unitsSamples ? pos / rate : pos;
+        };
+        double inS = std::isnan(m_pendingInPos) ? 0.0 : qMax(0.0, toSec(m_pendingInPos));
+        double outS = std::isnan(m_pendingOutPos) ? m_totalSec : qMax(0.0, toSec(m_pendingOutPos));
+        if (m_totalSec > 0.0) {
+            inS = qMin(inS, m_totalSec);
+            outS = qMin(outS, m_totalSec);
+        }
+        if (outS - inS < 0.1) {
+            outS = inS + 0.1; // keep the 0.1 s minimum span
+            if (m_totalSec > 0.0 && outS > m_totalSec) {
+                inS = qMax(0.0, m_totalSec - 0.1);
+                outS = m_totalSec;
+            }
+        }
+        m_inSec = inS;
+        m_outSec = outS;
+        m_pendingInPos = std::numeric_limits<double>::quiet_NaN();
+        m_pendingOutPos = std::numeric_limits<double>::quiet_NaN();
     }
     m_slider->setEnabled(m_sliderMaxDs > 0);
     m_slider->setRange(0, m_sliderMaxDs);

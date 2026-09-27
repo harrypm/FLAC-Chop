@@ -5,9 +5,14 @@
 #include <QSize>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
+#include <QJsonValue>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include "mainwindow.h"
 #include "flacchop.h"
 
@@ -40,6 +45,88 @@ static void applyDarkFusion(QApplication& app)
     app.setPalette(d);
 }
 
+// --- GUI launch forms ------------------------------------------------------
+// Two argument forms launch the GUI instead of the headless CLI:
+//   flac-chop --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
+//   flac-chop <file>                        (a single positional file arg)
+// The GUI opens with the file loaded and the IN/OUT markers set from --in/--out
+// (positions in real seconds, or exact real RF samples with --units samples —
+// the same units as vhs-decode metadata fileLoc). No window opens for any
+// other argument form (the headless CLI below handles those).
+struct GuiLaunch {
+    QString file;               // may be empty (plain --gui)
+    double inPos = std::numeric_limits<double>::quiet_NaN();  // --in  (NaN = not given)
+    double outPos = std::numeric_limits<double>::quiet_NaN(); // --out (NaN = not given)
+    bool unitsSamples = false;  // --units samples|seconds (default seconds)
+};
+
+// Parse the --gui argument list (args[1] == "--gui", scan from args[2]).
+// Returns false (with a message on stderr) on a usage error.
+static bool parseGuiArgs(const QStringList& args, GuiLaunch& gl)
+{
+    for (int i = 2; i < args.size(); ++i) {
+        const QString a = args[i];
+        if (a == QStringLiteral("--in") && i + 1 < args.size()) {
+            bool ok = false;
+            gl.inPos = args[++i].toDouble(&ok);
+            if (!ok || gl.inPos < 0.0) {
+                std::fprintf(stderr, "--in must be a non-negative number\n");
+                return false;
+            }
+        } else if (a == QStringLiteral("--out") && i + 1 < args.size()) {
+            bool ok = false;
+            gl.outPos = args[++i].toDouble(&ok);
+            if (!ok || gl.outPos < 0.0) {
+                std::fprintf(stderr, "--out must be a non-negative number\n");
+                return false;
+            }
+        } else if (a == QStringLiteral("--units") && i + 1 < args.size()) {
+            const QString u = args[++i];
+            if (u == QStringLiteral("samples")) {
+                gl.unitsSamples = true;
+            } else if (u == QStringLiteral("seconds")) {
+                gl.unitsSamples = false;
+            } else {
+                std::fprintf(stderr, "--units must be 'samples' or 'seconds'\n");
+                return false;
+            }
+        } else if (!a.startsWith(QLatin1String("--")) && gl.file.isEmpty()) {
+            gl.file = a;
+        } else {
+            std::fprintf(stderr, "unknown arg: %s\n", qPrintable(a));
+            return false;
+        }
+    }
+    return true;
+}
+
+// Decide what a given argument vector means:
+//   0 = run the headless CLI (runCli)
+//   1 = launch the GUI (gl holds the pre-load request when activateGui)
+//   2 = usage error (message already printed)
+// activateGui is set when the caller must pass the launch to MainWindow::
+// loadFileAndMarkers (an empty file = plain GUI).
+static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activateGui)
+{
+    activateGui = false;
+    if (args.size() == 1)
+        return 1; // no args: the GUI as today
+    // --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
+    if (args[1] == QStringLiteral("--gui")) {
+        if (!parseGuiArgs(args, gl))
+            return 2;
+        activateGui = true;
+        return 1;
+    }
+    // A single positional argument that is not a flag: a file to pre-load.
+    if (args.size() == 2 && !args[1].startsWith(QLatin1String("--"))) {
+        gl.file = args[1];
+        activateGui = true;
+        return 1;
+    }
+    return 0;
+}
+
 // --- CLI mode -------------------------------------------------------------
 // When the binary is run with arguments, run headless (no QApplication / GUI):
 // probe -> plan -> SoX chop -> rename + RF tag rewrite, printing a concise
@@ -47,10 +134,11 @@ static void applyDarkFusion(QApplication& app)
 // smoke/automation harness for the whole cut pipeline on real RF captures.
 //
 // Usage:
-//   flac-chop <in> <out.flac|outDir> <start_sec> <len_sec>
-//            [--rate 10000|16000|20000|24000|28600] [--bits 8|6]
-//            [--no-filter]
-//   flac-chop --probe <in>
+//   flac-chop <in> <out.flac|outDir> <start> <len>
+//            [--units samples|seconds] [--rate 10000|16000|20000|24000|28600]
+//            [--bits 8|12|6] [--no-filter]
+//   flac-chop --probe <in> [--json]
+//   flac-chop --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
 //   flac-chop --version
 //
 // Inputs: FLAC (.flac/.ldf + fLaC-magic files), PCM WAV, and headerless raw
@@ -60,19 +148,74 @@ static void applyDarkFusion(QApplication& app)
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).
 // With no args, the GUI launches as normal.
+// --- probe output -----------------------------------------------------------
+
+// Print the probe result as JSON with stable snake_case keys covering every
+// FcProbe field. QJsonObject sorts keys alphabetically, so the output order is
+// stable too. Works for a failed probe as well (ok=false + error). Returns the
+// process exit code (0 = probed ok, 1 = probe failed).
+static int printProbeJson(const FcProbe& p)
+{
+    static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16" };
+    QJsonObject o;
+    o.insert(QStringLiteral("ok"), p.ok != 0);
+    o.insert(QStringLiteral("error"), QString::fromUtf8(p.error));
+    o.insert(QStringLiteral("format"), QString::fromLatin1(p.format <= 5 ? kFmtNames[p.format] : "?"));
+    o.insert(QStringLiteral("format_code"), int(p.format));
+    o.insert(QStringLiteral("header_sample_rate"), double(p.header_sample_rate));
+    o.insert(QStringLiteral("declared_total_samples"), double(p.declared_total_samples));
+    o.insert(QStringLiteral("total_samples"), double(p.total_samples));
+    o.insert(QStringLiteral("total_samples_known"), p.total_samples_known != 0);
+    o.insert(QStringLiteral("total_samples_wraps"), int(p.total_samples_wraps));
+    o.insert(QStringLiteral("total_samples_estimated"), p.total_samples_estimated != 0);
+    o.insert(QStringLiteral("total_samples_scanned"), p.total_samples_scanned != 0);
+    o.insert(QStringLiteral("total_samples_from_companion"), p.total_samples_from_companion != 0);
+    o.insert(QStringLiteral("total_samples_from_vorbis"), p.total_samples_from_vorbis != 0);
+    o.insert(QStringLiteral("rate_from_vorbis"), p.rate_from_vorbis != 0);
+    o.insert(QStringLiteral("bits_per_sample"), int(p.bits_per_sample));
+    o.insert(QStringLiteral("channels"), int(p.channels));
+    o.insert(QStringLiteral("file_size"), double(p.file_size));
+    o.insert(QStringLiteral("audio_offset"), double(p.audio_offset));
+    o.insert(QStringLiteral("real_rate_hz"), double(p.real_rate_hz));
+    o.insert(QStringLiteral("is_rf"), p.is_rf != 0);
+    o.insert(QStringLiteral("msps"), double(p.msps));
+    o.insert(QStringLiteral("msps_known"), p.msps_known != 0);
+    // The probe packs diagnostics "; "-joined; expose them as a JSON array.
+    QJsonArray warnings;
+    const QString w = QString::fromUtf8(p.warnings);
+    if (!w.isEmpty()) {
+        for (const QString& part : w.split(QStringLiteral("; "), Qt::SkipEmptyParts))
+            warnings.append(part.trimmed());
+    }
+    o.insert(QStringLiteral("warnings"), warnings);
+    std::printf("%s\n",
+                QJsonDocument(o).toJson(QJsonDocument::Indented).constData());
+    return p.ok ? 0 : 1;
+}
+
 static int runCli(int argc, char* argv[])
 {
+    Q_UNUSED(argc);
+    Q_UNUSED(argv);
     const QStringList args = QCoreApplication::arguments();
     // --version
     if (args.size() == 2 && args[1] == QStringLiteral("--version")) {
         std::printf("FLAC-Chop %s\n", FLAC_CHOP_VERSION);
         return 0;
     }
-    // --probe <file>
-    if (args.size() == 3 && args[1] == QStringLiteral("--probe")) {
+    // --probe <file> [--json]
+    if (args.size() >= 3 && args[1] == QStringLiteral("--probe")) {
+        bool json = false;
+        for (int i = 3; i < args.size(); ++i) {
+            if (args[i] == QStringLiteral("--json"))
+                json = true;
+            else { std::fprintf(stderr, "unknown arg: %s\n", qPrintable(args[i])); return 2; }
+        }
         FcProbe p{};
         const QByteArray pb = args[2].toUtf8();
         fc_probe(pb.constData(), &p);
+        if (json)
+            return printProbeJson(p);
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
         static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16" };
         std::printf("ok                 : true\n");
@@ -92,31 +235,81 @@ static int runCli(int argc, char* argv[])
     if (args.size() >= 5 && args[1] != QStringLiteral("--help") && args[1] != QStringLiteral("-h")) {
         const QString inPath = args[1];
         QString outArg = args[2];
-        bool ok1 = false, ok2 = false;
-        const double startSec = args[3].toDouble(&ok1);
-        const double lenSec = args[4].toDouble(&ok2);
-        if (!ok1 || !ok2) { std::fprintf(stderr, "start_sec/len_sec not numbers\n"); return 2; }
-        // optional flags
+        // optional flags — pre-scanned first so --units governs how the
+        // positional start/len are parsed.
         quint64 outRateHz = 0; uint outBits = 0; bool basicFilter = true;
+        bool samplesUnits = false; // default: seconds (back-compat)
         for (int i = 5; i < args.size(); ++i) {
             if (args[i] == QStringLiteral("--rate") && i + 1 < args.size())
                 outRateHz = args[++i].toULongLong();
-            else if (args[i] == QStringLiteral("--bits") && i + 1 < args.size())
+            else if (args[i] == QStringLiteral("--bits") && i + 1 < args.size()) {
                 outBits = args[++i].toUInt();
+                if (outBits != 8 && outBits != 12 && outBits != 6) {
+                    std::fprintf(stderr, "--bits must be 8, 12, or 6\n");
+                    return 2;
+                }
+            }
+            else if (args[i] == QStringLiteral("--units") && i + 1 < args.size()) {
+                const QString u = args[++i];
+                if (u == QStringLiteral("samples")) {
+                    samplesUnits = true;
+                } else if (u == QStringLiteral("seconds")) {
+                    samplesUnits = false;
+                } else {
+                    std::fprintf(stderr, "--units must be 'samples' or 'seconds'\n");
+                    return 2;
+                }
+            }
             else if (args[i] == QStringLiteral("--no-filter"))
                 basicFilter = false;
             else { std::fprintf(stderr, "unknown arg: %s\n", qPrintable(args[i])); return 2; }
+        }
+        // Positional start/len: exact integer real RF samples in --units
+        // samples mode, real seconds otherwise (default, back-compat).
+        bool ok1 = false, ok2 = false;
+        quint64 startSamp = 0, lenSamp = 0;
+        double startSec = 0.0, lenSec = 0.0;
+        if (samplesUnits) {
+            startSamp = args[3].toULongLong(&ok1);
+            lenSamp = args[4].toULongLong(&ok2);
+            if (!ok1 || !ok2) {
+                std::fprintf(stderr, "start/len must be non-negative integer sample counts in --units samples mode\n");
+                return 2;
+            }
+        } else {
+            startSec = args[3].toDouble(&ok1);
+            lenSec = args[4].toDouble(&ok2);
+            if (!ok1 || !ok2) { std::fprintf(stderr, "start/len not numbers (seconds, or integer samples with --units samples)\n"); return 2; }
         }
         // probe
         FcProbe p{};
         const QByteArray inB = inPath.toUtf8();
         fc_probe(inB.constData(), &p);
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
-        // plan with STREAMINFO values (SoX reads at the on-disk rate)
+        // plan. In samples mode start/len are exact real RF sample counts —
+        // the same units as vhs-decode metadata fileLoc (real RF sample
+        // index) — passed 1:1 to fc_chop, clamped to the probed total exactly
+        // like fc_plan clamps second-derived counts. In seconds mode fc_plan
+        // computes the counts from the real rate.
         FcPlan plan{};
-        fc_plan(startSec, lenSec, p.real_rate_hz,
-                p.total_samples, p.total_samples_known, &plan);
-        if (!plan.ok) { std::fprintf(stderr, "plan error: %s\n", plan.error); return 1; }
+        if (samplesUnits) {
+            if (p.total_samples_known && startSamp >= p.total_samples) {
+                std::fprintf(stderr, "plan error: start is at or past the end of the file\n");
+                return 1;
+            }
+            if (lenSamp == 0) { std::fprintf(stderr, "length must be > 0\n"); return 2; }
+            if (p.total_samples_known && lenSamp > p.total_samples - startSamp)
+                lenSamp = p.total_samples - startSamp; // clamp to the file end
+            plan.ok = 1;
+            plan.start_samples = startSamp;
+            plan.length_samples = lenSamp;
+            plan.end_sample = startSamp + lenSamp;
+            plan.real_sample_rate_hz = p.real_rate_hz;
+        } else {
+            fc_plan(startSec, lenSec, p.real_rate_hz,
+                    p.total_samples, p.total_samples_known, &plan);
+            if (!plan.ok) { std::fprintf(stderr, "plan error: %s\n", plan.error); return 1; }
+        }
         // resolve output path: if outArg is a dir (or doesn't end in .flac),
         // generate via fc_generate_output_path with a renamed stem.
         QString outPath;
@@ -143,9 +336,10 @@ static int runCli(int argc, char* argv[])
         } else {
             outPath = outArg;
         }
-        std::printf("plan: start=%llu len=%llu samples (header_rate %llu Hz, is_rf=%d) -> %s\n",
+        std::printf("plan: start=%llu len=%llu samples%s (header_rate %llu Hz, is_rf=%d) -> %s\n",
                      (unsigned long long)plan.start_samples,
                      (unsigned long long)plan.length_samples,
+                     samplesUnits ? QStringLiteral(" (exact, --units samples)").toUtf8().constData() : "",
                      (unsigned long long)p.header_sample_rate, p.is_rf, qPrintable(outPath));
         // chop (blocking) — reuses the GUI's fc_chop (tag rewrite + rename)
         FcChopResult r{};
@@ -165,13 +359,24 @@ static int runCli(int argc, char* argv[])
     // --help / -h / unknown
     std::printf(
         "FLAC-Chop %s — sample-exact RF FLAC cutter\n\n"
-        "GUI:   flac-chop                  (no args -> launch the GUI)\n\n"
-        "CLI:\n"
-        "  flac-chop <in.flac> <out.flac|dir> <start_sec> <len_sec>\
+        "GUI:   flac-chop                  (no args -> launch the GUI)\n"
+        "       flac-chop <file>           (launch the GUI with <file> loaded)\n"
+        "       flac-chop --gui [<file>] [--in <pos>] [--out <pos>]\
 "
-        "          [--rate 10000|16000|20000|24000|28600] [--bits 8|6] [--no-filter]\n"
-        "  flac-chop --probe <in.flac>\n"
-        "  flac-chop --version\n",
+        "                 [--units samples|seconds]\n\n"
+        "CLI:\n"
+        "  flac-chop <in.flac> <out.flac|dir> <start> <len>\
+"
+        "          [--units samples|seconds] [--rate 10000|16000|20000|24000|28600]\n"
+        "          [--bits 8|12|6] [--no-filter]\n"
+        "  flac-chop --probe <in.flac> [--json]\n"
+        "  flac-chop --version\n\n"
+        "Units: --units seconds (default) takes start/len as real seconds;\
+"
+        "       --units samples takes them as exact real RF sample counts (the\
+"
+        "       same units as vhs-decode metadata fileLoc).\n\n"
+        "Exit codes: 0 = ok, 1 = pipeline error (reason on stderr), 2 = usage error.\n",
         FLAC_CHOP_VERSION);
     return args.size() == 1 ? 0 : 2;
 }
@@ -183,10 +388,23 @@ int main(int argc, char* argv[])
     // Matches ld-analyse's qunsetenv approach.
     qunsetenv("QT_STYLE_OVERRIDE");
 
-    // CLI mode: if any args are present, run headless via QCoreApplication
-    // (no GUI). This makes the binary scriptable + automatable and gives a
-    // fast smoke path for the whole cut pipeline on real RF captures.
-    if (argc > 1) {
+    // Launch routing (see detectLaunchMode):
+    //   no args, --gui [...], or a single positional <file> -> the GUI
+    //   (with the file/markers pre-loaded when given);
+    //   anything else -> the headless CLI (runCli) via QCoreApplication.
+    QStringList rawArgs;
+    rawArgs.reserve(argc);
+    for (int i = 0; i < argc; ++i)
+        rawArgs << QString::fromLocal8Bit(argv[i]);
+    GuiLaunch gui;
+    bool activateGui = false;
+    const int mode = detectLaunchMode(rawArgs, gui, activateGui);
+    if (mode == 2)
+        return 2; // --gui usage error (message already on stderr)
+    if (mode == 0) {
+        // CLI mode: run headless via QCoreApplication (no GUI). This makes
+        // the binary scriptable + automatable and gives a fast smoke path
+        // for the whole cut pipeline on real RF captures.
         QCoreApplication cliApp(argc, argv);
         cliApp.setApplicationName(QStringLiteral("FLAC-Chop"));
         cliApp.setApplicationVersion(QStringLiteral(FLAC_CHOP_VERSION));
@@ -225,6 +443,8 @@ int main(int argc, char* argv[])
     MainWindow w;
     w.setWindowIcon(appIcon);
     w.show();
+    if (activateGui && !gui.file.isEmpty())
+        w.loadFileAndMarkers(gui.file, gui.inPos, gui.outPos, gui.unitsSamples);
 
     return app.exec();
 }
