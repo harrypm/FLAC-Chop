@@ -249,3 +249,52 @@ README CLI section, GUI build + CLI smoke, then commit/push.
 - GUI: builds + links; --gui pre-load and the 12-bit selector have NOT been
   confirmed interactively in the running GUI (per the user-interactable rule)
   — awaiting user confirmation.
+
+## Session 2026-09-28 ~04:30 UTC — GUI pre-load verified + Apply Template bug fix
+
+1. GUI pre-load interactively CONFIRMED by user (instance: `flac-chop --gui
+   /tmp/fc_smoke/src16.flac --in 0.25 --out 1.5`): file loads with correct
+   metadata; IN=0.25 / OUT=1.5 markers set.
+2. **BUG REPORTED by user:** "Apply Template button does not load a template
+   with a file loaded in."
+3. Root cause (hard data):
+   - `probe_cli /tmp/fc_smoke/src16.flac` → `is_rf=false` (no RF tags on the
+     fixture; real_rate 48000 = header rate).
+   - `gui/mainwindow.cpp` `setMetaEnabled()`: template button gated
+     `editable && m_probe.is_rf` → disabled (grey) for non-RF FLAC.
+   - `applyTemplate()` silently returned for non-RF; core
+     `rf_template_non_rf_is_empty` test documents non-RF → empty RF tag set
+     (deliberate: RF totals for 48 kHz audio would be nonsense).
+4. Fix in `gui/mainwindow.cpp` (no core change):
+   - Template button now enabled for ANY loaded FLAC (`setEnabled(editable)`).
+   - `applyTemplate()` gate now only needs a loaded FLAC; non-RF files get
+     the 5 blank ingest rows (PROJECT/TAPE_ID/OPERATOR/LOCATION/NOTES); RF
+     captures additionally get the computed RF tags as before.
+   - Visible status on gate failure ("Apply Template needs a loaded FLAC
+     file.") and on zero additions ("all standard tags already present").
+   - Tooltip updated to say RF tags are for RF captures, ingest rows for any
+     FLAC.
+5. `cmake --build /home/harry/FLAC-Chop/build --target flac-chop` — OK.
+6. GUI restarted with the fixed binary, same pre-load args (new PID 1112518).
+   AWAITING user interactive confirmation of Apply Template on src16.flac
+   (expect: button enabled, click adds 5 ingest rows, status message shown).
+7. 10:30 UTC: relaunched GUI for testing (user request): `flac-chop --gui
+   /tmp/fc_smoke/src16.flac --in 0.25 --out 1.5` — PID 3063197, fixed binary
+   (built 04:32). Awaiting interactive Apply Template confirmation.
+8. 10:32 UTC: Apply Template fix CONFIRMED working by user ("yes it adds
+   fine"). Restore-point zip created per user rule:
+   /home/harry/FLAC-Chop-restore-points/flac-chop_12bit-apply-template-fix_2026-09-28.zip
+   (git HEAD archive + working-tree key files incl. the fix).
+9. NEW FEATURE (user request): "addable fields box to add fields like tape
+   speed and tape format etc." Implemented in Metadata Editor:
+   - New row under the buttons: "Add field:" + editable QComboBox with
+     presets TAPE_SPEED, TAPE_FORMAT, MACHINE, DATE_RECORDED, CONDITION,
+     SOURCE (free text allowed) + "Add Field" button. Enter in the box also
+     adds.
+   - Typed spaces become underscores; name upper-cased; validated
+     ^[A-Za-z0-9_]+$; duplicate names reported, not re-added. Inserts a blank
+     row focused for value entry; only Save writes the file.
+   - Enabled/disabled with the rest of the editor (loaded FLAC only).
+   Files: gui/mainwindow.cpp, gui/mainwindow.h. Build OK (10:33).
+10. 10:33 UTC: GUI restarted with the feature build, same pre-load args
+   (PID 3072777). Awaiting interactive user confirmation.

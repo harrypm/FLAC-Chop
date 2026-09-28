@@ -67,6 +67,7 @@ private slots:
     void saveMetadata();
     void reloadMetadata();
     void applyTemplate();
+    void addFieldFromBox();
     void onMetaSaveFinished();
 
 private:
@@ -153,6 +154,8 @@ private:
     QPushButton* m_metaSaveBtn = nullptr;
     QPushButton* m_metaReloadBtn = nullptr;
     QPushButton* m_metaTemplateBtn = nullptr;
+    QComboBox* m_metaFieldCombo = nullptr;   // quick-add field name box (presets + free text)
+    QPushButton* m_metaAddFieldBtn = nullptr;
     QLabel* m_metaStatusLabel = nullptr;
     // read-only STREAMINFO summary at the top of the editor page
     QLabel* m_metaFormatLabel = nullptr;
