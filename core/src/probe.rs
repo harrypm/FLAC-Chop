@@ -900,38 +900,54 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
     // other source. The tags are self-consistent by construction:
     //   RF_TOTAL_SAMPLES / RF_SAMPLE_RATE = DURATION_SECONDS
     //
-    // The pipeline has used two tag schemas:
+    // The pipeline has used two tag schemas (both self-consistent:
+    // RF_TOTAL_SAMPLES / RF_SAMPLE_RATE = DURATION_SECONDS — in BOTH schemas
+    // the tag pair is (count at the tag's rate, the tag's rate)):
     //  - EARLY: RF_SAMPLE_RATE holds the /1000 kHz header value (20000), and
-    //    RF_TOTAL_SAMPLES is therefore a count at that rate — i.e. the on-disk
-    //    sample count divided by 1000. (A 4403.98 s capture at 20 MSPS holds
-    //    ~88e9 samples on disk; the tag says 88,079,600.)
-    //  - LATER: RF_SAMPLE_RATE holds the real Hz value (20000000, with
+    //    RF_TOTAL_SAMPLES is a count at that rate — the on-disk count / 1000.
+    //    (A 4403.98 s capture at 20 MSPS holds ~88e9 samples on disk; the tag
+    //    says 88,079,600.) On-disk = tag × 1000.
+    //  - LATER (current MISRC-GUI writer, gui_record_finalize_flac_metadata):
+    //    RF_SAMPLE_RATE holds the real Hz value (20000000, with
     //    RF_SAMPLE_RATE_KHZ carrying the /1000 value) and RF_TOTAL_SAMPLES is
-    //    the true on-disk count.
+    //    the true on-disk count (the writer's `total_samples` is the raw
+    //    encoder count: duration = total/(rate_hz*1000); STREAMINFO is patched
+    //    to the /1000 kHz-domain count). Used as-is.
     //
     // Everything downstream (the GUI duration, `fc_plan`, and SoX's `trim Ns`,
-    // which counts ACTUAL on-disk samples) works in on-disk units at the real
-    // rate, so early-schema values must be rescaled by 1000 — otherwise a cut
-    // planned from them lands 1000× short. Schema detection: an RF_SAMPLE_RATE
+    // which counts ACTUAL on-disk samples) works in on-disk units, so
+    // early-schema tag values must be rescaled by 1000 — otherwise cuts
+    // planned from them land 1000× short. Schema detection: an RF_SAMPLE_RATE
     // below 1 MHz cannot be a real RF rate, so it is the /1000 kHz value.
     let rf_tags = crate::vorbis::rf_tags_from_reader(&reader);
 
     let msps_hint = crate::msps::extract_msps(&path.to_string_lossy());
-    let (mut real_rate, mut is_rf) = resolve_real_rate(r.header_sample_rate, msps_hint);
-    // Scale applied to vorbis tag values to convert them to on-disk units.
+    let (mut real_rate, is_rf) = resolve_real_rate(r.header_sample_rate, msps_hint);
+    // Conversion applied to the RF_TOTAL_SAMPLES tag to get the on-disk count.
     let mut vorbis_scale: u64 = 1;
-    if let Some(tag_sr) = rf_tags.sample_rate {
-        if tag_sr > 0 {
-            if tag_sr < 1_000_000 {
-                // Early schema: tag values are in /1000 (kHz) units.
-                vorbis_scale = 1000;
-                real_rate = tag_sr as f64 * 1000.0;
-            } else {
-                // Later schema: the tag is already the real Hz rate.
-                real_rate = tag_sr as f64;
+    // The schema logic only applies to RF files: a standard-audio-rate header
+    // (44.1k/48k/…) is NOT a /1000 kHz value, so RF_SAMPLE_RATE=48000 on a cut
+    // of a 48 kHz source (the cut-tag rewrite writes real-Hz tags on non-RF
+    // files, later schema) must not be re-scaled ×1000 — that would corrupt
+    // the sample count 1000× and wrongly flip the file to RF. Genuine RF
+    // captures never carry an audio-rate header (20/40 kHz are not in
+    // AUDIO_RATES), so gating on the header classification is safe.
+    if is_rf {
+        if let Some(tag_sr) = rf_tags.sample_rate {
+            if tag_sr > 0 {
+                if tag_sr < 1_000_000 {
+                    // Early schema: RF_TOTAL_SAMPLES is a count at the kHz
+                    // header rate (on-disk / 1000).
+                    vorbis_scale = 1000;
+                    real_rate = tag_sr as f64 * 1000.0;
+                } else {
+                    // Later schema: RF_TOTAL_SAMPLES is already the on-disk
+                    // count (the MISRC-GUI writer stores the raw encoder
+                    // count and patches STREAMINFO to the kHz domain).
+                    real_rate = tag_sr as f64;
+                }
+                r.rate_from_vorbis = true;
             }
-            is_rf = true;
-            r.rate_from_vorbis = true;
         }
     }
     r.real_rate_hz = real_rate;
@@ -944,34 +960,50 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
     r.total_samples_known = known;
 
     // --- Total sample count resolution (priority order) ---
-    // 1. Vorbis `RF_TOTAL_SAMPLES` tag — authoritative, in-file, exact.
+    // 1. Vorbis `RF_TOTAL_SAMPLES` tag — authoritative, in-file, exact (RF
+    //    files only). The tag schema is RF-only: on a non-RF audio file the
+    //    tags are our own cut-rewrite's real-Hz records (same count the
+    //    header already carries), and the payload sanity checks would
+    //    falsely trip on verbatim content, where FLAC's per-frame overhead
+    //    makes the payload slightly LARGER than the raw sample size.
     // 2. STREAMINFO header (+ 36-bit wrap correction) — finalized files.
     // 3. Companion .log/.wav — unfinalized files with a sibling.
     // 4. Frame-header scan — unfinalized files with no sibling (slow).
-    // Raw tag values, and the same values scaled to on-disk units (×1000 for
-    // the early /1000 schema, ×1 for the later real-Hz schema).
+    // Raw tag values converted to the on-disk count (×1000 for the early
+    // /1000 schema; the later schema's tag is already the on-disk count).
+    let audio_bytes = if file_size > audio_offset {
+        file_size - audio_offset
+    } else {
+        0
+    };
+    // Uncompressed-payload estimate per sample uses the exact bit depth
+    // (12-bit = 1.5 bytes/sample — integer division would round to 1 and
+    // falsely trip the "too small" rescale for every 12-bit capture).
+    let bits_per_sample_all = u128::from(si.channels) * u128::from(si.bits_per_sample);
     let mut vorbis_total: Option<u64> = None;
-    if let Some(ts) = rf_tags.total_samples {
-        if ts > 0 {
-            vorbis_total = Some(ts.saturating_mul(vorbis_scale));
+    if is_rf {
+        if let Some(ts) = rf_tags.total_samples {
+            if ts > 0 {
+                vorbis_total = Some(ts.saturating_mul(vorbis_scale));
+            }
         }
-    }
-    // Sanity 1: the tags' own math is RF_TOTAL_SAMPLES / RF_SAMPLE_RATE =
-    // DURATION_SECONDS (both raw, so the check is schema-independent). Verify
-    // they agree; warn if not, but still trust the integer total.
-    if let (Some(ts), Some(tag_sr), Some(dur)) =
-        (rf_tags.total_samples, rf_tags.sample_rate, rf_tags.duration_seconds)
-    {
-        if tag_sr > 0 && ts > 0 {
-            let implied = ts as f64 / tag_sr as f64;
-            if (implied - dur).abs() > 1.0 {
-                add_warning(
-                    r,
-                    &format!(
-                        "vorbis RF_TOTAL_SAMPLES={} / RF_SAMPLE_RATE={} = {:.3}s but DURATION_SECONDS={}; mismatch",
-                        ts, tag_sr, implied, dur
-                    ),
-                );
+        // Sanity 1: the tags' own math is RF_TOTAL_SAMPLES / RF_SAMPLE_RATE =
+        // DURATION_SECONDS (both raw, so the check is schema-independent).
+        // Verify they agree; warn if not, but still trust the integer total.
+        if let (Some(ts), Some(tag_sr), Some(dur)) =
+            (rf_tags.total_samples, rf_tags.sample_rate, rf_tags.duration_seconds)
+        {
+            if tag_sr > 0 && ts > 0 {
+                let implied = ts as f64 / tag_sr as f64;
+                if (implied - dur).abs() > 1.0 {
+                    add_warning(
+                        r,
+                        &format!(
+                            "vorbis RF_TOTAL_SAMPLES={} / RF_SAMPLE_RATE={} = {:.3}s but DURATION_SECONDS={}; mismatch",
+                            ts, tag_sr, implied, dur
+                        ),
+                    );
+                }
             }
         }
     }
@@ -981,15 +1013,9 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
     // in /1000 units despite the schema detection — rescale and warn. A total
     // that fails it outright is unusable — drop it and fall through to the
     // header / companion / scan sources.
-    let audio_bytes = if file_size > audio_offset {
-        file_size - audio_offset
-    } else {
-        0
-    };
-    let bytes_per_sample = u64::from(si.channels) * (u64::from(si.bits_per_sample) / 8);
     if let Some(ts) = vorbis_total {
-        if audio_bytes > 0 && bytes_per_sample > 0 {
-            let uncompressed = (ts as u128) * (bytes_per_sample as u128);
+        if audio_bytes > 0 && bits_per_sample_all > 0 {
+            let uncompressed = (ts as u128) * bits_per_sample_all / 8;
             if uncompressed < audio_bytes as u128 {
                 if uncompressed * 1000 >= audio_bytes as u128 {
                     add_warning(

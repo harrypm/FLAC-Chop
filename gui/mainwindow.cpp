@@ -239,6 +239,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_outputBitsCombo = new QComboBox(outBox);
     m_outputBitsCombo->addItem(tr("Keep source bit-depth"), uint(0));
     m_outputBitsCombo->addItem(tr("8-bit"), uint(8));
+    m_outputBitsCombo->addItem(tr("12-bit (MISRC true 12-bit FLAC)"), uint(12));
     m_outputBitsCombo->addItem(tr("6-bit crush (stored as 8-bit FLAC)"), uint(6));
     m_outputBitsCombo->setEnabled(false);
     m_basicFilterCheck = new QCheckBox(tr("Apply basic RF filter profile"), outBox);
@@ -345,7 +346,7 @@ MainWindow::MainWindow(QWidget* parent)
     metaEditRow->addWidget(m_metaDownBtn);
     metaEditRow->addStretch(1);
     m_metaTemplateBtn = new QPushButton(tr("Apply Template"), vcBox);
-    m_metaTemplateBtn->setToolTip(tr("Fill in the standard RF tags (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE, ...) derived from the probe context, plus blank ingest rows (PROJECT, TAPE_ID, ...). Only missing keys are added — review then Save."));
+    m_metaTemplateBtn->setToolTip(tr("Fill in the standard RF tags (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE, ...) derived from the probe context for RF captures, plus blank ingest rows (PROJECT, TAPE_ID, ...) for any FLAC. Only missing keys are added — review then Save."));
     m_metaReloadBtn = new QPushButton(tr("Reload"), vcBox);
     m_metaSaveBtn = new QPushButton(tr("Save to file"), vcBox);
     m_metaSaveBtn->setToolTip(tr("Write the comments back to the source FLAC in place."));
@@ -353,6 +354,25 @@ MainWindow::MainWindow(QWidget* parent)
     metaEditRow->addWidget(m_metaReloadBtn);
     metaEditRow->addWidget(m_metaSaveBtn);
     vcLay->addLayout(metaEditRow);
+
+    // Quick-add field row: an editable combo of common ingest presets (or
+    // type any custom name) + "Add Field" inserts a blank row into the table.
+    // Typed spaces become underscores; names are upper-cased and validated.
+    auto* addFieldRow = new QHBoxLayout();
+    auto* addFieldLbl = new QLabel(tr("Add field:"), vcBox);
+    m_metaFieldCombo = new QComboBox(vcBox);
+    m_metaFieldCombo->setEditable(true);
+    m_metaFieldCombo->setInsertPolicy(QComboBox::NoInsert);
+    for (const char* preset : { "TAPE_SPEED", "TAPE_FORMAT", "MACHINE",
+                                "DATE_RECORDED", "CONDITION", "SOURCE" })
+        m_metaFieldCombo->addItem(QString::fromLatin1(preset));
+    m_metaFieldCombo->setToolTip(tr("Pick a common field (TAPE_SPEED, TAPE_FORMAT, MACHINE, DATE_RECORDED, CONDITION, SOURCE) or type any name — spaces become underscores. Click Add Field (or press Enter) to insert a blank row."));
+    m_metaAddFieldBtn = new QPushButton(tr("Add Field"), vcBox);
+    m_metaAddFieldBtn->setToolTip(tr("Insert a blank row with this field name."));
+    addFieldRow->addWidget(addFieldLbl);
+    addFieldRow->addWidget(m_metaFieldCombo, 1);
+    addFieldRow->addWidget(m_metaAddFieldBtn);
+    vcLay->addLayout(addFieldRow);
 
     m_metaStatusLabel = new QLabel(tr("Load a FLAC file to edit its metadata."), vcBox);
     m_metaStatusLabel->setWordWrap(true);
@@ -386,6 +406,9 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_metaSaveBtn, &QPushButton::clicked, this, &MainWindow::saveMetadata);
     connect(m_metaReloadBtn, &QPushButton::clicked, this, &MainWindow::reloadMetadata);
     connect(m_metaTemplateBtn, &QPushButton::clicked, this, &MainWindow::applyTemplate);
+    connect(m_metaAddFieldBtn, &QPushButton::clicked, this, &MainWindow::addFieldFromBox);
+    connect(m_metaFieldCombo->lineEdit(), &QLineEdit::returnPressed,
+            this, &MainWindow::addFieldFromBox);
 
     // Restore the persisted output directory (empty = "same as input").
     // If a dir was previously chosen (non-empty), auto-follow is off so it
@@ -608,6 +631,23 @@ void MainWindow::loadFile(const QString& fn)
     startProbe();
 }
 
+void MainWindow::loadFileAndMarkers(const QString& file, double inPos, double outPos,
+                                    bool unitsSamples)
+{
+    // CLI --gui pre-load. Stash the requested IN/OUT positions; they are
+    // applied when the fresh-load probe finishes (onProbeFinished), where the
+    // real rate is known for the --units samples conversion. An empty file is
+    // a no-op (the GUI opens as today); the stash is never touched by a
+    // normal Browse/drop (loadFile), so a --gui with no file cannot leak
+    // markers onto a later user load.
+    if (file.isEmpty())
+        return;
+    m_pendingInPos = inPos;
+    m_pendingOutPos = outPos;
+    m_pendingUnitsSamples = unitsSamples;
+    loadFile(file);
+}
+
 void MainWindow::startProbe()
 {
     // Run the probe off the GUI thread. For files with an unknown STREAMINFO
@@ -709,6 +749,36 @@ void MainWindow::onProbeFinished()
     } else {
         m_inSec = 0.0;
         m_outSec = 0.0;
+    }
+    // CLI --gui pre-load: override the default full-tape markers with the
+    // requested --in/--out positions (converted from real RF samples via the
+    // probed real rate when --units samples was used). Only on a fresh load —
+    // never on a metadata-save refresh. Mirrors the Set IN/OUT clamping rules
+    // (>= 0, within the tape, >= 0.1 s span).
+    if (!refresh
+        && (!std::isnan(m_pendingInPos) || !std::isnan(m_pendingOutPos))) {
+        const double rate = m_probe.real_rate_hz;
+        const bool unitsSamples = m_pendingUnitsSamples;
+        auto toSec = [unitsSamples, rate](double pos) {
+            return unitsSamples ? pos / rate : pos;
+        };
+        double inS = std::isnan(m_pendingInPos) ? 0.0 : qMax(0.0, toSec(m_pendingInPos));
+        double outS = std::isnan(m_pendingOutPos) ? m_totalSec : qMax(0.0, toSec(m_pendingOutPos));
+        if (m_totalSec > 0.0) {
+            inS = qMin(inS, m_totalSec);
+            outS = qMin(outS, m_totalSec);
+        }
+        if (outS - inS < 0.1) {
+            outS = inS + 0.1; // keep the 0.1 s minimum span
+            if (m_totalSec > 0.0 && outS > m_totalSec) {
+                inS = qMax(0.0, m_totalSec - 0.1);
+                outS = m_totalSec;
+            }
+        }
+        m_inSec = inS;
+        m_outSec = outS;
+        m_pendingInPos = std::numeric_limits<double>::quiet_NaN();
+        m_pendingOutPos = std::numeric_limits<double>::quiet_NaN();
     }
     m_slider->setEnabled(m_sliderMaxDs > 0);
     m_slider->setRange(0, m_sliderMaxDs);
@@ -1390,8 +1460,12 @@ void MainWindow::setMetaEnabled(bool on)
     m_metaDownBtn->setEnabled(editable);
     m_metaReloadBtn->setEnabled(editable);
     m_metaSaveBtn->setEnabled(editable);
-    // The RF tag template is meaningful only for RF captures.
-    m_metaTemplateBtn->setEnabled(editable && m_probe.is_rf);
+    // The blank ingest rows are useful for any FLAC; the RF rate/total tags
+    // only apply to RF captures (the template core yields none for non-RF),
+    // so the button stays enabled for every loaded FLAC.
+    m_metaTemplateBtn->setEnabled(editable);
+    m_metaFieldCombo->setEnabled(editable);
+    m_metaAddFieldBtn->setEnabled(editable);
 }
 
 void MainWindow::loadMetadata()
@@ -1598,11 +1672,15 @@ void MainWindow::applyTemplate()
     // from the probe context (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE,
     // RF_SAMPLE_RATE_KHZ, DURATION_SECONDS, LENGTH) plus blank ingest rows
     // (PROJECT, TAPE_ID, OPERATOR, LOCATION, NOTES) for the user to fill in.
-    // Only RF FLAC captures are eligible. Merge semantics: only keys that are
-    // NOT already present are added; existing values are left untouched. The
-    // rows land in the table for review — the user hits Save to write them.
-    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0 || !m_probe.is_rf)
+    // Any loaded FLAC is eligible; RF rate/total tags are only produced for
+    // RF captures (the template core yields none for non-RF files). Merge
+    // semantics: only keys that are NOT already present are added; existing
+    // values are left untouched. The rows land in the table for review — the
+    // user hits Save to write them.
+    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0) {
+        m_metaStatusLabel->setText(tr("Apply Template needs a loaded FLAC file."));
         return;
+    }
     if (m_metaWatcher && m_metaWatcher->isRunning())
         return;
 
@@ -1651,5 +1729,45 @@ void MainWindow::applyTemplate()
             ++added;
         }
     }
-    m_metaStatusLabel->setText(tr("Template applied: %1 row(s) added. Review the values, then Save to write.").arg(added));
+    if (added == 0)
+        m_metaStatusLabel->setText(tr("Template: all standard tags already present — nothing added."));
+    else
+        m_metaStatusLabel->setText(tr("Template applied: %1 row(s) added. Review the values, then Save to write.").arg(added));
+}
+
+void MainWindow::addFieldFromBox()
+{
+    // "Add Field" — insert a blank row with the name picked/typed in the
+    // quick-add box. Whitespace becomes underscores, the name is upper-cased
+    // and validated (editor convention: letters, digits, _). A name already
+    // in the table is reported instead of duplicated; the row is only saved
+    // to the file when the user hits Save.
+    if (!m_metaFieldCombo->isEnabled())
+        return;
+    QString key = m_metaFieldCombo->currentText().trimmed();
+    key.replace(QLatin1Char(' '), QLatin1Char('_'));
+    key = key.toUpper();
+    if (key.isEmpty()) {
+        m_metaStatusLabel->setText(tr("Add Field: type a field name first."));
+        return;
+    }
+    static const QRegularExpression valid(QStringLiteral("^[A-Za-z0-9_]+$"));
+    if (!valid.match(key).hasMatch()) {
+        m_metaStatusLabel->setText(tr("Add Field: \"%1\" is not a valid field name (use letters, digits, _).").arg(key));
+        return;
+    }
+    if (metaHasKey(key)) {
+        m_metaStatusLabel->setText(tr("Add Field: %1 already present — nothing added.").arg(key));
+        return;
+    }
+    const int row = m_metaTable->rowCount();
+    m_metaTable->insertRow(row);
+    m_metaTable->setItem(row, 0, new QTableWidgetItem(key));
+    m_metaTable->setItem(row, 1, new QTableWidgetItem(QString()));
+    m_metaTable->setCurrentCell(row, 0);
+    m_metaTable->editItem(m_metaTable->item(row, 1));
+    m_metaStatusLabel->setText(tr("Add Field: %1 row added — fill the value, then Save to write.").arg(key));
+    // Consume the picked/typed name so the box is ready for the next field.
+    m_metaFieldCombo->setCurrentIndex(-1);
+    m_metaFieldCombo->lineEdit()->clear();
 }

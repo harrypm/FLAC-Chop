@@ -13,6 +13,7 @@
 
 pub mod chop;
 pub mod companions;
+pub mod enc12;
 pub mod ffi;
 pub mod msps;
 pub mod probe;

@@ -183,6 +183,24 @@ fn rf_filter_cutoff_khz(output_rate_hz: u64) -> Option<u32> {
     }
 }
 
+/// Detect a true 12-bit FLAC source: returns the FLAC header (rate, channels)
+/// when the input is a FLAC whose STREAMINFO declares 12 bits. Such files
+/// cannot be read by SoX/libSoX at all (non-byte-aligned bit depth — see the
+/// note in `chop_with_options`), so every cut of one must come from a claxon
+/// decode instead. Shared by both backends (the static-sox backend uses it
+/// only to reject the input with a clear message).
+fn twelve_bit_flac_source(fmt: InputFormat, in_path: &str) -> Option<(u32, u32)> {
+    if fmt != InputFormat::Flac {
+        return None;
+    }
+    let p = probe::probe(Path::new(in_path));
+    if p.ok && p.bits_per_sample == 12 && p.header_sample_rate > 0 && p.channels > 0 {
+        Some((p.header_sample_rate as u32, p.channels as u32))
+    } else {
+        None
+    }
+}
+
 /// Outcome of a SoX cut.
 pub struct ChopResult {
     pub ok: bool,
@@ -244,7 +262,16 @@ mod shelldet {
 
 #[cfg(not(feature = "static-sox"))]
 /// Spawn a sox command and poll it until exit (supporting cancellation).
-fn run_sox_child(mut cmd: Command) -> Result<(std::process::ExitStatus, String), ChopResult> {
+/// `feed` (when Some) is moved to a writer thread that pumps the child's
+/// stdin — used for true 12-bit FLAC sources, which SoX cannot read as files
+/// (see the note in `chop_with_options`); the stream is fed as raw s16.
+fn run_sox_child(
+    mut cmd: Command,
+    feed: Option<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>>,
+) -> Result<(std::process::ExitStatus, String), ChopResult> {
+    if feed.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
     CANCEL.store(false, Ordering::Relaxed);
@@ -259,6 +286,25 @@ fn run_sox_child(mut cmd: Command) -> Result<(std::process::ExitStatus, String),
             })
         }
     };
+
+    // Feed stdin from a writer thread (when requested). A feed error is
+    // captured and turned into a cut failure after the child exits — an early
+    // drop of the stdin pipe would otherwise look like a normal EOF to sox and
+    // silently mask the truncation.
+    let feed_err = feed.map(|mut f| {
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let slot2 = slot.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = f(&mut stdin) {
+                if let Ok(mut s) = slot2.lock() {
+                    *s = Some(e);
+                }
+            }
+            // stdin dropped here → clean EOF for sox
+        });
+        slot
+    });
 
     // Poll try_wait (non-blocking) so a cancel request can kill sox without
     // waiting for the whole (potentially long) cut to finish. Checked every
@@ -292,7 +338,67 @@ fn run_sox_child(mut cmd: Command) -> Result<(std::process::ExitStatus, String),
     if let Some(mut se) = child.stderr.take() {
         let _ = se.read_to_string(&mut stderr);
     }
+    // A failed feed means the audio stream was cut short: fail the cut even
+    // though sox itself exited cleanly on the (early) EOF.
+    if let Some(slot) = feed_err {
+        if let Ok(mut s) = slot.lock() {
+            if let Some(e) = s.take() {
+                return Err(ChopResult { ok: false, exit_code: -1, stderr: e });
+            }
+        }
+    }
     Ok((status, stderr))
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Build the stdin feeder for a true 12-bit FLAC source: streams the decoded
+/// samples (claxon), left-justified ×16 into 16-bit little-endian — byte-for-
+/// byte what SoX would have read from the equivalent 16-bit FLAC. Works for
+/// any channel count (claxon yields interleaved samples).
+fn make_12bit_s16_feed(
+    in_path: &str,
+) -> Result<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>, String> {
+    // The reader is opened inside the closure (which runs on the stdin writer
+    // thread) so its borrow lives with the closure, not this function.
+    let in_path = in_path.to_string();
+    Ok(Box::new(move |stdin: &mut std::process::ChildStdin| {
+        use std::io::Write;
+        let mut reader = claxon::FlacReader::open(&in_path)
+            .map_err(|e| format!("12-bit FLAC source is unreadable: {e}"))?;
+        let mut samples = reader.samples();
+        let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        loop {
+            buf.clear();
+            for _ in 0..4096 {
+                match samples.next() {
+                    Some(Ok(v)) => {
+                        if !(-2048..=2047).contains(&v) {
+                            return Err(format!("12-bit source sample {v} outside [-2048, 2047]"));
+                        }
+                        // Left-justify the 12-bit value into the 16-bit
+                        // container (the exact inverse of the >>4 re-encode).
+                        buf.extend_from_slice(&((v * 16) as i16).to_le_bytes());
+                    }
+                    Some(Err(e)) => return Err(format!("12-bit FLAC source decode failed: {e}")),
+                    None => {
+                        // End of stream: flush the partial batch BEFORE the
+                        // EOF, or the final partial FLAC frame's samples are
+                        // silently dropped (a full-length cut would come up
+                        // short by up to BLOCK_SIZE-1 samples).
+                        if !buf.is_empty() {
+                            stdin
+                                .write_all(&buf)
+                                .map_err(|e| format!("12-bit source: sox stdin write failed: {e}"))?;
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+            stdin
+                .write_all(&buf)
+                .map_err(|e| format!("12-bit source: sox stdin write failed: {e}"))?;
+        }
+    }))
 }
 
 #[cfg(not(feature = "static-sox"))]
@@ -324,16 +430,85 @@ pub fn chop_with_options(
         Ok(f) => f,
         Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
     };
-    let in_args = match sox_input_args(in_fmt, in_path, &opts) {
-        Ok(a) => a,
-        Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
-    };
     let si_note = maybe_repair_streaminfo(in_fmt, in_path);
 
+    // Pure-Rust path for plain trims of true 12-bit FLAC sources: with no
+    // conversion requested, `output_bits: None` means "keep source precision"
+    // — a true 12-bit FLAC, which SoX cannot write either. Decode → trim →
+    // re-encode entirely in Rust (claxon + [`crate::enc12`]), sample-exact by
+    // construction. Anything else (bit-depth/rate conversion) goes through the
+    // SoX stdin-feed path below, which handles all conversions from the ×16
+    // s16 stream.
+    if let Some((_rate, _ch)) = twelve_bit_flac_source(in_fmt, in_path) {
+        if opts.output_bits.is_none() && opts.output_rate_hz.is_none() {
+            let mut r = chop_12bit_source_pure(
+                in_path,
+                out_path,
+                start_samples,
+                length_samples,
+                opts.is_rf,
+            );
+            if !si_note.is_empty() {
+                r.stderr = if r.stderr.is_empty() {
+                    si_note
+                } else {
+                    format!("{si_note}\n{}", r.stderr)
+                };
+            }
+            return r;
+        }
+    }
+    // True 12-bit FLAC sources with conversions: SoX cannot read non-byte-aligned
+    // FLAC at all (sox_precision(FLAC, bps) is 0 unless bps % 8 == 0 —
+    // src/formats.c; verified on 14.4.2: it also fails on libFLAC-C-API-written
+    // 12-bit files with "data encoding or sample size was not specified"). Feed
+    // the cut as a raw s16 stream on stdin instead: decode the 12-bit FLAC
+    // sample-exactly (claxon) and left-justify every sample ×16 into the 16-bit
+    // container — byte-for-byte what SoX would have read from the equivalent
+    // 16-bit FLAC. The rest of the pipeline (trim/sinc/rate/6-bit/12-bit
+    // passes) is unchanged; the stream rate is the FLAC header rate (the
+    // /1000-convention value for RF, same stream SoX sees for the FLAC).
+    let (in_args, sox_input, stdin_feed) = match twelve_bit_flac_source(in_fmt, in_path) {
+        Some((rate, ch)) => match make_12bit_s16_feed(in_path) {
+            Ok(feed) => (
+                vec![
+                    "-t".to_string(),
+                    "s16".to_string(),
+                    "-r".to_string(),
+                    rate.to_string(),
+                    "-c".to_string(),
+                    ch.to_string(),
+                ],
+                "-".to_string(),
+                Some(feed),
+            ),
+            Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+        },
+        None => match sox_input_args(in_fmt, in_path, &opts) {
+            Ok(a) => (a, in_path.to_string(), None),
+            Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+        },
+    };
+
     let six_bit = matches!(opts.output_bits, Some(6));
+    let twelve_bit = matches!(opts.output_bits, Some(12));
+    // 12-bit output runs the same two-pass shape as 6-bit: pass 1 cuts into a
+    // 16-bit temp FLAC (12-bit sources land there exactly ×16 left-justified —
+    // the exact inverse of the >>4 re-encode pass), pass 2 produces the true
+    // 12-bit FLAC via the `flac` CLI encoder.
+    let sink_bits: u32 = match opts.output_bits {
+        Some(6) => 8,
+        Some(12) => 16,
+        Some(b) => b,
+        None => 0,
+    };
     let tmp_path = if six_bit {
         Some(
             std::env::temp_dir().join(format!("flac-chop-6bit-{}.flac", std::process::id())),
+        )
+    } else if twelve_bit {
+        Some(
+            std::env::temp_dir().join(format!("flac-chop-12bit-{}.flac", std::process::id())),
         )
     } else {
         None
@@ -347,7 +522,7 @@ pub fn chop_with_options(
     for a in &in_args {
         cmd.arg(a);
     }
-    cmd.arg(in_path);
+    cmd.arg(&sox_input);
 
     if let Some(rate) = opts.output_rate_hz {
         if rate > 0 {
@@ -355,15 +530,11 @@ pub fn chop_with_options(
         }
     }
 
-    if let Some(bits) = opts.output_bits {
-        if bits == 6 {
-            cmd.arg("-b").arg("8");
-        } else if bits > 0 {
-            cmd.arg("-b").arg(bits.to_string());
-        }
+    if sink_bits > 0 {
+        cmd.arg("-b").arg(sink_bits.to_string());
     }
 
-    let out_target: PathBuf = if six_bit {
+    let out_target: PathBuf = if six_bit || twelve_bit {
         tmp_path.clone().unwrap()
     } else {
         PathBuf::from(out_path)
@@ -387,7 +558,7 @@ pub fn chop_with_options(
         cmd.arg("vol").arg("0.25");
     }
 
-    let (status, stderr) = match run_sox_child(cmd) {
+    let (status, stderr) = match run_sox_child(cmd, stdin_feed) {
         Ok(v) => v,
         Err(cancelled) => {
             // Clean up the partial pass-1 temp file on failure/cancel.
@@ -413,7 +584,7 @@ pub fn chop_with_options(
         cmd2.arg("-b").arg("8");
         cmd2.arg(out_path);
         cmd2.arg("vol").arg("4");
-        match run_sox_child(cmd2) {
+        match run_sox_child(cmd2, None) {
             Ok((st, _se)) => {
                 if !st.success() {
                     r.ok = false;
@@ -428,6 +599,18 @@ pub fn chop_with_options(
             }
         }
         // The temp file is no longer needed in any path.
+        let _ = std::fs::remove_file(tmp_path.as_ref().unwrap());
+    }
+
+    // Pass 2 (12-bit only): decode the 16-bit temp FLAC, arithmetic-shift
+    // every sample >>4 back onto the 12-bit grid, and encode a TRUE 12-bit
+    // FLAC via the `flac` CLI (SoX/libFLAC cannot write 12-bit directly).
+    if r.ok && twelve_bit {
+        if let Err(e) = encode_true_12bit(tmp_path.as_ref().unwrap(), out_path) {
+            r.ok = false;
+            r.exit_code = -1;
+            r.stderr = e;
+        }
         let _ = std::fs::remove_file(tmp_path.as_ref().unwrap());
     }
 
@@ -455,6 +638,69 @@ pub fn chop_with_options(
 /// True if a bundled or PATH `sox` executable responds to `--version`.
 pub fn sox_available() -> bool {
     shelldet::resolve().is_some()
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Plain trim of a true 12-bit FLAC source, entirely in Rust (no SoX):
+/// claxon-decode → drop `start` → take `len` → re-encode with
+/// [`crate::enc12`] at the source's header rate. Sample-exact by
+/// construction (the encoder's only transform is the identity).
+///
+/// Runs to completion once started (no mid-decode cancellation hook — the
+/// pre-start CANCEL check is honoured, matching the static-sox backend's
+/// semantics). Mono only ([`crate::enc12`] is a mono encoder; multichannel
+/// 12-bit sources with conversions use the SoX path, and without conversions
+/// they error here with the explanation).
+fn chop_12bit_source_pure(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    is_rf: bool,
+) -> ChopResult {
+    use claxon::FlacReader;
+
+    let fail = |stderr: String| ChopResult { ok: false, exit_code: -1, stderr };
+    if CANCEL.load(Ordering::Relaxed) {
+        return fail("cancelled by user".into());
+    }
+    let mut reader = match FlacReader::open(in_path) {
+        Ok(r) => r,
+        Err(e) => return fail(format!("12-bit source is unreadable: {e}")),
+    };
+    let si = reader.streaminfo();
+    if si.channels != 1 {
+        return fail(format!(
+            "true 12-bit output supports mono streams (the source has {} channels)",
+            si.channels
+        ));
+    }
+    let start = match usize::try_from(start_samples) {
+        Ok(s) => s,
+        Err(_) => return fail(format!("cut start {start_samples} out of range")),
+    };
+    let mut decoded: u64 = 0;
+    let samples = reader
+        .samples()
+        .skip(start)
+        .take(usize::try_from(length_samples).unwrap_or(usize::MAX))
+        .map(|s| {
+            decoded += 1;
+            match s {
+                Ok(v) if (-2048..=2047).contains(&v) => Ok(v as i16),
+                Ok(v) => Err(format!("12-bit source sample {v} outside [-2048, 2047]")),
+                Err(e) => Err(format!("12-bit source decode failed: {e}")),
+            }
+        });
+    if let Err(e) = crate::enc12::encode_12bit_mono(samples, si.sample_rate, length_samples, Path::new(out_path)) {
+        return fail(e);
+    }
+    // `decoded` was counted in the iterator; a start past the real end of the
+    // stream yields fewer samples than requested and the encoder already
+    // rejected the count mismatch, so reaching here means the cut is exact.
+    let mut r = ChopResult { ok: true, exit_code: 0, stderr: String::new() };
+    rewrite_tags_after_cut(out_path, is_rf, &mut r);
+    r
 }
 
 // ===========================================================================
@@ -805,10 +1051,21 @@ pub fn chop_with_options(
         Ok(v) => v,
         Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
     };
+    // libSoX cannot read true 12-bit FLAC either (same non-byte-aligned
+    // precision check as the CLI) — reject with the explanation instead of a
+    // bare "sox_open_read failed".
+    if twelve_bit_flac_source(in_fmt, in_path).is_some() {
+        return ChopResult {
+            ok: false,
+            exit_code: -1,
+            stderr: "the input is a true 12-bit FLAC, which libSoX cannot read (non-byte-aligned bit depth); use a build that shells out to the sox CLI".into(),
+        };
+    }
     let si_note = maybe_repair_streaminfo(in_fmt, in_path);
 
     let result: Result<(), String> = (|| {
         let six_bit = matches!(opts.output_bits, Some(6));
+        let twelve_bit = matches!(opts.output_bits, Some(12));
         unsafe {
             if six_bit {
                 // Pass 1: quantize to the 6-bit grid (vol 0.25, 8-bit sink) into
@@ -830,6 +1087,29 @@ pub fn chop_with_options(
                 // Pass 2: rescale x4 (lossless on integer samples). No rate
                 // change, no filter — the temp file is already the finished cut.
                 let r2 = run_chain(&tmp_str, out_path, 0, length_samples, &opts, Some(4.0), None);
+                let _ = std::fs::remove_file(&tmp_str);
+                r2
+            } else if twelve_bit {
+                // Pass 1: the cut into a 16-bit temp FLAC (12-bit sources land
+                // there exactly ×16 left-justified); pass 2 = true 12-bit encode
+                // via the shared `flac` CLI helper.
+                let tmp = std::env::temp_dir()
+                    .join(format!("flac-chop-12bit-{}.flac", std::process::id()));
+                let tmp_str = tmp.to_string_lossy().into_owned();
+                let mut pass1 = opts.clone();
+                pass1.output_bits = Some(16);
+                if let Err(e) = run_chain(
+                    in_path,
+                    &tmp_str,
+                    start_samples,
+                    length_samples,
+                    &pass1,
+                    None,
+                    hints.as_ref(),
+                ) {
+                    return Err(e);
+                }
+                let r2 = encode_true_12bit(Path::new(&tmp_str), out_path);
                 let _ = std::fs::remove_file(&tmp_str);
                 r2
             } else {
@@ -882,6 +1162,59 @@ pub fn sox_available() -> bool {
 // ===========================================================================
 // Shared helpers.
 // ===========================================================================
+
+// ===========================================================================
+// 12-bit FLAC (MISRC/HdSDAOH standard): true signed 12-bit samples
+// [-2048, 2047], STREAMINFO bits_per_sample = 12, mono.
+// ===========================================================================
+
+/// Pass 2 of the 12-bit flow (both backends): decode the 16-bit temp FLAC
+/// sample-exactly, arithmetic-shift every sample >>4 back onto the 12-bit
+/// grid, and encode a TRUE 12-bit FLAC ([`crate::enc12`]).
+///
+/// The shift is the exact inverse of the ×16 left-justification SoX applied
+/// writing the 16-bit temp (a 12-bit source value v lands there as v × 16),
+/// so a 12-bit → 12-bit cut round-trips sample-exactly. The output header
+/// rate comes from the temp FLAC's own STREAMINFO (SoX already applied any
+/// `-r` there). No external encoder is used: no CLI encoder can write 12-bit
+/// FLAC (flac/SoX/ffmpeg all refuse or round it — see the [`crate::enc12`]
+/// module docs), while the MISRC standard needs STREAMINFO bps = 12 exactly.
+fn encode_true_12bit(tmp_path: &Path, out_path: &str) -> Result<(), String> {
+    use claxon::FlacReader;
+
+    let mut reader = FlacReader::open(tmp_path)
+        .map_err(|e| format!("12-bit re-encode: temp FLAC unreadable: {e}"))?;
+    let si = reader.streaminfo();
+    if si.bits_per_sample != 16 {
+        return Err(format!(
+            "12-bit re-encode: expected a 16-bit temp FLAC, got {}-bit",
+            si.bits_per_sample
+        ));
+    }
+    if si.channels != 1 {
+        return Err(format!(
+            "12-bit output supports mono streams (the cut has {} channels)",
+            si.channels
+        ));
+    }
+    let rate = si.sample_rate;
+    let total = si
+        .samples
+        .ok_or_else(|| "12-bit re-encode: temp FLAC has an unknown total".to_string())?;
+
+    // Stream the temp FLAC through the >>4 shift into the 12-bit encoder.
+    let mut samples = reader.samples();
+    let shifted = std::iter::from_fn(move || {
+        match samples.next() {
+            Some(Ok(w)) => Some(Ok((w >> 4) as i16)), // arithmetic shift: 16-bit -> 12-bit grid
+            Some(Err(e)) => Some(Err(format!(
+                "12-bit re-encode: temp FLAC decode failed: {e}"
+            ))),
+            None => None,
+        }
+    });
+    crate::enc12::encode_12bit_mono(shifted, rate, total, Path::new(out_path))
+}
 
 /// Repair a mis-declared STREAMINFO total on a FLAC input before the cut.
 /// Some capture writers never seek back to finalize the header: the MISRC
