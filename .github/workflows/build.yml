@@ -151,27 +151,17 @@ jobs:
           cp "$(command -v sox)" AppDir/usr/bin/sox
           chmod +x AppDir/usr/bin/sox
 
-          cat > AppDir/flac-chop.desktop <<'EOF'
-          [Desktop Entry]
-          Type=Application
-          Name=FLAC-Chop
-          Exec=flac-chop
-          Icon=flac-chop
-          Categories=AudioVideo;Utility;
-          Terminal=false
-          StartupNotify=true
-          StartupWMClass=FLAC-Chop
-          EOF
+          # Desktop entry (StartupWMClass must match the Qt window class set in
+          # gui/main.cpp) and AppRun (installs the user-level launcher + icon on
+          # first GUI run) live in assets/appimage/ - kept as real files, not
+          # inline heredocs, so they cannot break the workflow YAML.
+          cp assets/appimage/flac-chop.desktop AppDir/flac-chop.desktop
 
           # AppImage tooling rejects 1024x1024 icons; use a validated 512x512
           # raster source for metadata embedding.
           cp assets/icons/flac-chop-icon-512.png AppDir/flac-chop.png
 
-          cat > AppDir/AppRun <<'EOF'
-          #!/usr/bin/env bash
-          HERE="$(dirname "$(readlink -f "$0")")"
-          exec "$HERE/usr/bin/flac-chop" "$@"
-          EOF
+          cp assets/appimage/AppRun AppDir/AppRun
           chmod +x AppDir/AppRun
 
           curl -L -o linuxdeploy "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${LINUXDEPLOY_ARCH}.AppImage"

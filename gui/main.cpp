@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QCoreApplication>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QPalette>
 #include <QSize>
@@ -412,10 +413,26 @@ int main(int argc, char* argv[])
         return runCli(argc, argv);
     }
 
+#if defined(Q_OS_LINUX)
+    // Linux taskbar identity. Qt derives the X11 WM_CLASS instance name from
+    // argv[0], which inside an AppImage is a temporary mount path. Pin it to
+    // "flac-chop" (the .desktop file basename) unless the caller set one.
+    if (!qEnvironmentVariableIsSet("RESOURCE_NAME"))
+        qputenv("RESOURCE_NAME", "flac-chop");
+#endif
+
     QApplication app(argc, argv);
     app.setApplicationName("FLAC-Chop");
     app.setApplicationVersion(QStringLiteral(FLAC_CHOP_VERSION));
     app.setOrganizationName("FLAC-Chop");
+#if defined(Q_OS_LINUX)
+    // WM_CLASS class = applicationName ("FLAC-Chop") matches
+    // StartupWMClass=FLAC-Chop in flac-chop.desktop; the desktop file name
+    // gives the Wayland app_id / freedesktop association. Both must be set
+    // before the first window is shown (Qt reads them at native window
+    // creation), which happens at w.show() below.
+    QGuiApplication::setDesktopFileName(QStringLiteral("flac-chop"));
+#endif
     applyDarkFusion(app);
     // Multi-size QIcon so the taskbar/dock gets a crisp icon at every size
     // (16..512) instead of a scaled single raster. Matches ld-analyse's

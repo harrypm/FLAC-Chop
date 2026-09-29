@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FLAC-Chop
+Exec=flac-chop
+Icon=flac-chop
+Categories=AudioVideo;Utility;
+Terminal=false
+StartupNotify=true
+StartupWMClass=FLAC-Chop

@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# AppRun — launches FLAC-Chop and registers it with the desktop.
+#
+# AppImages are not registered with the desktop automatically. Without a
+# matching user-level .desktop file, Cinnamon/Mint (and GNOME/KDE) cannot tie
+# the running window to a launcher: the taskbar shows a placeholder icon,
+# pinning does not stick and the shell generates a stray
+# "Flac-Chop.cinnamon-generated.desktop".
+#
+# On GUI launches this installs ~/.local/share/applications/flac-chop.desktop
+# (Exec = the AppImage file itself) and the hicolor icon. The window identity
+# set in gui/main.cpp (WM_CLASS class "FLAC-Chop", instance "flac-chop",
+# desktop file name "flac-chop") matches that file.
+#
+# Set FLAC_CHOP_NO_INTEGRATION=1 to skip the desktop integration.
+
+self="$(readlink -f -- "$0")"
+HERE="${self%/*}"
+
+# X11 WM_CLASS instance name (the class comes from QApplication::applicationName).
+export RESOURCE_NAME="flac-chop"
+
+flac_chop_integrate() {
+    # Only when running from a real AppImage file (APPIMAGE is the file path;
+    # $HERE is a temporary mount that must never end up in a .desktop file).
+    [ -n "${APPIMAGE:-}" ] && [ -f "${APPIMAGE}" ] || return 0
+    [ -z "${FLAC_CHOP_NO_INTEGRATION:-}" ] || return 0
+
+    # Mirror gui/main.cpp detectLaunchMode(): only GUI launches integrate, not
+    # headless CLI runs (--probe, --version, <in> <out> <start> <len>, ...).
+    case "${1:-}" in
+        "" | --gui) ;;
+        --*) return 0 ;;
+        *) [ "$#" -eq 1 ] || return 0 ;;
+    esac
+
+    # Characters that would need multi-level .desktop escaping: skip rather
+    # than write a broken launcher.
+    case "${APPIMAGE}" in
+        *[\"\`\$\\]*) return 0 ;;
+    esac
+
+    local data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+    local apps_dir="${data_home}/applications"
+    local icon_dir="${data_home}/icons/hicolor/512x512/apps"
+    local desktop="${apps_dir}/flac-chop.desktop"
+    local icon_src="${HERE}/usr/share/icons/hicolor/512x512/apps/flac-chop.png"
+    local icon_dst="${icon_dir}/flac-chop.png"
+    local changed=0
+
+    mkdir -p "${apps_dir}" "${icon_dir}" 2>/dev/null || return 0
+
+    # '%' is the field-code escape character in Exec.
+    local exec_path="${APPIMAGE//%/%%}"
+    local desired
+    desired="$(cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=FLAC-Chop
+Comment=Sample-exact RF FLAC cutter
+Exec="${exec_path}" %f
+TryExec=${APPIMAGE}
+Icon=flac-chop
+Categories=AudioVideo;Utility;
+Terminal=false
+StartupNotify=true
+StartupWMClass=FLAC-Chop
+EOF
+)"
+
+    # Rewrite when missing or when it points at a different AppImage/version,
+    # so the launcher always follows the AppImage that was run last.
+    if [ ! -f "${desktop}" ] || [ "$(cat "${desktop}" 2>/dev/null)" != "${desired}" ]; then
+        printf '%s\n' "${desired}" > "${desktop}.tmp.$$" 2>/dev/null \
+            && mv -f "${desktop}.tmp.$$" "${desktop}" 2>/dev/null \
+            && changed=1
+        rm -f "${desktop}.tmp.$$" 2>/dev/null
+    fi
+
+    if [ -f "${icon_src}" ] && { [ ! -f "${icon_dst}" ] || ! cmp -s "${icon_src}" "${icon_dst}"; }; then
+        cp -f "${icon_src}" "${icon_dst}" 2>/dev/null && changed=1
+    fi
+
+    if [ "${changed}" -eq 1 ]; then
+        update-desktop-database "${apps_dir}" >/dev/null 2>&1 || true
+        gtk-update-icon-cache -f -t "${data_home}/icons/hicolor" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+flac_chop_integrate "$@" || true
+
+exec "${HERE}/usr/bin/flac-chop" "$@"
