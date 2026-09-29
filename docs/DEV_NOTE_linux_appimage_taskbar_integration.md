@@ -45,11 +45,18 @@ Which piece is broken depends on the app. Check first (do not assume):
 
 ## How to verify (hard data, not "looks fine")
 - Real window class: launch the app, then `xdotool search --pid <pid>` -> `xprop -id <win> WM_CLASS _NET_WM_PID`. Match by PID: `xdotool search --name` can hit a different already-running instance (this happened while testing).
+- Only judge the MAPPED main window (`xdotool search --onlyvisible ...`, `xprop -id <win> WM_STATE` = Normal). Qt also creates a hidden helper/client-leader window at startup whose WM_CLASS class is set before `applicationName` is applied (seen as `Decode-rust-gui`); it has no WM_STATE and never shows in the taskbar. Reading that one gives a false alarm. Use `--onlyvisible`, or list every new window with its visibility.
+- When probing a packaged AppImage on the user's live session: sandbox `HOME` only via `env HOME=... <cmd>` (never `export HOME=` in the persistent shell - it hid ~/.gitconfig and GitHub credentials for a while), diff window lists before/after so the user's own running instance is never touched, and kill only the process group you started.
 - Compare old vs new with a deliberately wrong argv[0] (`exec -a /tmp/.mount_x/whatever ...`) to prove the identity code is what pins the class.
 - AppRun logic: run it in a sandbox (`HOME=/tmp/x APPIMAGE=/tmp/x/app.AppImage`) with a stub binary; check install, no-rewrite on rerun (mtime), CLI/selftest/opt-out create zero files, path with space and `%`, re-point to another AppImage.
 - `desktop-file-validate` on the shipped and generated `.desktop` files.
 - `ls ~/.local/share/applications | grep cinnamon-generated` before/after: no new stray entry.
 - Final proof is the user's taskbar on real Linux Mint (Cinnamon): correct icon, pinning sticks. Ask the user; do not declare it fixed before that.
+
+## Verified on CI-built AppImages (2026-09-29, before user taskbar confirmation)
+- FLAC-Chop `linux_FLAC-Chop_dev-7f080c1_x86.AppImage` (Actions run 36610699222, all jobs green): shipped AppRun is ours (linuxdeploy kept it); mapped window WM_CLASS `"flac-chop", "FLAC-Chop"`; first GUI launch installed `flac-chop.desktop` (Exec = the AppImage, StartupWMClass=FLAC-Chop) + 512x512 icon into the sandbox HOME.
+- tape-decode-rust `decode-rust-gui-linux_v4.0.0-11-ge16d1d8_x86_64.AppImage` (fork run 36610703924, both arches green, `--selftest` passes inside CI): mapped window WM_CLASS `"decode-rust-gui", "decode-rust-gui"`; installed `decode-rust-gui.desktop` + 256x256 icon.
+- Still needs the user's real Linux Mint taskbar check (icon, pinning, no new `*.cinnamon-generated.desktop`).
 
 ## Gotchas
 - Old stray `*.cinnamon-generated.desktop` files keep shadowing; delete them and unpin/re-pin while the app is running.
