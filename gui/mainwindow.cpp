@@ -468,7 +468,7 @@ void MainWindow::browse()
     const QString startDir = m_inPath.isEmpty() ? QDir::homePath() : QFileInfo(m_inPath).absolutePath();
     const QString fn = QFileDialog::getOpenFileName(
         this, tr("Select capture file"), startDir,
-        tr("RF captures (*.flac *.ldf *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.raw *.bin)"
+        tr("RF captures (*.flac *.ldf *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm)"
            ";;FLAC files (*.flac);;All files (*)"));
     if (fn.isEmpty())
         return;

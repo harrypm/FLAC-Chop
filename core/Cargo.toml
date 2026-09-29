@@ -16,6 +16,12 @@ claxon = "0.4"
 # (frames displaced one byte past the metadata end) and panicked on
 # padding-less files.
 
+# SIGPIPE disposition for the 12-bit SoX stdin feed (unix): SoX closes the
+# pipe once it has the full trim window, and a delivered SIGPIPE would kill
+# the whole process (the C++ GUI binary has no Rust SIG_IGN default).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # Link libSoX statically and run the cut in-process (no external sox binary).
 # The build script links libsox + deps from $SOX_STATIC_PREFIX when set.

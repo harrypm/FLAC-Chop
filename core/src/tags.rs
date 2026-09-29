@@ -17,18 +17,20 @@
 //! Tag schema (from MISRC-GUI `gui_record.c` + the capture pipeline):
 //!
 //! ```text
-//! RF_TOTAL_SAMPLES   = real total sample count at the real rate
+//! RF_TOTAL_SAMPLES   = true on-disk sample count (1:1 real RF samples)
 //! RF_SAMPLE_RATE     = real rate in Hz   (header_khz * 1000 for RF)
 //! RF_SAMPLE_RATE_KHZ = header kHz value   (RF only; = header sample_rate)
-//! DURATION_SECONDS   = real duration (s)  (= total / header_rate)
+//! DURATION_SECONDS   = real duration (s)  (= on-disk count / real rate)
 //! LENGTH             = duration in ms
 //! ```
 //!
 //! For RF files the FLAC header `sample_rate` holds the /1000 "kHz" value
 //! (e.g. 20000 for 20 MSPS); `RF_TOTAL_SAMPLES` is the STREAMINFO
-//! `total_samples` (count at the header rate) multiplied by 1000 to give the
-//! real-rate count. For non-RF audio the header `sample_rate` is the real Hz
-//! and `RF_SAMPLE_RATE_KHZ` is omitted.
+//! `total_samples` taken as the true on-disk count — every stored sample IS
+//! one real RF sample (only the header RATE is /1000), matching the
+//! MISRC-GUI writer and the probe's later-schema reader. For non-RF audio
+//! the header `sample_rate` is the real Hz and `RF_SAMPLE_RATE_KHZ` is
+//! omitted.
 //!
 //! The write path mirrors the MISRC-GUI recorder method (`misrc_tools/common/
 //! flac_writer.c` + `gui_record_finalize_flac_metadata`): metadata updates are
@@ -58,9 +60,12 @@ const OWNED_TAGS: &[&str] = &[
 ];
 
 /// Read the output FLAC's STREAMINFO and rewrite the numeric RF Vorbis tags to
-/// match the actual cut. `is_rf` selects the RF /1000 convention (RF_SAMPLE_RATE
-/// = header*1000, RF_TOTAL_SAMPLES = streaminfo_total*1000, + RF_SAMPLE_RATE_KHZ)
-/// versus plain audio (RF_SAMPLE_RATE = header, no KHZ tag).
+/// match the actual cut. `is_rf` selects the RF rate convention (RF_SAMPLE_RATE
+/// = header*1000 real Hz, + RF_SAMPLE_RATE_KHZ) versus plain audio
+/// (RF_SAMPLE_RATE = header, no KHZ tag); in both cases RF_TOTAL_SAMPLES is
+/// the output's true on-disk sample count (1:1 real RF samples — the
+/// MISRC-GUI writer convention, and what the probe's later-schema reader
+/// expects). Duration tags derive from the real rate, never the kHz header.
 ///
 /// Returns `Ok(())` on success, or an error string describing why the rewrite
 /// failed (the caller may surface it as a non-fatal warning — the cut itself
@@ -71,14 +76,20 @@ pub fn rewrite_cut_tags(out_path: &Path, is_rf: bool) -> Result<(), String> {
     if header_rate == 0 {
         return Err("output STREAMINFO sample_rate is 0".into());
     }
-    let duration_sec = total_samples as f64 / header_rate as f64;
+    // The on-disk count is 1:1 real RF samples; the RF header rate is the
+    // /1000 kHz value, so the real duration derives from header*1000 (for
+    // non-RF audio the header rate is already the real rate).
+    let real_rate_hz: u64 = if is_rf {
+        (header_rate as u64) * 1000
+    } else {
+        header_rate as u64
+    };
+    let duration_sec = total_samples as f64 / real_rate_hz as f64;
     let length_ms = (duration_sec * 1000.0).round() as u64;
 
-    // Fresh values from the output's own STREAMINFO.
+    // Fresh values from the output's own STREAMINFO (1:1 on-disk counts).
     let (rf_sample_rate, rf_total_samples) = if is_rf {
-        let real_hz = (header_rate as u64) * 1000;
-        let real_total = total_samples.saturating_mul(1000);
-        (real_hz, real_total)
+        (real_rate_hz, total_samples)
     } else {
         (header_rate as u64, total_samples)
     };

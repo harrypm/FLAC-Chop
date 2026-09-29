@@ -298,3 +298,171 @@ README CLI section, GUI build + CLI smoke, then commit/push.
    Files: gui/mainwindow.cpp, gui/mainwindow.h. Build OK (10:33).
 10. 10:33 UTC: GUI restarted with the feature build, same pre-load args
    (PID 3072777). Awaiting interactive user confirmation.
+11. 10:36 UTC: user confirmed the Add Field box works ("this is good") and
+    requested: commit, push, merge into main, trigger release.
+    - Restore-point zip #2 (per user rule):
+      /home/harry/FLAC-Chop-restore-points/flac-chop_add-field-box-confirmed_2026-09-28.zip
+    - Commit 9217a83 "GUI: fix Apply Template gating, add quick-add field
+      box" (gui/mainwindow.cpp, gui/mainwindow.h, prompt_readme.md;
+      Co-Authored-By: Warp). .ci-debug/ left untracked (scratch logs).
+    - Pushed feature/cli-gui-loading (08677b5..9217a83).
+    - Merged --no-ff into master (merge commit 3b2e321), pushed
+      (950f91c..3b2e321). Note: this repo's primary branch is master.
+    - Tagged v1.2.0 (annotated) and pushed — triggers "Build and release
+      binary" workflow (releases trigger on v* tag push per build.yml).
+    - Release run confirmed in_progress:
+      https://github.com/harrypm/FLAC-Chop/actions/runs/36404718502
+    - Tests workflow also running on master from the merge push.
+    - POLLED to completion (~7.5 min): run 36404718502 completed / success.
+    - RELEASE VERIFIED PUBLISHED: v1.2.0 —
+      https://github.com/harrypm/FLAC-Chop/releases/tag/v1.2.0 (5 assets).
+12. 12:15 UTC: VERSION CORRECTION (user: "Why did you not push v1.0.3.. I
+    did not ask for version tag jumping").
+    - Root cause of my error: I picked the version from the LOCAL git tag
+      list, which was missing v1.0.1/v1.0.2 (remote-only tags; never
+      fetched). Newest version tag seen locally was v1.1.0 (July, no GitHub
+      release) → I bumped minor to v1.2.0 instead of checking `gh release
+      list` (real series v1.0.0→v1.0.2) or asking before tagging.
+    - Fix: `git fetch --tags`; deleted v1.2.0 GitHub release
+      (gh release delete), remote tag (push :refs/tags/v1.2.0) and local
+      tag. Tagged v1.0.3 at the same merge commit 3b2e321, pushed.
+    - VERIFIED: run 36420618753 completed/success; release v1.0.3 published
+      https://github.com/harrypm/FLAC-Chop/releases/tag/v1.0.3 (5 assets),
+      Latest. Release list: v1.0.3, v1.0.2, v1.0.1, v1.0.0, deps-v4 — no
+      v1.2.0 anywhere.
+    - Lesson logged: always `git fetch --tags` + `gh release list` and
+      confirm the version number with the user BEFORE tagging a release.
+
+## Session 2026-09-28 ~13:30-14:10 UTC — 12-bit RF auto-load verification + 2 core fixes
+
+Task (from orchestrator, user requirement): auto file loading must work for RF
+captures — true 12-bit MISRC FLACs — on all three GUI paths (--gui arg,
+File Open, drag-drop).
+
+1. Fixture: built /tmp/fc12rf_gen (throwaway cargo crate, path-dep on core)
+   calling enc12::encode_12bit_mono → /tmp/fc_smoke/src12rf.flac: TRUE 12-bit
+   (STREAMINFO bps=12, mono), 40,000,000 actual samples (2.0 s real @ 20 MSPS,
+   1:1 on-disk = real count), header rate 20000 (kHz-domain), STREAMINFO
+   declared total left at 40000000 (enc12 writes the true count; the real
+   MISRC writer leaves declared = count/1000 and the chop repairs it from the
+   tag — see dev notes), RF tags: RF_SAMPLE_RATE=20000000,
+   RF_SAMPLE_RATE_KHZ=20000, RF_TOTAL_SAMPLES=40000000.
+   - Fixture lesson 1: a 200k-actual/200M-tag file is IMPOSSIBLE in the wild
+     (first attempt) — no real file looks like that; the chop correctly
+     errored on it (plan 1:1 vs 200k actual → empty window).
+   - Fixture lesson 2: the tag convention is 1:1 on-disk counts
+     (probe.rs later-schema doc), NOT count×1000 (second attempt tripped the
+     probe's /1000 sanity rescale).
+2. VERIFIED LOAD PATHS (code + runtime): --gui arg → loadFileAndMarkers →
+   loadFile; File Open (browse) → loadFile; drag-drop (dropEvent) → loadFile
+   — all three funnel into the identical load/probe/display chain, gated only
+   on format==0 (FLAC) and is_rf, never on bit depth. No 16-bit assumptions
+   in the load path. GUI log clean.
+3. **BUG #1 (fixed, core/probe.rs): RF tag falsely rescaled ×1000.**
+   Sanity-2 (payload cross-check) tripped on `uncompressed < audio_bytes`
+   with zero tolerance: a verbatim 12-bit payload sits ~0.25% ABOVE the raw
+   sample size (frame headers + CRC + alignment pad), so a legitimate
+   40M-sample tag was rescaled ×1000 → 40e9 → phantom 33:20 duration →
+   broken plans/cuts. Fix: rescale only when the unscaled raw estimate is
+   ≥100× below the payload (a genuine /1000-unit tag lands ~970× under for
+   RF noise); otherwise the tag stands. Regression test added
+   (vorbis_later_schema_tag_stands_on_verbatim_12bit_payload).
+4. **BUG #2 (fixed, core/chop.rs): SIGPIPE/EPIPE killed the process on
+   partial conversion cuts of large 12-bit files.** SoX closes stdin once it
+   has the full trim window; the feeder kept writing post-window audio →
+   EPIPE (Rust binaries: feed error → cut failed) / delivered SIGPIPE
+   (C++ GUI binary: whole process died, exit 141, no tag rewrite, GUI crash
+   mid-cut). Observed: exit=141 on an 8-bit conversion of the 40M-sample
+   fixture. Fix: SIGPIPE→SIG_IGN for the feed (libc dep added for unix) +
+   BrokenPipe treated as a benign end-of-feed (child status + output
+   validation decide). Regression test added
+   (twelve_bit_source_partial_conversion_cut_survives_sox_early_pipe_close —
+   100k-sample source, [0,50k) cut, 100 KiB post-window > 64 KiB pipe
+   buffer). Note: SoX's 8-bit sink maps a 12-bit value to v/16
+   (full-scale-preserving); test asserts ±1 rounding.
+5. Tests: 113 core + 6 ffi_plan + 10 roundtrip12 ALL PASS (2 new).
+6. CLI verification on the fixture (fresh builds): keep-precision pure trim
+   0.5-1.0 s → ok; claxon cross-check cut == source[10M..30M] sample-exact
+   (20M samples); --bits 8 conversion → exit 0, tags rewritten (was: exit
+   141, no tags). SoX "clipped 39070 samples" warning = synthetic full-scale
+   sawtooth at 12-bit +full-scale meeting the 8-bit rounding edge — benign,
+   same as 16→8 v1.0.x behavior.
+7. **BUG #3 (REPORTED, NOT FIXED — needs a convention decision): post-cut RF
+   tag rewrite writes RF_TOTAL_SAMPLES = count×1000 (tags.rs:78-84, doc lines
+   27-31), but the MISRC-GUI writer convention (probe.rs:910-913) is tag =
+   true on-disk count (1:1).** Hard data: a 1.0 s 20M-sample cut gets
+   RF_TOTAL_SAMPLES=20000000000, DURATION_SECONDS=1000.000000,
+   LENGTH=1000000 — reloading any RF cut shows a ×1000 phantom duration
+   (probe trusts the tag) and --units samples cuts-of-cuts plan 1000× past
+   the audio. Pre-existing (16-bit v1.0.x cuts too), duration-consistent
+   within itself, roundtrip12 currently asserts the ×1000 shape. Held for a
+   user/orchestrator decision: switch the rewrite to 1:1 (match MISRC-GUI +
+   FLAC-Chop's own probe) or keep.
+8. GUI relaunched with the fixed build: --gui /tmp/fc_smoke/src12rf.flac
+   --in 0.5 --out 1.5 (PID 3811637). NOTE: two FLAC-Chop windows are open —
+   my test instance (titled "FLAC-Chop v1.0.0-2-g842384b-dirty" = the dev
+   build, dirty tree) and a separate instance running the RELEASED v1.0.3
+   binary (PID 3624717, not mine — untouched). Screenshots:
+   /tmp/fc_smoke/gui_12bit_test_win.png (test instance crop).
+   AWAITING user interactive confirmation of the load display + markers.
+9. No commits yet (holding for user confirmation per the usual rule).
+
+## Session 2026-09-28 ~20:15 UTC — .8u / reversed raw-PCM extension support
+
+1. User request: "fix .8u 8-bit detection, double check other format inputs
+   as well."
+2. Root cause (core/src/probe.rs sniff_format): only .u8/.s8/.u16/.s16/.r8/
+   .r16 were mapped — the reversed <bits><sign> naming (.8u/.8s/.16u/.16s)
+   fell through to the unsupported-extension error.
+3. Fix (probe.rs): added .8u→U8, .8s→S8, .16u→U16, .16s→S16; added .pcm to
+   the u8-default group (.raw/.bin/.pcm); updated the unsupported-ext error
+   message + module docs. Extended sniff_raw_extensions_and_ldf with all new
+   extensions (14 cases).
+4. GUI: browse() file filter now lists *.8u *.8s *.16u *.16s *.pcm.
+   gui/main.cpp CLI usage docs updated.
+5. readme.md: supported-inputs table row, GUI usage step 1, CLI <in> bullet —
+   all now list the reversed extensions + .pcm.
+6. HARD-DATA verification (probe_cli on real generated files named with the
+   20msps hint): cap_20msps.8u → raw u8/8-bit/20 MHz RF/48000 samples ✓;
+   .8s → raw s8 ✓; .16u → raw u16/16-bit ✓; .16s → raw s16 ✓; .pcm → raw u8
+   default ✓.
+7. End-to-end cut on .8u (fresh build): plan start=0 len=20000 (0.001 s ×
+   20 MHz) → sox ok → exit=0; output valid 8-bit FLAC. Note: the output's
+   rewritten RF_TOTAL_SAMPLES=20000000 (count×1000) re-confirms the reported
+   tag-rewrite convention issue (BUG #3, held for user decision).
+8. Full test suite: 113 core + 6 ffi_plan + 10 roundtrip12 green.
+9. GUI restarted with the rebuilt binary (PID 1832401, same 12-bit RF
+   pre-load --in 0.5 --out 1.5). Both the 12-bit load confirmation and the
+   new Open-dialog extensions are testable in this instance.
+10. No commits yet (holding for user confirmation per the standing rule).
+
+## Session 2026-09-28 ~20:25 UTC — BUG #3 fixed: cut tag rewrite switched to 1:1
+
+1. Orchestrator relayed the user's decision: the post-cut RF tag rewrite must
+   use the 1:1 convention (RF_TOTAL_SAMPLES = true on-disk sample count),
+   matching MISRC-GUI's writer and FLAC-Chop's own probe later-schema reader.
+2. Fix (core/src/tags.rs):
+   - RF_TOTAL_SAMPLES = output STREAMINFO total taken 1:1 (was total×1000).
+   - DURATION_SECONDS / LENGTH now derive from the REAL rate
+     (header×1000 for RF), not the kHz header: duration = total/real_rate.
+   - RF_SAMPLE_RATE (real Hz) + RF_SAMPLE_RATE_KHZ (kHz value) unchanged.
+   - Module + function docs updated to the 1:1 schema.
+3. Tests (roundtrip12):
+   - rf_tag_rewrite_runs_on_12bit_cut: now asserts RF_TOTAL_SAMPLES=4096
+     (1:1) and DURATION_SECONDS=0.000205 (real-rate-derived, 6-decimal
+     format).
+   - NEW rf_cut_output_reprobes_with_correct_total_and_recuts: cut →
+     fc_probe reload (total = 1:1 count, correct 2.5 ms duration, no
+     rescale warnings) → --units samples-style cut-of-cuts inside the
+     probed total → sample-exact (was impossible with ×1000 tags).
+4. Suite: 113 core + 6 ffi_plan + 11 roundtrip12 ALL PASS.
+5. HARD-DATA end-to-end (fresh build): re-cut src12rf.flac 0.5→1.0 s →
+   exit=0; tags RF_TOTAL_SAMPLES=20000000, DURATION_SECONDS=1.000000,
+   LENGTH=1000; re-probe: total=20000000 (vorbis-tag), 1.000 s, no warnings.
+   (First relink attempt used a stale staticlib — forced cargo build +
+   cmake relink; always verify the binary mtime after core edits.)
+6. GUI relaunched with the final build (PID 1871233, same 12-bit RF pre-load
+   --in 0.5 --out 1.5) for the user's interactive confirmation of everything
+   at once: 12-bit RF load display, markers, .8u/.16u Open-dialog extensions,
+   and the corrected cut tags.
+7. No commits yet (holding for user confirmation per the standing rule).

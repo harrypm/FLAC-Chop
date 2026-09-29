@@ -288,6 +288,43 @@ fn twelve_bit_source_full_length_conversion_keeps_every_sample() {
 }
 
 #[test]
+fn twelve_bit_source_partial_conversion_cut_survives_sox_early_pipe_close() {
+    // Regression: sox stops reading (and closes the stdin pipe) once it has
+    // the full trim window. On a partial conversion cut of a large capture
+    // the feeder still holds megabytes of post-window audio — the pending
+    // writes then hit EPIPE/SIGPIPE, which KILLED the whole process in the
+    // C++ GUI binary (exit 141, no tag rewrite, GUI crash mid-cut) and
+    // failed the cut in Rust binaries. The smaller existing tests never
+    // caught it: with ≤64 KiB of post-window audio the data fits in the
+    // kernel pipe buffer, so no write ever failed. 100k-sample source,
+    // cut [0, 50k): 50k samples (100 KiB) past the window > 64 KiB buffer.
+    if !require_sox() {
+        return;
+    }
+    let ws = Workspace::new("epipe");
+    let data = test_data_12bit(100_000);
+    let src = make_12bit_source(&ws, "src12.flac", &data, 48_000);
+    let out = ws.path("cut8.flac");
+    let r = run_chop(&src, &out, 0, 50_000, ChopOptions { output_bits: Some(8), ..Default::default() });
+    assert!(r.ok, "partial conversion cut must survive sox closing the feed: {}", r.stderr);
+
+    let p = probe::probe(&out);
+    assert!(p.ok, "probe failed: {}", p.error);
+    assert_eq!(p.bits_per_sample, 8);
+    assert_eq!(p.total_samples, 50_000);
+    // The 8-bit sink divides the 16-bit container by 256: a 12-bit value
+    // (×16 left-justified into s16) lands at v/16 — full-scale-preserving,
+    // the same ÷16 the rest of the pipeline uses. Assert with ±1 tolerance
+    // for sink rounding.
+    let decoded = decode_samples(&out);
+    assert_eq!(decoded.len(), 50_000);
+    for (&o, &v) in decoded.iter().zip(data.iter()) {
+        let expect = f32::from(v) / 16.0;
+        assert!((f32::from(o) - expect).abs() <= 1.0, "sample {o} vs {expect}");
+    }
+}
+
+#[test]
 fn twelve_bit_source_default_cut_is_true_12bit() {
     if !require_sox() {
         return;
@@ -388,14 +425,70 @@ fn rf_tag_rewrite_runs_on_12bit_cut() {
     assert!(r.ok, "12-bit RF cut failed: {}", r.stderr);
 
     // The rewrite must have inserted the numeric RF tags derived from the
-    // output's own STREAMINFO (RF: /1000 header convention, count ×1000).
+    // output's own STREAMINFO — RF_TOTAL_SAMPLES = the 1:1 on-disk count
+    // (MISRC-GUI convention; the old count×1000 shape is gone).
     let file = std::fs::File::open(&out).unwrap();
     let opts = FlacReaderOptions { metadata_only: true, read_vorbis_comment: true };
     let reader = FlacReader::new_ext(file, opts).unwrap();
     let tag = |k| reader.get_tag(k).next().expect("tag must exist");
     assert_eq!(tag("RF_SAMPLE_RATE"), "20000000");
-    assert_eq!(tag("RF_TOTAL_SAMPLES"), "4096000");
+    assert_eq!(tag("RF_TOTAL_SAMPLES"), "4096");
     assert_eq!(tag("RF_SAMPLE_RATE_KHZ"), "20000");
+    // Duration tags derive from the REAL rate (header×1000), not the kHz
+    // header: 4096 / 20 MHz = 0.0002048 s → 0.000205 at the 6-decimal format.
+    assert_eq!(tag("DURATION_SECONDS"), "0.000205");
+}
+
+#[test]
+fn rf_cut_output_reprobes_with_correct_total_and_recuts() {
+    // 1:1 tag-convention regression: the cut's RF_TOTAL_SAMPLES must equal
+    // the on-disk sample count (NOT count×1000), so re-probing the cut
+    // yields the correct real duration with no rescale warnings, and a
+    // --units samples cut-of-cuts plans inside the actual audio (the ×1000
+    // tags planned 1000× past the stream end and failed).
+    if !require_sox() {
+        return;
+    }
+    let ws = Workspace::new("reprobecut");
+    // 20 kHz = the /1000 kHz-domain header (20 MSPS real), no source tags —
+    // the probe classifies it RF from the header rate alone.
+    let data = test_data_12bit(100_000);
+    let src = make_12bit_source(&ws, "src12.flac", &data, 20_000);
+    let out = ws.path("cut12.flac");
+    let r = run_chop(
+        &src,
+        &out,
+        0,
+        50_000,
+        ChopOptions { output_bits: Some(12), is_rf: true, ..Default::default() },
+    );
+    assert!(r.ok, "12-bit RF cut failed: {}", r.stderr);
+
+    // Reload via the probe: the tag must read back as the 1:1 on-disk count.
+    let p = probe::probe(&out);
+    assert!(p.ok, "{}", p.error);
+    assert!(p.is_rf);
+    assert!(p.total_samples_from_vorbis);
+    assert_eq!(p.total_samples, 50_000, "cut tag must be the 1:1 on-disk count");
+    let dur = p.total_samples as f64 / p.real_rate_hz;
+    assert!((dur - 0.0025).abs() < 1e-9, "real duration must be 2.5 ms, got {dur}");
+    assert!(p.warnings.is_empty(), "no tag rescale warnings: {}", p.warnings);
+
+    // Cut-of-cuts in real-sample units (the --units samples contract): the
+    // plan must land inside the actual audio and the cut must succeed.
+    let out2 = ws.path("cut2.flac");
+    let r2 = run_chop(
+        &out,
+        &out2,
+        10_000,
+        20_000,
+        ChopOptions { is_rf: true, ..Default::default() },
+    );
+    assert!(r2.ok, "cut-of-cuts failed: {}", r2.stderr);
+    let p2 = probe::probe(&out2);
+    assert!(p2.ok, "{}", p2.error);
+    assert_eq!(p2.total_samples, 20_000);
+    assert_eq!(decode_samples(&out2), data[10_000..30_000], "cut-of-cuts must be sample-exact");
 }
 
 #[test]

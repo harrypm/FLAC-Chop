@@ -142,8 +142,9 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 //   flac-chop --version
 //
 // Inputs: FLAC (.flac/.ldf + fLaC-magic files), PCM WAV, and headerless raw
-// PCM (.u8/.u16/.s8/.s16/.r8/.r16; .raw/.bin assumed u8). Raw files must
-// carry the rate in their name (e.g. ..._8-bit_20msps.u8).
+// PCM (.u8/.u16/.s8/.s16/.r8/.r16 and the reversed .8u/.8s/.16u/.16s;
+// .raw/.bin/.pcm assumed u8). Raw files must carry the rate in their name
+// (e.g. ..._8-bit_20msps.u8).
 //
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).

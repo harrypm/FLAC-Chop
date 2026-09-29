@@ -270,6 +270,17 @@ fn run_sox_child(
     feed: Option<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>>,
 ) -> Result<(std::process::ExitStatus, String), ChopResult> {
     if feed.is_some() {
+        // SoX stops reading (and closes the pipe) once it has the full trim
+        // window — on a partial cut of a large capture that happens while the
+        // feeder still holds megabytes of post-window audio. A delivered
+        // SIGPIPE would kill the whole process (the C++ GUI binary does not
+        // inherit Rust's SIG_IGN default — observed: exit 141 mid-cut), so
+        // ignore it for the feed and let the EPIPE write error be the benign
+        // end-of-feed signal instead (see `make_12bit_s16_feed`).
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        }
         cmd.stdin(Stdio::piped());
     }
     cmd.stdout(Stdio::null());
@@ -367,8 +378,25 @@ fn make_12bit_s16_feed(
             .map_err(|e| format!("12-bit FLAC source is unreadable: {e}"))?;
         let mut samples = reader.samples();
         let mut buf: Vec<u8> = Vec::with_capacity(8192);
+        // Write one batch. A BrokenPipe (sox stopped reading) is a benign
+        // end-of-feed, not a truncation: sox closes stdin once it has the
+        // full trim window, so on a partial cut of a large capture the
+        // feeder legitimately still holds megabytes of audio sox will never
+        // need. The child's exit status + the output validation decide the
+        // outcome; a genuine mid-stream decode failure still returns a hard
+        // error below.
+        let write_batch = |stdin: &mut std::process::ChildStdin,
+                           buf: &Vec<u8>|
+         -> Result<(), String> {
+            match stdin.write_all(buf) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                Err(e) => Err(format!("12-bit source: sox stdin write failed: {e}")),
+            }
+        };
         loop {
             buf.clear();
+            let mut eof = false;
             for _ in 0..4096 {
                 match samples.next() {
                     Some(Ok(v)) => {
@@ -381,22 +409,21 @@ fn make_12bit_s16_feed(
                     }
                     Some(Err(e)) => return Err(format!("12-bit FLAC source decode failed: {e}")),
                     None => {
-                        // End of stream: flush the partial batch BEFORE the
-                        // EOF, or the final partial FLAC frame's samples are
-                        // silently dropped (a full-length cut would come up
-                        // short by up to BLOCK_SIZE-1 samples).
-                        if !buf.is_empty() {
-                            stdin
-                                .write_all(&buf)
-                                .map_err(|e| format!("12-bit source: sox stdin write failed: {e}"))?;
-                        }
-                        return Ok(());
+                        eof = true;
+                        break;
                     }
                 }
             }
-            stdin
-                .write_all(&buf)
-                .map_err(|e| format!("12-bit source: sox stdin write failed: {e}"))?;
+            if !buf.is_empty() {
+                write_batch(stdin, &buf)?;
+            }
+            if eof {
+                // End of stream: the partial batch was flushed above BEFORE
+                // the EOF, so the final partial FLAC frame's samples are not
+                // dropped (a full-length cut would otherwise come up short by
+                // up to BLOCK_SIZE-1 samples).
+                return Ok(());
+            }
         }
     }))
 }

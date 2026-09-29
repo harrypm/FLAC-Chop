@@ -610,7 +610,8 @@ impl InputFormat {
 use InputFormat::{Flac, S16, S8, U16, U8, Wav};
 
 /// Sniff the container format: FLAC/WAV by magic header, raw PCM by the
-/// common ld-decode/cxadc file extensions (.u8/.s8/.u16/.s16/.r8/.r16),
+/// common ld-decode/cxadc file extensions (.u8/.s8/.u16/.s16/.r8/.r16 and
+/// the reversed <bits><sign> form .8u/.8s/.16u/.16s), .pcm (u8 default),
 /// .ldf (which is native FLAC from the vhs-decode pipeline), and anything
 /// else by header magic. Returns Err for files we cannot handle.
 pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
@@ -634,17 +635,23 @@ pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
         "s8" => Ok(S8),
         "u16" | "r16" => Ok(U16),
         "s16" => Ok(S16),
+        // The reversed <bits><sign> naming (the same formats as above): .8u
+        // = unsigned 8-bit, .8s = signed 8-bit, .16u/.16s = 16-bit LE.
+        "8u" => Ok(InputFormat::U8),
+        "8s" => Ok(S8),
+        "16u" => Ok(U16),
+        "16s" => Ok(S16),
         // .ldf is the vhs-decode pipeline's native FLAC extension; a .ldf
         // whose magic is missing is corrupt anyway, so routing it to the FLAC
         // prober yields the right "not a valid FLAC stream" error.
         "ldf" => Ok(Flac),
-        "raw" | "bin" => {
+        "raw" | "bin" | "pcm" => {
             // 8-bit vs 16-bit raw is ambiguous without a header; the cxadc
             // 8-bit mode is by far the most common, so default to u8 and say so.
             Ok(InputFormat::U8)
         }
         _ => Err(format!(
-            "unsupported file type (extension .{ext}): expected FLAC (fLaC marker), WAV (RIFF), or raw u8/s8/u16/s16 RF data"
+            "unsupported file type (extension .{ext}): expected FLAC (fLaC marker), WAV (RIFF), or raw u8/s8/u16/s16 RF data (also .8u/.8s/.16u/.16s/.pcm)"
         )),
     }
 }
@@ -1017,7 +1024,19 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
         if audio_bytes > 0 && bits_per_sample_all > 0 {
             let uncompressed = (ts as u128) * bits_per_sample_all / 8;
             if uncompressed < audio_bytes as u128 {
-                if uncompressed * 1000 >= audio_bytes as u128 {
+                // FLAC's per-frame overhead (frame/subframe headers, byte-
+                // alignment pad, CRC-16) can push the payload a fraction of a
+                // percent PAST the raw sample size for verbatim content
+                // (e.g. a 12-bit capture: 40M samples = 60.0 MB raw but a
+                // 60.1 MB payload). That is NOT a /1000-unit tag — a genuine
+                // /1000-unit count lands ~970× under the payload for RF noise
+                // (~97% compression). Only rescale when the unscaled raw
+                // estimate is far (100×) below the payload; a payload within
+                // the framing-overhead margin of the raw estimate means the
+                // tag count is the true on-disk count and stands unchanged.
+                if uncompressed * 100 < audio_bytes as u128
+                    && uncompressed * 1000 >= audio_bytes as u128
+                {
                     add_warning(
                         r,
                         &format!(
@@ -1026,7 +1045,7 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
                         ),
                     );
                     vorbis_total = Some(ts.saturating_mul(1000));
-                } else {
+                } else if uncompressed * 1000 < audio_bytes as u128 {
                     add_warning(
                         r,
                         &format!(
@@ -1036,6 +1055,9 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
                     );
                     vorbis_total = None;
                 }
+                // else: payload within the framing-overhead margin of the raw
+                // estimate — the tag count is trusted as-is (self-consistent
+                // file; rescaling it here would inflate the duration 1000×).
             }
         }
     }
@@ -1445,6 +1467,69 @@ mod tests {
     }
 
     #[test]
+    fn vorbis_later_schema_tag_stands_on_verbatim_12bit_payload() {
+        // A true 12-bit RF capture whose verbatim payload sits a fraction of
+        // a percent ABOVE the raw sample size (per-frame overhead: frame +
+        // subframe headers, byte-alignment pad, CRC-16 — exactly what the
+        // in-tree enc12 writer emits for predictor-defeating content). The
+        // old Sanity-2 check tripped on `uncompressed < audio_bytes` alone
+        // and falsely rescaled the tag ×1000 (40M → 40B: a phantom 33:20
+        // duration that broke every cut plan). A genuine /1000-unit tag
+        // lands ~970× under the payload for RF noise; 0.25% over must keep
+        // the tag count as the on-disk count.
+        let mut v = Vec::new();
+        v.extend_from_slice(b"fLaC");
+        v.extend_from_slice(&[0x00, 0x00, 0x00, 34]);
+        v.extend_from_slice(&4096u16.to_be_bytes());
+        v.extend_from_slice(&4096u16.to_be_bytes());
+        v.extend_from_slice(&[0, 0, 0]);
+        v.extend_from_slice(&[0, 0, 0]);
+        // rate 20000 (kHz domain), mono, bps-1 = 11 (12-bit); STREAMINFO
+        // total = 40_000 = the /1000 kHz-domain count the MISRC writer leaves
+        // (the tag is the authoritative 1:1 on-disk count).
+        let packed: u64 = (20_000u64 << 44) | (11u64 << 36) | 40_000;
+        v.extend_from_slice(&packed.to_be_bytes());
+        v.extend_from_slice(&[0u8; 16]);
+        let tags = [
+            ("RF_TOTAL_SAMPLES", "400000"),
+            ("RF_SAMPLE_RATE", "20000000"),
+            ("RF_SAMPLE_RATE_KHZ", "20000"),
+        ];
+        let mut body = Vec::new();
+        let vendor = b"fc-test";
+        body.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        body.extend_from_slice(vendor);
+        body.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for (k, val) in tags {
+            let entry = format!("{k}={val}");
+            body.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            body.extend_from_slice(entry.as_bytes());
+        }
+        v.push(0x84); // VORBIS_COMMENT, last metadata block
+        let len = body.len() as u32;
+        v.extend_from_slice(&len.to_be_bytes()[1..4]);
+        v.extend_from_slice(&body);
+        // "Audio" payload: 400,000 12-bit samples = 600,000 B raw; the
+        // verbatim payload sits ~0.25% over (mirroring the real 40M-sample
+        // fixture: 60,000,000 raw → 60,124,782 B payload). Only the byte
+        // COUNT matters to the probe (metadata-only read; the total is
+        // known so no frame scan runs).
+        v.extend(std::iter::repeat(0u8).take(601_500));
+        let p = write_temp("fc_test_vorbis_verbatim12.flac", &v);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!(r.is_rf);
+        assert!(r.total_samples_from_vorbis);
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(
+            r.total_samples, 400_000,
+            "verbatim framing overhead must not rescale the tag ×1000"
+        );
+        assert!(r.warnings.is_empty(), "no false rescale warning: {}", r.warnings);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn no_vorbis_tags_header_rate_x1000_rule_applies() {
         let flac = make_flac_with_tags(20_000, 200_000_000, &[]);
         let p = write_temp("fc_test_vorbis_none.flac", &flac);
@@ -1585,6 +1670,15 @@ mod tests {
             ("tape.u16", InputFormat::U16),
             ("tape.r16", InputFormat::U16),
             ("tape.s16", InputFormat::S16),
+            // Reversed <bits><sign> naming (same formats).
+            ("tape.8u", InputFormat::U8),
+            ("tape.8s", InputFormat::S8),
+            ("tape.16u", InputFormat::U16),
+            ("tape.16s", InputFormat::S16),
+            // Ambiguous-no-header extensions default to u8.
+            ("tape.raw", InputFormat::U8),
+            ("tape.bin", InputFormat::U8),
+            ("tape.pcm", InputFormat::U8),
             ("tape.lds_ldf.ldf", InputFormat::Flac),
         ];
         for (name, want) in cases {

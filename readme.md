@@ -22,7 +22,7 @@ whose FLAC header total is unknown.
 |---|---|---|
 | FLAC (`.flac`, `.ldf`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
 | PCM WAV (`.wav`) | header | header: audio rate as-is; >1 MHz = real RF rate; else /1000 |
-| headerless raw PCM `.u8` `.u16` `.s8` `.s16` (also `.r8`/`.r16`/`.raw`/`.bin`) | extension | filename only: an `<n>msps` hint (e.g. `..._8-bit_20msps.u8`) is REQUIRED |
+| headerless raw PCM `.u8` `.u16` `.s8` `.s16` (also `.r8`/`.r16`, the reversed `.8u`/`.8s`/`.16u`/`.16s`, and `.raw`/`.bin`/`.pcm`) | extension | filename only: an `<n>msps` hint (e.g. `..._8-bit_20msps.u8`) is REQUIRED |
 
 - Unknown extensions with a `fLaC` or `RIFF` magic header are detected by
   sniffing the first bytes of the file, so renamed captures just work.
@@ -86,9 +86,10 @@ If you build FLAC-Chop from source, SoX still needs to be available on PATH
 ## Using the GUI
 
 1. **Browse** to a capture file — FLAC (`.flac`/`.ldf`), PCM WAV, or headerless
-   raw PCM (`.u8`/`.u16`/`.s8`/`.s16`); any file with a matching magic header
-   is accepted too. Drag-and-drop takes any local file and lets the probe
-   decide (a clear error appears if the format is unsupported).
+   raw PCM (`.u8`/`.u16`/`.s8`/`.s16`, also `.r8`/`.r16`/`.8u`/`.8s`/`.16u`/`.16s`/`.raw`/`.bin`/`.pcm`);
+   any file with a matching magic header is accepted too. Drag-and-drop takes
+   any local file and lets the probe decide (a clear error appears if the
+   format is unsupported).
 2. The probe runs on a background thread; the "Total (real)" label shows the
    real-time duration and a provenance tag (`vorbis RF_TOTAL_SAMPLES`,
    `companion file`, `scanned from frames`, or `wrap-corrected +N×2³⁶`). If
@@ -134,7 +135,8 @@ flac-chop --version
 ```
 
 - `<in>`: FLAC (`.flac`/`.ldf`/`fLaC` magic), PCM WAV, or headerless raw PCM
-  (`.u8`/`.u16`/`.s8`/`.s16`; raw needs an `<n>msps` filename hint).
+  (`.u8`/`.u16`/`.s8`/`.s16`/`.r8`/`.r16`/`.8u`/`.8s`/`.16u`/`.16s`/`.raw`/`.bin`/`.pcm`;
+  raw needs an `<n>msps` filename hint).
 - `<out>`: a full `.flac` output path OR a directory. A directory gets a
   renamed stem reflecting the chosen rate/bits (MISRC convention:
   `<base>_<B>-bit_<N>msps`, e.g. `tape_8-bit_20msps` cut to 16 MSPS 6-bit
