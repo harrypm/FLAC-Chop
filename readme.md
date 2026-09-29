@@ -6,17 +6,35 @@
 
 A small, cross-platform tool for **sample-exact cutting of RF-capture files**
 
-(Ideally produced by the [MISRC-GUI](https://github.com/harrypm/MISRC-GUI) pipeline)
+Ideally using captures produced by the [MISRC-GUI](https://github.com/harrypm/MISRC-GUI) pipeline, it also has cross-integration with [tbc-tools](https://github.com/harrypm/tbc-tools/) for frame exact extraction and analysis use. 
 
 A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
 [SoX](https://sox.sourceforge.net/) performs the actual cut. The GUI is Qt6.
 
 It correctly handles the things that trip up generic audio editors on these
 files: the RF "20 kHz header = 20 MSPS real" convention, the 36-bit
-`total_samples` wrap that long captures hit, and unfinalized/piped captures
-whose FLAC header total is unknown.
+`total_samples` wrap that long captures hit, and unfinalized/piped captures whose FLAC header total is unknown.
+
+<img width="400" height="" alt="main" src="https://github.com/user-attachments/assets/fba019f3-8ceb-4aea-b12c-26ed181afdce" />
+
+<img width="400" height="" alt="metadata" src="https://github.com/user-attachments/assets/1e159ded-8b95-43bd-836d-833aa2e1a29c" />
+
+
+## Downloads
+
+
+Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://github.com/harrypm/FLAC-Chop/releases)
+
+Packaged release artifacts are self-contained: they bundle SoX and required
+runtime libraries. 
+
+You should not need to install SoX separately when using
+release downloads however if you build FLAC-Chop from source, SoX still needs to be available on PATH
+(or via `FLAC_CHOP_SOX=/path/to/sox`).
+
 
 ## Supported input formats
+
 
 | Input | Recognized by | Rate source |
 |---|---|---|
@@ -35,25 +53,7 @@ whose FLAC header total is unknown.
   equivalent FLAC, so sinc cutoffs and resample modes behave identically.
 
 
-## Downloads
-
-
-Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://github.com/harrypm/FLAC-Chop/releases)
-
-Packaged release artifacts are self-contained: they bundle SoX and required
-runtime libraries. You should not need to install SoX separately when using
-release downloads.
-
-If you build FLAC-Chop from source, SoX still needs to be available on PATH
-(or via `FLAC_CHOP_SOX=/path/to/sox`).
-
-
 ## Features
-
-<img width="400" height="" alt="main" src="https://github.com/user-attachments/assets/fba019f3-8ceb-4aea-b12c-26ed181afdce" />
-
-<img width="400" height="" alt="metadata" src="https://github.com/user-attachments/assets/1e159ded-8b95-43bd-836d-833aa2e1a29c" />
-
 
 - Real-time HH:MM:SS duration for RF captures, not the 1000×-wrong header value.
 - Handles `total_samples` wrapping past 2³⁶ (recovers the true sample count).
