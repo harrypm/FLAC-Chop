@@ -81,10 +81,14 @@ pub struct FcProbe {
     /// field was appended to the struct — the C header (flacchop.h) must be
     /// regenerated to match before the GUI links against this build.
     pub warnings: [c_char; 512],
-    /// Sniffed input container format: 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16.
-    /// Appended at the end of the struct (ABI-append-only) — flacchop.h must
-    /// be updated in lockstep.
+    /// Sniffed input container format: 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16
+    /// 6=ogg-flac (the real-world `.ldf`). Appended at the end of the struct
+    /// (ABI-append-only) — flacchop.h must be updated in lockstep.
     pub format: u32,
+    /// 1 if the total came from the last Ogg page's granule position (Ogg
+    /// FLAC input: exact, 64-bit, valid even with an unfinalised STREAMINFO).
+    /// Appended after `format` (ABI-append-only).
+    pub total_samples_from_ogg: i32,
 }
 
 impl Default for FcProbe {
@@ -112,6 +116,7 @@ impl Default for FcProbe {
             error: [0; 256],
             warnings: [0; 512],
             format: 0,
+            total_samples_from_ogg: 0,
         }
     }
 }
@@ -182,8 +187,10 @@ fn fc_probe_impl(path: *const c_char, out: &mut FcProbe) {
         out.msps = m;
         out.msps_known = 1;
     }
-    // 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16 (probe::InputFormat discriminants).
+    // 0=flac 1=wav 2=u8 3=s8 4=u16 5=s16 6=ogg-flac (probe::InputFormat
+    // discriminants).
     out.format = res.format as u32;
+    out.total_samples_from_ogg = if res.total_samples_from_ogg { 1 } else { 0 };
     set_str(&mut out.warnings, &res.warnings);
 }
 
@@ -689,7 +696,8 @@ pub fn rf_template_from_probe(p: &FcProbe) -> Vec<(String, String)> {
         // (later) — scale only when the audio-payload check says /1000.
         let from_real = p.total_samples_from_vorbis != 0
             || p.total_samples_from_companion != 0
-            || p.total_samples_scanned != 0;
+            || p.total_samples_scanned != 0
+            || p.total_samples_from_ogg != 0;
         let mut real_total = p.total_samples;
         if !from_real {
             let bps = (p.channels as u64) * ((p.bits_per_sample as u64) / 8);

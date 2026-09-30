@@ -31,6 +31,7 @@
 
 use claxon::{FlacReader, FlacReaderOptions};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 /// RF metadata pulled from a FLAC's Vorbis comment block. Any field may be
@@ -49,19 +50,19 @@ pub struct RfTags {
 
 /// Parse the first value of a Vorbis comment tag as `u64` (case-insensitive
 /// name lookup). Returns `None` if absent or not a clean integer.
-fn tag_u64(reader: &FlacReader<File>, name: &str) -> Option<u64> {
+fn tag_u64<R: Read>(reader: &FlacReader<R>, name: &str) -> Option<u64> {
     reader.get_tag(name).next().and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Parse the first value of a Vorbis comment tag as `f64`.
-fn tag_f64(reader: &FlacReader<File>, name: &str) -> Option<f64> {
+fn tag_f64<R: Read>(reader: &FlacReader<R>, name: &str) -> Option<f64> {
     reader.get_tag(name).next().and_then(|v| v.parse::<f64>().ok())
 }
 
 /// Read the RF metadata tags out of an already-open claxon reader (which must
 /// have been created with `read_vorbis_comment: true`). Lets the probe reuse
 /// its own STREAMINFO reader instead of opening and re-parsing the file.
-pub fn rf_tags_from_reader(reader: &FlacReader<File>) -> RfTags {
+pub fn rf_tags_from_reader<R: Read>(reader: &FlacReader<R>) -> RfTags {
     RfTags {
         total_samples: tag_u64(reader, "RF_TOTAL_SAMPLES"),
         sample_rate: tag_u64(reader, "RF_SAMPLE_RATE"),

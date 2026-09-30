@@ -38,12 +38,30 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 
 | Input | Recognized by | Rate source |
 |---|---|---|
-| FLAC (`.flac`, `.ldf`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
+| Native FLAC (`.flac`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
+| **Ogg FLAC** (`.ldf`, `.oga`, `.raw.oga`, `.ogg` — any file starting with `OggS` + a FLAC mapping header) | magic, never the extension | header (RF /1000 rule applies); length from the last Ogg page |
 | PCM WAV (`.wav`) | header | header: audio rate as-is; >1 MHz = real RF rate; else /1000 |
 | headerless raw PCM `.u8` `.u16` `.s8` `.s16` (also `.r8`/`.r16`, the reversed `.8u`/`.8s`/`.16u`/`.16s`, and `.raw`/`.bin`/`.pcm`) | extension | filename only: an `<n>msps` hint (e.g. `..._8-bit_20msps.u8`) is REQUIRED |
 
-- Unknown extensions with a `fLaC` or `RIFF` magic header are detected by
-  sniffing the first bytes of the file, so renamed captures just work.
+- Unknown extensions with a `fLaC`, `OggS` or `RIFF` magic header are detected
+  by sniffing the first bytes of the file, so renamed captures just work.
+- **`.ldf` files are Ogg-wrapped FLAC** (vhs-decode's `ld-compress` runs
+  `ffmpeg … -acodec flac -f ogg`), not native FLAC. FLAC-Chop reads them with
+  its own Ogg demuxer: the exact length comes from the last page's granule
+  position (64-bit, so no 36-bit wrap, and correct even though a piped ffmpeg
+  write leaves STREAMINFO `total_samples` = 0), and a cut losslessly remuxes
+  only the pages it needs into a temporary native FLAC (frame bytes are copied,
+  frame numbers rebased, CRCs recomputed — nothing is re-encoded) that the
+  normal SoX pipeline then trims. This works with the bundled SoX, which has no
+  Ogg support. The temp file is written next to the output (falling back to the
+  system temp dir) and is removed afterwards; it is only as large as the cut.
+  Cuts are always written as native `.flac`, whatever the input container.
+- Clear errors instead of a generic failure: non-FLAC Ogg (Vorbis/Opus/…), a
+  headerless packed `.lds`, and an ID3v2-prefixed FLAC each get a message that
+  says what the file is and what to do.
+- Ogg FLAC metadata is read-only in the Metadata Editor tab (Ogg header packets
+  cannot be rewritten in place); the cut output is a native FLAC whose tags are
+  editable.
 - Raw PCM files have no header at all: the rate comes only from the filename
   (`..._20msps.u8` → 20 MSPS) and total samples from the file size. Without an
   `<n>msps` hint the probe refuses to guess.
@@ -88,7 +106,7 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 
 ## Using the GUI
 
-1. **Browse** to a capture file — FLAC (`.flac`/`.ldf`), PCM WAV, or headerless
+1. **Browse** to a capture file — FLAC (`.flac`), Ogg FLAC (`.ldf`/`.oga`), PCM WAV, or headerless
    raw PCM (`.u8`/`.u16`/`.s8`/`.s16`, also `.r8`/`.r16`/`.8u`/`.8s`/`.16u`/`.16s`/`.raw`/`.bin`/`.pcm`);
    any file with a matching magic header is accepted too. Drag-and-drop takes
    any local file and lets the probe decide (a clear error appears if the
@@ -137,7 +155,7 @@ flac-chop --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
 flac-chop --version
 ```
 
-- `<in>`: FLAC (`.flac`/`.ldf`/`fLaC` magic), PCM WAV, or headerless raw PCM
+- `<in>`: FLAC (`.flac`/`fLaC` magic), Ogg FLAC (`.ldf`/`.oga`/`OggS` magic), PCM WAV, or headerless raw PCM
   (`.u8`/`.u16`/`.s8`/`.s16`/`.r8`/`.r16`/`.8u`/`.8s`/`.16u`/`.16s`/`.raw`/`.bin`/`.pcm`;
   raw needs an `<n>msps` filename hint).
 - `<out>`: a full `.flac` output path OR a directory. A directory gets a

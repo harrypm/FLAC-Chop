@@ -24,6 +24,7 @@
 //! expands the data" (correct for RF noise, which compresses poorly).
 
 use claxon::{FlacReader, FlacReaderOptions};
+use crate::ogg;
 use crate::rate::resolve_real_rate;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -72,6 +73,10 @@ pub struct ProbeResult {
     /// record). Highest-priority source — beats the header, companions, and
     /// frame scan.
     pub total_samples_from_vorbis: bool,
+    /// True if the total was read from the last Ogg page's granule position
+    /// (Ogg FLAC / `.ldf` input). Exact, 64-bit (no 36-bit wrap), and valid
+    /// even when the encoder never finalised STREAMINFO.
+    pub total_samples_from_ogg: bool,
     /// True if `RF_SAMPLE_RATE` was present in the Vorbis comment and used to
     /// confirm the RF /1000 rate resolution.
     pub rate_from_vorbis: bool,
@@ -110,6 +115,7 @@ impl Default for ProbeResult {
             total_samples_scanned: false,
             total_samples_from_companion: false,
             total_samples_from_vorbis: false,
+            total_samples_from_ogg: false,
             rate_from_vorbis: false,
             bits_per_sample: 0,
             channels: 0,
@@ -134,12 +140,15 @@ fn add_warning(r: &mut ProbeResult, msg: &str) {
 /// Walk the FLAC metadata block headers from the start of `file` and return the
 /// byte offset just past the last metadata block (i.e. the first audio frame).
 /// Validates the `fLaC` stream marker. Does not parse block bodies.
-fn find_audio_offset(file: &mut File) -> Result<u64, String> {
+pub(crate) fn find_audio_offset(file: &mut File) -> Result<u64, String> {
     file.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).map_err(|e| e.to_string())?;
     if &magic != b"fLaC" {
-        return Err("not a FLAC stream (missing fLaC marker)".to_string());
+        return Err(format!(
+            "not a native FLAC stream (missing fLaC marker; first bytes {:02x} {:02x} {:02x} {:02x})",
+            magic[0], magic[1], magic[2], magic[3]
+        ));
     }
     loop {
         let mut hdr = [0u8; 4];
@@ -194,7 +203,7 @@ const CRC8_TABLE: [u8; 256] = [
 /// Read the FLAC "UTF-8"-coded variable-length integer from the start of `w`.
 /// Returns `(value, bytes_consumed)` or `None` if invalid / not enough bytes.
 /// Mirrors claxon `frame::read_var_length_int`.
-fn read_utf8_coded(w: &[u8]) -> Option<(u64, usize)> {
+pub(crate) fn read_utf8_coded(w: &[u8]) -> Option<(u64, usize)> {
     if w.is_empty() {
         return None;
     }
@@ -235,7 +244,7 @@ fn read_utf8_coded(w: &[u8]) -> Option<(u64, usize)> {
 /// caller applies the sequential-number cross-check (so this does not need the
 /// expected value). `w` must be at least `MAX_HEADER_LEN` bytes when not at EOF.
 pub const MAX_HEADER_LEN: usize = 17;
-fn parse_frame_header(w: &[u8]) -> Option<(u16, usize, u64, bool)> {
+pub(crate) fn parse_frame_header(w: &[u8]) -> Option<(u16, usize, u64, bool)> {
     if w.len() < 2 {
         return None;
     }
@@ -579,6 +588,11 @@ pub enum InputFormat {
     U16,
     /// Headerless raw signed 16-bit little-endian (DdD s16 / general s16le).
     S16,
+    /// FLAC inside an Ogg container (`OggS` magic, `0x7F "FLAC"` mapping
+    /// header) — the real-world `.ldf` / `.raw.oga` ld-compress output.
+    /// Appended LAST: the discriminants are part of the FFI format codes
+    /// (0=flac 1=wav 2=u8 3=s8 4=u16 5=s16 6=ogg-flac).
+    OggFlac,
 }
 
 impl InputFormat {
@@ -587,6 +601,8 @@ impl InputFormat {
     pub fn sox_type(&self) -> Option<&'static str> {
         match self {
             InputFormat::Flac => None, // sniffed from the fLaC marker
+            // Ogg FLAC is remuxed to a temp native FLAC before SoX sees it.
+            OggFlac => None,
             Wav => None,
             InputFormat::U8 => Some("u8"),
             S8 => Some("s8"),
@@ -598,6 +614,7 @@ impl InputFormat {
     pub fn as_str(&self) -> &'static str {
         match self {
             Flac => "flac",
+            OggFlac => "ogg-flac",
             Wav => "wav",
             U8 => "u8",
             S8 => "s8",
@@ -607,20 +624,39 @@ impl InputFormat {
     }
 }
 
-use InputFormat::{Flac, S16, S8, U16, U8, Wav};
+use InputFormat::{Flac, OggFlac, S16, S8, U16, U8, Wav};
 
 /// Sniff the container format: FLAC/WAV by magic header, raw PCM by the
 /// common ld-decode/cxadc file extensions (.u8/.s8/.u16/.s16/.r8/.r16 and
 /// the reversed <bits><sign> form .8u/.8s/.16u/.16s), .pcm (u8 default),
-/// .ldf (which is native FLAC from the vhs-decode pipeline), and anything
-/// else by header magic. Returns Err for files we cannot handle.
+/// .ldf (Ogg-wrapped FLAC from the vhs-decode `ld-compress` pipeline — but
+/// also accepted as native FLAC when it carries a bare `fLaC` marker), and
+/// anything else by header magic. The container is ALWAYS decided by content
+/// first: `fLaC` → native FLAC, `OggS` + FLAC mapping header → Ogg FLAC,
+/// `RIFF/WAVE` → WAV; the extension is only consulted for headerless raw PCM.
+/// Returns Err (with an actionable message) for files we cannot handle.
 pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
     use std::io::Read;
     let mut f = File::open(path).map_err(|e| format!("open failed: {e}"))?;
-    let mut magic = [0u8; 12];
+    let mut magic = [0u8; 64];
     let n = f.read(&mut magic).map_err(|e| e.to_string())?;
     if n >= 4 && &magic[..4] == b"fLaC" {
         return Ok(Flac);
+    }
+    if n >= 4 && &magic[..4] == b"OggS" {
+        return match ogg::sniff_ogg(&magic[..n]) {
+            ogg::OggKind::Flac => Ok(OggFlac),
+            ogg::OggKind::Other(codec) => Err(format!(
+                "this is an Ogg {codec} stream, not Ogg FLAC — FLAC-Chop only cuts FLAC RF/audio captures"
+            )),
+            ogg::OggKind::NotOgg => unreachable!("OggS magic was just matched"),
+        };
+    }
+    if n >= 10 && &magic[..3] == b"ID3" {
+        return Err(
+            "this FLAC carries a leading ID3v2 tag, which FLAC-Chop cannot read — strip it first, e.g. `ffmpeg -i in.flac -c copy -map_metadata -1 -write_id3v2 0 out.flac`"
+                .to_string(),
+        );
     }
     if n >= 12 && &magic[..4] == b"RIFF" && &magic[8..12] == b"WAVE" {
         return Ok(Wav);
@@ -641,10 +677,16 @@ pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
         "8s" => Ok(S8),
         "16u" => Ok(U16),
         "16s" => Ok(S16),
-        // .ldf is the vhs-decode pipeline's native FLAC extension; a .ldf
-        // whose magic is missing is corrupt anyway, so routing it to the FLAC
-        // prober yields the right "not a valid FLAC stream" error.
+        // .ldf is the vhs-decode pipeline's compressed-RF extension. Real
+        // files are Ogg FLAC (caught by the OggS magic above); a .ldf with
+        // neither magic is corrupt, so routing it to the FLAC prober yields
+        // a precise "first bytes …" error.
         "ldf" => Ok(Flac),
+        // Uncompressed packed-10-bit RF: no header, cannot be cut by sample.
+        "lds" => Err(
+            "a .lds file is headerless packed 10-bit RF — it cannot be probed or cut here; compress/convert it first (vhs-decode `ld-compress` → .ldf, or `ld-lds-converter -u` → 16-bit .r16)"
+                .to_string(),
+        ),
         "raw" | "bin" | "pcm" => {
             // 8-bit vs 16-bit raw is ambiguous without a header; the cxadc
             // 8-bit mode is by far the most common, so default to u8 and say so.
@@ -771,6 +813,7 @@ pub fn probe(path: &Path) -> ProbeResult {
 
     match fmt {
         InputFormat::Flac => probe_flac(path, &mut r),
+        InputFormat::OggFlac => probe_ogg_flac(path, &mut r),
         InputFormat::Wav => probe_wav(path, &mut r),
         InputFormat::U8 | InputFormat::S8 | InputFormat::U16 | InputFormat::S16 => {
             probe_raw(path, &mut r, fmt)
@@ -847,9 +890,8 @@ fn probe_raw(path: &Path, r: &mut ProbeResult, fmt: InputFormat) {
     r.total_samples_known = true;
 }
 
-/// The FLAC probe body: STREAMINFO + 36-bit wrap correction + RF vorbis
-/// tags (see the module docs). Never reads audio frames unless the header
-/// total is unknown and no companion exists (frame-header scan).
+/// Native-FLAC probe entry: opens the file, locates the first audio frame,
+/// and hands a metadata-only claxon reader to [`probe_flac_common`].
 fn probe_flac(path: &Path, r: &mut ProbeResult) {
     // Handle for the claxon metadata-only reader (moved into the reader).
     let file = match File::open(path) {
@@ -876,8 +918,6 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
             return;
         }
     };
-    r.audio_offset = audio_offset;
-    let file_size = r.file_size;
 
     // metadata_only + read_vorbis_comment => claxon parses the metadata blocks
     // (STREAMINFO + Vorbis comment) and stops before any audio frame. Reading
@@ -894,6 +934,50 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
             return;
         }
     };
+    probe_flac_common(path, r, reader, audio_offset, Some(off_file), None);
+}
+
+/// Ogg FLAC probe entry (`.ldf` / `.oga`): parses the Ogg mapping header +
+/// metadata packets, presents them to claxon as a native metadata chain, and
+/// reads the EXACT length from the last Ogg page's granule position.
+fn probe_ogg_flac(path: &Path, r: &mut ProbeResult) {
+    let hdr = match ogg::read_header(path) {
+        Ok(h) => h,
+        Err(e) => {
+            r.error = e;
+            return;
+        }
+    };
+    let opts = FlacReaderOptions {
+        metadata_only: true,
+        read_vorbis_comment: true,
+    };
+    let reader = match FlacReader::new_ext(std::io::Cursor::new(hdr.native_bytes()), opts) {
+        Ok(rd) => rd,
+        Err(e) => {
+            r.error = format!("not a valid Ogg FLAC stream: {e}");
+            return;
+        }
+    };
+    let granule = ogg::last_granule(path, &hdr);
+    probe_flac_common(path, r, reader, hdr.audio_offset, None, granule);
+}
+
+/// The shared FLAC probe body: STREAMINFO + 36-bit wrap correction + RF
+/// vorbis tags (see the module docs). Never reads audio frames unless the
+/// header total is unknown and no companion exists (frame-header scan, native
+/// FLAC only — `off_file` is `None` for Ogg FLAC, whose exact length comes
+/// from the last page's granule position, `ogg_total`).
+fn probe_flac_common<R: Read>(
+    path: &Path,
+    r: &mut ProbeResult,
+    reader: FlacReader<R>,
+    audio_offset: u64,
+    mut off_file: Option<File>,
+    ogg_total: Option<u64>,
+) {
+    r.audio_offset = audio_offset;
+    let file_size = r.file_size;
 
     let si = reader.streaminfo();
     r.ok = true;
@@ -965,6 +1049,39 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
     r.declared_total_samples = declared;
     r.total_samples = declared;
     r.total_samples_known = known;
+
+    // Ogg FLAC: the last page's granule position IS the exact on-disk sample
+    // count (64-bit: no 36-bit wrap; correct for unfinalised ffmpeg-piped
+    // `.ldf` whose STREAMINFO total is 0). It describes the audio physically
+    // present in this file, so it outranks the header and the RF tags.
+    if let Some(g) = ogg_total {
+        r.total_samples = g;
+        r.total_samples_known = true;
+        r.total_samples_from_ogg = true;
+        if declared != 0 && declared != g {
+            add_warning(
+                r,
+                &format!(
+                    "Ogg FLAC STREAMINFO declares {declared} samples but the stream holds {g} (from the last Ogg page); using {g}"
+                ),
+            );
+        }
+        if is_rf {
+            if let Some(ts) = rf_tags.total_samples {
+                let tag_total = ts.saturating_mul(vorbis_scale);
+                let tol = u64::from(si.max_block_size.max(1)) * 2;
+                if ts > 0 && tag_total.abs_diff(g) > tol {
+                    add_warning(
+                        r,
+                        &format!(
+                            "vorbis RF_TOTAL_SAMPLES ({tag_total}) disagrees with the Ogg stream length ({g}); using the stream length"
+                        ),
+                    );
+                }
+            }
+        }
+        return;
+    }
 
     // --- Total sample count resolution (priority order) ---
     // 1. Vorbis `RF_TOTAL_SAMPLES` tag — authoritative, in-file, exact (RF
@@ -1153,12 +1270,14 @@ fn probe_flac(path: &Path, r: &mut ProbeResult) {
         // no companion was found. We only do this when the header total is
         // genuinely absent; a file that HAS a header total is finalized and is
         // handled by the wrap branch above.
-        if !r.total_samples_from_companion
-            && audio_offset > 0
-            && file_size > audio_offset
-        {
+        if let (false, true, true, Some(scan_file)) = (
+            r.total_samples_from_companion,
+            audio_offset > 0,
+            file_size > audio_offset,
+            off_file.as_mut(),
+        ) {
             let audio_bytes = file_size - audio_offset;
-            match count_samples_by_scanning(&mut off_file, audio_offset, si.min_frame_size) {
+            match count_samples_by_scanning(scan_file, audio_offset, si.min_frame_size) {
                 Ok(scanned) if scanned > 0 => {
                     // FLAC never expands the data, so the uncompressed size of
                     // the scanned samples must be >= the compressed payload.
@@ -1658,6 +1777,77 @@ mod tests {
         let p = write_temp("fc_test_junk.unknownext", &[0u8; 64]);
         assert!(sniff_format(&p).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    // --- Ogg FLAC (.ldf) ------------------------------------------------
+
+    #[test]
+    fn ogg_flac_ldf_is_sniffed_by_content_and_probed_exactly() {
+        // The real-world .ldf: Ogg-wrapped FLAC whose STREAMINFO total is 0
+        // (piped ffmpeg). The probe must report the exact length from the
+        // last page's granule, the /1000 RF rate, and 12-bit mono.
+        let n = 300_000usize;
+        let (p, _) = ogg::testutil::make_ogg_ldf("fc_probe_ogg_ldf", n, 40_000, 255, true, true);
+        assert_eq!(sniff_format(&p).unwrap(), InputFormat::OggFlac);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(r.format, InputFormat::OggFlac);
+        assert_eq!(r.declared_total_samples, 0);
+        assert_eq!(r.total_samples, n as u64);
+        assert!(r.total_samples_known && r.total_samples_from_ogg);
+        assert!(!r.total_samples_scanned && !r.total_samples_from_vorbis);
+        assert_eq!(r.header_sample_rate, 40_000);
+        assert!(r.is_rf);
+        assert!((r.real_rate_hz - 40_000_000.0).abs() < 1e-6);
+        assert_eq!(r.bits_per_sample, 12);
+        assert_eq!(r.channels, 1);
+        assert!(r.audio_offset > 0 && r.audio_offset < r.file_size);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn ogg_flac_extension_does_not_matter() {
+        // .oga / .raw.oga / no extension: content wins over extension.
+        let (p, _) = ogg::testutil::make_ogg_ldf("fc_probe_ogg_ext", 20_000, 20_000, 255, false, false);
+        for ext in ["oga", "raw.oga", "ogg", "bin"] {
+            let q = p.with_file_name(format!("fc_probe_ogg_ext.{ext}"));
+            std::fs::copy(&p, &q).unwrap();
+            assert_eq!(sniff_format(&q).unwrap(), InputFormat::OggFlac, "ext {ext}");
+            let r = probe(&q);
+            assert!(r.ok && r.total_samples == 20_000, "ext {ext}: {}", r.error);
+            let _ = std::fs::remove_file(&q);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn non_flac_ogg_and_other_dead_ends_get_actionable_errors() {
+        // Ogg Vorbis: named, not a generic failure.
+        let mut vorbis = b"OggS\0\x02".to_vec();
+        vorbis.extend_from_slice(&[0u8; 20]); // granule/serial/seq/crc
+        vorbis.push(1); // one segment
+        vorbis.push(30);
+        vorbis.extend_from_slice(b"\x01vorbis\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0");
+        let p = write_temp("fc_test_vorbis.ogg", &vorbis);
+        let e = sniff_format(&p).unwrap_err();
+        assert!(e.contains("Vorbis") && e.contains("not Ogg FLAC"), "got: {e}");
+        // .lds: explains what it is and what to do.
+        let p2 = write_temp("fc_test_tape.lds", &[0u8; 64]);
+        let e2 = sniff_format(&p2).unwrap_err();
+        assert!(e2.contains(".lds") && e2.contains("packed 10-bit"), "got: {e2}");
+        // ID3v2-prefixed FLAC: explains the fix.
+        let mut id3 = b"ID3\x04\0\0\0\0\0\0".to_vec();
+        id3.extend_from_slice(b"fLaC\0\0\0\x22");
+        let p3 = write_temp("fc_test_id3.flac", &id3);
+        let e3 = sniff_format(&p3).unwrap_err();
+        assert!(e3.contains("ID3v2"), "got: {e3}");
+        // A .ldf with neither magic: precise first-bytes error from the probe.
+        let p4 = write_temp("fc_test_bad.ldf", &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0]);
+        let r4 = probe(&p4);
+        assert!(!r4.ok && r4.error.contains("de ad be ef"), "got: {}", r4.error);
+        for q in [p, p2, p3, p4] {
+            let _ = std::fs::remove_file(&q);
+        }
     }
 
     #[test]

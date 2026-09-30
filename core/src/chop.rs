@@ -96,7 +96,10 @@ fn sox_input_args(
     opts: &ChopOptions,
 ) -> Result<Vec<String>, String> {
     Ok(match fmt {
-        InputFormat::Flac => Vec::new(), // SoX sniffs the fLaC marker
+        // SoX sniffs the fLaC marker. (Ogg FLAC never reaches here: the
+        // chop wrapper remuxes it to a temp native FLAC first — the bundled
+        // SoX has no Ogg support.)
+        InputFormat::Flac | InputFormat::OggFlac => Vec::new(),
         InputFormat::Wav => {
             // Pin only real-rate RF WAVs (header > 1 MHz): override SoX's
             // view of the input rate to the /1000 convention so the sinc
@@ -429,8 +432,10 @@ fn make_12bit_s16_feed(
 }
 
 #[cfg(not(feature = "static-sox"))]
-/// Run `sox in out trim <start>s <len>s` with optional output conversion.
-pub fn chop_with_options(
+/// Run `sox in out trim <start>s <len>s` with optional output conversion on
+/// a NATIVE (non-Ogg) input. [`chop_with_options`] is the public entry point:
+/// it remuxes Ogg FLAC inputs to a temp native FLAC and then calls this.
+fn chop_native_input(
     in_path: &str,
     out_path: &str,
     start_samples: u64,
@@ -837,7 +842,7 @@ fn in_hints_for(
     opts: &ChopOptions,
 ) -> Result<Option<InHints>, String> {
     let hints = match fmt {
-        InputFormat::Flac => None,
+        InputFormat::Flac | InputFormat::OggFlac => None,
         InputFormat::Wav => match (opts.is_rf, wav_header_real_rate(in_path)?) {
             (true, Some(real)) if real > 1_000_000.0 => Some(InHints {
                 signal: sox_ffi::sox_signalinfo_t {
@@ -871,7 +876,10 @@ fn in_hints_for(
                     bits_per_sample: bits,
                     ..sox_ffi::sox_encodinginfo_t::default()
                 },
-                filetype: Some(CString::new(fmt.sox_type().unwrap())?),
+                filetype: Some(
+                    CString::new(fmt.sox_type().unwrap())
+                        .map_err(|e| format!("input filetype has an embedded NUL: {e}"))?,
+                ),
             })
         }
     };
@@ -1013,8 +1021,10 @@ unsafe fn run_chain(
             }
         }
 
-        let (ok, stderr) = match err {
-            Some(e) => (false, e),
+        // Borrow `err` (it is matched again below); the flow's own message is
+        // carried by `err`/the final match, so the second tuple field is unused.
+        let (ok, _flow_msg) = match &err {
+            Some(e) => (false, e.clone()),
             None => {
                 let rc = sox_ffi::sox_flow_effects(chain, None, std::ptr::null_mut());
                 if rc == sox_ffi::SOX_SUCCESS {
@@ -1043,12 +1053,13 @@ unsafe fn vol_effect_args(v: f64) -> CString {
 }
 
 #[cfg(feature = "static-sox")]
-/// Run the cut in-process via libSoX. The 6-bit profile is a pure bit-shift
-/// requantization (no dither): pass 1 quantizes onto the 6-bit grid
-/// (vol 0.25 + 8-bit sink rounding), pass 2 rescales x4 back to the MISRC
-/// full-scale container convention (values = 4·round(v/4), lossless on
-/// integer samples, never clipped).
-pub fn chop_with_options(
+/// Run the cut in-process via libSoX on a NATIVE (non-Ogg) input. The 6-bit
+/// profile is a pure bit-shift requantization (no dither): pass 1 quantizes
+/// onto the 6-bit grid (vol 0.25 + 8-bit sink rounding), pass 2 rescales x4
+/// back to the MISRC full-scale container convention (values =
+/// 4·round(v/4), lossless on integer samples, never clipped).
+/// [`chop_with_options`] is the public entry point (it remuxes Ogg FLAC first).
+fn chop_native_input(
     in_path: &str,
     out_path: &str,
     start_samples: u64,
@@ -1190,6 +1201,97 @@ pub fn sox_available() -> bool {
 // Shared helpers.
 // ===========================================================================
 
+/// Deletes the remuxed Ogg-window temp file on every return path.
+struct TempFileGuard(PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Where to put the temp native FLAC for an Ogg FLAC window: next to the
+/// OUTPUT file (the user already needs space there, and `/tmp` is often a
+/// RAM-backed tmpfs), falling back to the system temp dir if that directory
+/// is not writable.
+fn ogg_window_temp_path(out_path: &str) -> PathBuf {
+    let name = format!(".flac-chop-oggsrc-{}.tmp.flac", std::process::id());
+    if let Some(dir) = Path::new(out_path).parent() {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let cand = dir.join(&name);
+        if std::fs::File::create(&cand).is_ok() {
+            return cand;
+        }
+    }
+    std::env::temp_dir().join(name)
+}
+
+/// Cut `length_samples` samples starting at `start_samples` from `in_path`,
+/// with the optional rate / bit-depth conversion in `opts`. Public entry point
+/// for both backends.
+///
+/// Ogg FLAC inputs (the real-world `.ldf`) are first reduced to exactly the
+/// pages covering the cut and remuxed — losslessly, no re-encode — into a
+/// temporary native FLAC ([`crate::ogg::remux_window`]); the normal SoX /
+/// 12-bit pipeline then runs on that file with the start shifted by the
+/// window's first sample. The bundled SoX has no Ogg support, so this is what
+/// makes `.ldf` work in the release builds (and the static-sox backend).
+pub fn chop_with_options(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    opts: ChopOptions,
+) -> ChopResult {
+    let fail = |stderr: String| ChopResult { ok: false, exit_code: -1, stderr };
+    let fmt = match opts
+        .input_format
+        .map_or_else(|| probe::sniff_format(Path::new(in_path)), Ok)
+    {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    if fmt != InputFormat::OggFlac {
+        return chop_native_input(in_path, out_path, start_samples, length_samples, opts);
+    }
+
+    CANCEL.store(false, Ordering::Relaxed);
+    let tmp = ogg_window_temp_path(out_path);
+    let _guard = TempFileGuard(tmp.clone());
+    let win = match crate::ogg::remux_window(
+        Path::new(in_path),
+        &tmp,
+        start_samples,
+        length_samples,
+        &|| CANCEL.load(Ordering::Relaxed),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            if e.contains("cancelled") {
+                CANCEL.store(false, Ordering::Relaxed); // consume the flag
+            }
+            return fail(format!("Ogg FLAC: {e}"));
+        }
+    };
+    let mut inner = opts;
+    inner.input_format = Some(InputFormat::Flac);
+    let mut r = chop_native_input(
+        &tmp.to_string_lossy(),
+        out_path,
+        start_samples - win.first_sample,
+        length_samples,
+        inner,
+    );
+    let note = format!(
+        "note: Ogg FLAC input — cut from a lossless native-FLAC remux of samples {}..{} ({} frames)",
+        win.first_sample,
+        win.first_sample + win.samples,
+        win.frames
+    );
+    r.stderr = if r.stderr.is_empty() { note } else { format!("{note}\n{}", r.stderr) };
+    r
+}
+
 // ===========================================================================
 // 12-bit FLAC (MISRC/HdSDAOH standard): true signed 12-bit samples
 // [-2048, 2047], STREAMINFO bits_per_sample = 12, mono.
@@ -1289,7 +1391,18 @@ fn validate_cut_output(out_path: &str, stderr: &str) -> Result<(), String> {
         ));
     }
     let len = std::fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
-    if len < 200 {
+    // A header-only FLAC ends exactly where its metadata chain ends. Use the
+    // real metadata end when the output parses as FLAC, so a legitimately tiny
+    // cut (a few samples is ~130 bytes, under the old fixed 200-byte rule) is
+    // accepted; fall back to the fixed threshold only for unparseable files.
+    let frameless = match std::fs::File::open(out_path)
+        .map_err(|e| e.to_string())
+        .and_then(|mut f| probe::find_audio_offset(&mut f))
+    {
+        Ok(audio_off) => len <= audio_off,
+        Err(_) => len < 200,
+    };
+    if frameless {
         return Err(format!(
             "sox wrote no audio frames ({len}-byte output) — the input's header total is unreliable or the cut window is past the real end of the stream"
         ));
@@ -1359,7 +1472,12 @@ pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -
     let p = Path::new(in_path);
     let src_stem = p.file_stem()?.to_str()?;
     let stem = if !stem_override.is_empty() { stem_override } else { src_stem };
-    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("flac");
+    // The cut is ALWAYS written as FLAC, whatever the input container was:
+    // reusing the input's extension would name a FLAC `x-cut.ldf` / `x-cut.wav`
+    // / `x-cut.u8`, and SoX picks the OUTPUT format from that extension (an
+    // `.ldf` has no SoX handler; `.wav`/`.u8` would write a different format
+    // than the RF Vorbis-tag rewrite and the rest of the pipeline expect).
+    let ext = "flac";
     // out_dir selects where the cut is written. An empty out_dir means "next
     // to the source" (the original sibling -cut.flac behaviour); otherwise the
     // cut goes into the user-chosen directory. A non-existent out_dir is not
@@ -1390,6 +1508,25 @@ mod tests {
     fn output_path_appends_cut() {
         let p = generate_output_path("/tmp/foo/bar.flac", "", "").unwrap();
         assert!(p.ends_with("bar-cut.flac"));
+    }
+
+    #[test]
+    fn output_path_is_always_flac_even_for_ldf_and_raw_inputs() {
+        // Regression: the input's extension used to be reused, producing
+        // `x-cut.ldf` (no SoX output handler) / `x-cut.wav` / `x-cut.u8`.
+        for (input, want) in [
+            ("/tmp/Opening to Pretty in Pink (US VHS, 1986).ldf", "Opening to Pretty in Pink (US VHS, 1986)-cut.flac"),
+            ("/tmp/tape.raw.oga", "tape.raw-cut.flac"),
+            ("/tmp/tape_8-bit_20msps.u8", "tape_8-bit_20msps-cut.flac"),
+            ("/tmp/tape.wav", "tape-cut.flac"),
+            ("/tmp/TAPE.FLAC", "TAPE-cut.flac"),
+        ] {
+            let p = generate_output_path(input, "", "").unwrap();
+            assert!(p.ends_with(want), "{input} -> {p}");
+        }
+        // Stem override path keeps the .flac extension too.
+        let p = generate_output_path("/tmp/cap.ldf", "", "16msps_6-bit").unwrap();
+        assert!(p.ends_with("16msps_6-bit.flac"), "got {p}");
     }
 
     #[test]
@@ -1502,6 +1639,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_tiny_real_flac_and_rejects_header_only_flac() {
+        // A real FLAC (STREAMINFO-only chain, last flag set) followed by a
+        // 13-byte frame is a valid tiny cut even though it is < 200 bytes;
+        // the same header with NO frame bytes must still be rejected.
+        let dir = std::env::temp_dir().join("fc_test_validate");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut hdr = b"fLaC".to_vec();
+        hdr.extend_from_slice(&[0x80, 0, 0, 34]);
+        hdr.extend_from_slice(&[0u8; 34]);
+        let header_only = dir.join("hdr_only_real.flac");
+        std::fs::write(&header_only, &hdr).unwrap();
+        let err = validate_cut_output(header_only.to_str().unwrap(), "").unwrap_err();
+        assert!(err.contains("no audio frames"), "got: {err}");
+        let mut with_frame = hdr.clone();
+        with_frame.extend_from_slice(&[0xFF, 0xF8, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        let tiny = dir.join("tiny_real.flac");
+        std::fs::write(&tiny, &with_frame).unwrap();
+        assert!(with_frame.len() < 200);
+        assert!(validate_cut_output(tiny.to_str().unwrap(), "").is_ok());
+        let _ = std::fs::remove_file(&header_only);
+        let _ = std::fs::remove_file(&tiny);
+    }
+
+    #[test]
     fn validate_accepts_output_with_frames() {
         let dir = std::env::temp_dir().join("fc_test_validate");
         let _ = std::fs::create_dir_all(&dir);
@@ -1553,5 +1714,87 @@ mod tests {
         let o = ChopOptions::default();
         let e = sox_input_args(probe::InputFormat::U8, "/tmp/nohint.u8", &o).unwrap_err();
         assert!(e.contains("msps"), "got: {e}");
+    }
+
+    // --- Ogg FLAC (.ldf) end to end, through the public entry point --------
+    //
+    // The synthetic .ldf is 12-bit mono, so a plain trim runs the pure-Rust
+    // decode/trim/re-encode path (no SoX needed) — the whole Ogg route
+    // (sniff → window remux → shifted start → cut → tag rewrite) is exercised
+    // and compared sample-for-sample with the known source samples.
+
+    fn decode12(path: &str) -> Vec<i32> {
+        let mut r = claxon::FlacReader::open(path).unwrap();
+        r.samples().map(|s| s.unwrap()).collect()
+    }
+
+    #[test]
+    fn ogg_flac_cut_is_sample_exact_through_chop_with_options() {
+        let n = 700_000usize;
+        for max_segs in [3usize, 255] {
+            let name = format!("fc_chop_ogg_{max_segs}");
+            let (p, samples) =
+                crate::ogg::testutil::make_ogg_ldf(&name, n, 40_000, max_segs, true, true);
+            let dir = std::env::temp_dir().join(format!("fc_chop_ogg_out_{max_segs}"));
+            let _ = std::fs::create_dir_all(&dir);
+            for (i, (start, len)) in [
+                (0u64, 10_000u64),
+                (4095, 3),
+                (123_457, 250_000),
+                (n as u64 - 7_000, 7_000),
+                (n as u64 - 1, 1),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let out = dir.join(format!("cut{i}.flac"));
+                let r = chop_with_options(
+                    p.to_str().unwrap(),
+                    out.to_str().unwrap(),
+                    start,
+                    len,
+                    ChopOptions { is_rf: true, ..Default::default() },
+                );
+                assert!(r.ok, "start {start} len {len}: {}", r.stderr);
+                assert!(r.stderr.contains("Ogg FLAC input"), "note missing: {}", r.stderr);
+                let got = decode12(out.to_str().unwrap());
+                let want: Vec<i32> = samples[start as usize..(start + len) as usize]
+                    .iter()
+                    .map(|&v| v as i32)
+                    .collect();
+                assert_eq!(got, want, "start {start} len {len} max_segs {max_segs}");
+                // The RF tags were rewritten for the cut (RF_TOTAL_SAMPLES = len).
+                let (_, tags) = crate::tags::read_all_comments(&out).unwrap();
+                assert!(
+                    tags.iter().any(|(k, v)| k == "RF_TOTAL_SAMPLES" && *v == len.to_string()),
+                    "tags: {tags:?}"
+                );
+                // The temp remux file never outlives the call.
+                let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.file_name().to_string_lossy().contains("oggsrc"))
+                    .collect();
+                assert!(leftovers.is_empty(), "temp remux left behind: {leftovers:?}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
+    #[test]
+    fn ogg_flac_cut_reports_a_clear_error_for_a_start_past_the_end() {
+        let (p, _) = crate::ogg::testutil::make_ogg_ldf("fc_chop_ogg_pastend", 50_000, 40_000, 255, true, false);
+        let out = std::env::temp_dir().join("fc_chop_ogg_pastend-cut.flac");
+        let r = chop_with_options(
+            p.to_str().unwrap(),
+            out.to_str().unwrap(),
+            60_000,
+            10,
+            ChopOptions { is_rf: true, ..Default::default() },
+        );
+        assert!(!r.ok);
+        assert!(r.stderr.contains("Ogg FLAC") && r.stderr.contains("past the end"), "got: {}", r.stderr);
+        let _ = std::fs::remove_file(&p);
     }
 }

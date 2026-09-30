@@ -328,6 +328,15 @@ fn parse_metadata_chain(path: &Path) -> Result<(Vec<MetaBlock>, u64), String> {
     let mut f = File::open(path).map_err(|e| format!("open: {e}"))?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic).map_err(|e| format!("read magic: {e}"))?;
+    if &magic == b"OggS" {
+        // Ogg FLAC (.ldf): Vorbis comments live in Ogg header packets, which
+        // the in-place / splice writers cannot rewrite safely. Say so plainly
+        // instead of the misleading "not a FLAC file".
+        return Err(
+            "this is an Ogg FLAC file (.ldf): its metadata cannot be edited in place — FLAC-Chop cuts from it fine, and the cut output is a native FLAC whose tags are editable"
+                .to_string(),
+        );
+    }
     if &magic != b"fLaC" {
         return Err("not a FLAC file".to_string());
     }

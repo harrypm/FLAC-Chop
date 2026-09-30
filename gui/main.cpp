@@ -142,10 +142,11 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 //   flac-chop --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
 //   flac-chop --version
 //
-// Inputs: FLAC (.flac/.ldf + fLaC-magic files), PCM WAV, and headerless raw
-// PCM (.u8/.u16/.s8/.s16/.r8/.r16 and the reversed .8u/.8s/.16u/.16s;
-// .raw/.bin/.pcm assumed u8). Raw files must carry the rate in their name
-// (e.g. ..._8-bit_20msps.u8).
+// Inputs: FLAC (.flac + fLaC-magic files), Ogg FLAC (.ldf/.oga/.ogg — the
+// real vhs-decode ld-compress output, detected by the OggS magic), PCM WAV, and
+// headerless raw PCM (.u8/.u16/.s8/.s16/.r8/.r16 and the reversed
+// .8u/.8s/.16u/.16s; .raw/.bin/.pcm assumed u8). Raw files must carry the rate
+// in their name (e.g. ..._8-bit_20msps.u8).
 //
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).
@@ -158,11 +159,11 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 // process exit code (0 = probed ok, 1 = probe failed).
 static int printProbeJson(const FcProbe& p)
 {
-    static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16" };
+    static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac" };
     QJsonObject o;
     o.insert(QStringLiteral("ok"), p.ok != 0);
     o.insert(QStringLiteral("error"), QString::fromUtf8(p.error));
-    o.insert(QStringLiteral("format"), QString::fromLatin1(p.format <= 5 ? kFmtNames[p.format] : "?"));
+    o.insert(QStringLiteral("format"), QString::fromLatin1(p.format <= 6 ? kFmtNames[p.format] : "?"));
     o.insert(QStringLiteral("format_code"), int(p.format));
     o.insert(QStringLiteral("header_sample_rate"), double(p.header_sample_rate));
     o.insert(QStringLiteral("declared_total_samples"), double(p.declared_total_samples));
@@ -173,6 +174,7 @@ static int printProbeJson(const FcProbe& p)
     o.insert(QStringLiteral("total_samples_scanned"), p.total_samples_scanned != 0);
     o.insert(QStringLiteral("total_samples_from_companion"), p.total_samples_from_companion != 0);
     o.insert(QStringLiteral("total_samples_from_vorbis"), p.total_samples_from_vorbis != 0);
+    o.insert(QStringLiteral("total_samples_from_ogg"), p.total_samples_from_ogg != 0);
     o.insert(QStringLiteral("rate_from_vorbis"), p.rate_from_vorbis != 0);
     o.insert(QStringLiteral("bits_per_sample"), int(p.bits_per_sample));
     o.insert(QStringLiteral("channels"), int(p.channels));
@@ -219,17 +221,18 @@ static int runCli(int argc, char* argv[])
         if (json)
             return printProbeJson(p);
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
-        static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16" };
+        static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac" };
         std::printf("ok                 : true\n");
         std::printf("format             : %s\n",
-                    p.format <= 5 ? kFmtNames[p.format] : "?");
+                    p.format <= 6 ? kFmtNames[p.format] : "?");
         std::printf("header_sample_rate : %llu Hz\n", (unsigned long long)p.header_sample_rate);
         std::printf("bits_per_sample    : %u\n", p.bits_per_sample);
         std::printf("channels           : %u\n", p.channels);
         std::printf("real_rate_hz       : %.0f  (is_rf=%d)\n", p.real_rate_hz, p.is_rf);
         std::printf("declared_total     : %llu (STREAMINFO)\n", (unsigned long long)p.declared_total_samples);
         std::printf("total_samples      : %llu (real)\n", (unsigned long long)p.total_samples);
-        std::printf("total_known        : %d\n", p.total_samples_known);
+        std::printf("total_known        : %d%s\n", p.total_samples_known,
+                    p.total_samples_from_ogg ? " (exact, from the Ogg stream)" : "");
         std::printf("warnings           : %s\n", p.warnings[0] ? p.warnings : "(none)");
         return 0;
     }

@@ -468,8 +468,8 @@ void MainWindow::browse()
     const QString startDir = m_inPath.isEmpty() ? QDir::homePath() : QFileInfo(m_inPath).absolutePath();
     const QString fn = QFileDialog::getOpenFileName(
         this, tr("Select capture file"), startDir,
-        tr("RF captures (*.flac *.ldf *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm)"
-           ";;FLAC files (*.flac);;All files (*)"));
+        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm)"
+           ";;FLAC / Ogg FLAC files (*.flac *.ldf *.oga *.ogg);;All files (*)"));
     if (fn.isEmpty())
         return;
     loadFile(fn);
@@ -923,14 +923,15 @@ void MainWindow::setProbeInfo()
         m_totalLabel->setStyleSheet(QString());
         return;
     }
-    if (m_probe.format >= 2) {
+    if (m_probe.format >= 2 && m_probe.format <= 5) {
         // Headerless raw PCM: there is no header to report; the rate label
         // points at the filename (the <n>msps hint is the only rate source).
         static const char* kRawNames[] = { "", "", "raw u8", "raw s8", "raw u16", "raw s16" };
-        const QString fmtName = (m_probe.format <= 5)
-            ? QString::fromLatin1(kRawNames[m_probe.format])
-            : QStringLiteral("?");
+        const QString fmtName = QString::fromLatin1(kRawNames[m_probe.format]);
         m_headerRateLabel->setText(tr("raw PCM (%1, rate from filename)").arg(fmtName));
+    } else if (m_probe.format == 6) {
+        // Ogg FLAC (.ldf): the FLAC header rate is the /1000 convention value.
+        m_headerRateLabel->setText(tr("%1 Hz (header, Ogg FLAC)").arg(m_probe.header_sample_rate));
     } else {
         m_headerRateLabel->setText(tr("%1 Hz (header)").arg(m_probe.header_sample_rate));
     }
@@ -948,7 +949,12 @@ void MainWindow::setProbeInfo()
             .arg(ulongStr(m_probe.total_samples), secsToHms(totalSec));
         // Provenance tag (highest priority first).
         QString tag;
-        if (m_probe.total_samples_from_vorbis)
+        // The Ogg stream length is the normal, exact source for an .ldf — shown
+        // as information, not as an amber caution like the recovery paths below.
+        const bool infoTag = (m_probe.total_samples_from_ogg != 0);
+        if (m_probe.total_samples_from_ogg)
+            tag = tr(" (exact, from the Ogg stream)");
+        else if (m_probe.total_samples_from_vorbis)
             tag = tr(" (vorbis RF_TOTAL_SAMPLES)");
         else if (m_probe.total_samples_from_companion)
             tag = tr(" (companion file)");
@@ -962,7 +968,7 @@ void MainWindow::setProbeInfo()
             tag += tr(" ~est.");
         if (!tag.isEmpty()) {
             m_totalLabel->setText(main + tag);
-            m_totalLabel->setStyleSheet("color:#e8a040;");
+            m_totalLabel->setStyleSheet(infoTag ? QString() : QStringLiteral("color:#e8a040;"));
         } else {
             m_totalLabel->setText(main);
             m_totalLabel->setStyleSheet("");
@@ -1419,17 +1425,17 @@ static QVector<QPair<QString, QString>> parseCommentsBlob(const QByteArray& blob
 void MainWindow::setMetaStreamInfo()
 {
     // Read-only STREAMINFO summary at the top of the editor page.
-    static const char* kFmtNames[] = { "FLAC", "PCM WAV", "raw u8", "raw s8", "raw u16", "raw s16" };
+    static const char* kFmtNames[] = { "FLAC", "PCM WAV", "raw u8", "raw s8", "raw u16", "raw s16", "Ogg FLAC" };
     if (!m_probeOk) {
         for (auto* lbl : {m_metaFormatLabel, m_metaHeaderRateLabel, m_metaBitsChLabel,
                           m_metaRealRateLabel, m_metaTotalSamplesLabel, m_metaFileSizeLabel})
             lbl->setText(QStringLiteral("—"));
         return;
     }
-    m_metaFormatLabel->setText((m_probe.format <= 5)
+    m_metaFormatLabel->setText((m_probe.format <= 6)
         ? QString::fromLatin1(kFmtNames[m_probe.format])
         : tr("unknown"));
-    if (m_probe.format >= 2)
+    if (m_probe.format >= 2 && m_probe.format <= 5)
         m_metaHeaderRateLabel->setText(tr("raw PCM (rate from filename)"));
     else
         m_metaHeaderRateLabel->setText(tr("%1 Hz").arg(m_probe.header_sample_rate));
@@ -1475,7 +1481,10 @@ void MainWindow::loadMetadata()
     if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0) {
         m_metaTable->setRowCount(0);
         setMetaEnabled(false);
-        if (m_probeOk && m_probe.format != 0)
+        if (m_probeOk && m_probe.format == 6)
+            m_metaStatusLabel->setText(tr("This is an Ogg FLAC file (.ldf): its metadata cannot be edited in place. "
+                                          "Cutting from it works normally, and the cut output is a native FLAC whose tags are editable."));
+        else if (m_probeOk && m_probe.format != 0)
             m_metaStatusLabel->setText(tr("Metadata editing is only available for FLAC files (this file is %1).")
                 .arg(m_metaFormatLabel->text()));
         else

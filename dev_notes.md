@@ -809,3 +809,71 @@ Validation (hard data, real capture copies in /tmp/fc-val):
 - Full end-to-end chop (repair + cut + in-place tags): `flac -t` ok, decoded
   md5 9e4211e7b276476ad37488640cdf89b6 == manual sox reference.
 - GUI relinks (Built target flac-chop).
+
+---
+
+## 2026-09-30 (session) — Ogg FLAC `.ldf` support (user-reported .ldf failures)
+
+### Problem
+Users reported FLAC-Chop failing on `.ldf` files. Reproduced with a real
+capture (`Opening to Pretty in Pink (US VHS, 1986).ldf`, 1.19 GiB, 40 kHz-header
+mono 16-bit): `probe error: not a FLAC stream (missing fLaC marker)`.
+
+### Root cause (verified)
+Real `.ldf` files are **Ogg-wrapped FLAC** (`OggS` at byte 0; `fLaC` only inside
+the first page). vhs-decode `scripts/ld-compress` and `scripts/windows/lds-compress.bat`
+write them with `ffmpeg … -acodec flac -f ogg out.ldf`. Earlier code assumed
+".ldf = native FLAC" (`sniff_format`, `find_audio_offset`, claxon, SoX). Also:
+- `soxi`/`sox` without `-t flac`: "no handler for file extension `ldf'"
+- the bundled static SoX is `--without-ogg` (libFLAC `WITH_OGG=OFF`), so passing
+  `-t flac` would not have fixed release builds either.
+- `generate_output_path` reused the input extension, naming cuts `x-cut.ldf`
+  (SoX picks the OUTPUT format from that extension).
+- The piped ffmpeg write leaves STREAMINFO `total_samples` = 0.
+
+### Fix
+New `core/src/ogg.rs` (+ wiring in probe.rs / chop.rs / vorbis.rs / ffi.rs / GUI):
+- `sniff_ogg` / `InputFormat::OggFlac` (FFI format code 6, appended last).
+- `read_header` (mapping header + metadata packets → native metadata chain so
+  claxon reads STREAMINFO/Vorbis tags), CRC-32-verified page reader.
+- `last_granule`: exact length from the last valid page (64-bit; survives a
+  truncated tail by taking the last CRC-valid page).
+- `remux_window`: binary search over granule positions (~25 probes for a deep
+  cut), start at ANY page — packets routinely span pages, so a leading partial
+  packet is skipped and the window's first sample is derived from the first full
+  frame's header number, then cross-checked (last granule − start must equal the
+  summed block sizes of the copied frames). Frame numbers rebased to 0 with
+  CRC-8/CRC-16 recomputed so the temp file is a valid standalone FLAC (libFLAC
+  seeks rely on frame numbers). Source Vorbis comments carried through.
+- `chop_with_options` is now a wrapper: Ogg input → remux window → existing
+  pipeline (SoX / 12-bit / static-sox) with start shifted by `first_sample`;
+  temp file next to the output, removed by a drop guard.
+- `total_samples_from_ogg` appended to `FcProbe` (+ `flacchop.h`).
+- Extra fixes found on the way: output always `.flac`; `validate_cut_output`
+  no longer rejects legitimate tiny cuts (<200 B, e.g. a 4-sample cut) — it now
+  compares the file size to the real metadata end; clear errors for non-FLAC
+  Ogg / `.lds` / ID3v2-prefixed FLAC; two pre-existing `static-sox` compile
+  errors fixed (CString `?` conversion, moved `Option`).
+
+### Validation (hard data)
+- `cargo test --release`: 131 unit + 6 + 11 integration pass (incl. sample-exact
+  windows over synthetic Ogg FLAC built from the in-tree enc12 encoder with real
+  lacing, continued packets and granule-less pages; corrupt page → hard error;
+  truncated tail; cancel).
+- Real file, `probe_cli`: total 1890582528 samples (= ffprobe duration_ts = full
+  ffmpeg decode byte count / 2), 47.265 s at 40 MSPS, provenance ogg-granule, 5 ms.
+- Real-file cuts vs an independent `ffmpeg atrim=start_sample:end_sample`
+  md5 of the decoded s16 (head, mid, 1 ms mid, near end, past end, last 4
+  samples): all identical, `flac -t` ok, 0.1–2.6 s each.
+- Conversion path: 20 MSPS + 8-bit + sinc from the .ldf has the same md5 as the
+  same range from an equivalent native FLAC; 12-bit and 6-bit profiles ok.
+- Shipped `flac-chop` binary: `--probe`, `--probe --json`, directory-output cut
+  (`…-cut.flac`), md5 equal to the ffmpeg reference.
+- `cargo check --features static-sox` passes; it could NOT be linked/run here
+  (no static libsox in this environment).
+- GUI behaviour NOT yet confirmed by the user (only built; CLI exercised).
+
+### Known limits
+- Ogg FLAC metadata is read-only in the editor (cannot rewrite Ogg headers).
+- Multiplexed/chained Ogg streams: only the first logical FLAC stream is used.
+- FLAC-with-ID3v2 and `.lds` get explicit errors, not support.
