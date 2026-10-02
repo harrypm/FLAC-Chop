@@ -888,11 +888,25 @@ jobs:
           fi
 
           features=""; fixes=""; others=""
-          while IFS= read -r s; do
-            [ -z "$s" ] && continue
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            sha="${line%%$'\t'*}"
+            s="${line#*$'\t'}"
             first=$(printf '%s' "$s" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]' | tr -d ':,')
             # Strip a conventional-commit prefix (feat:/fix:/docs(scope):) for display.
             clean=$(printf '%s' "$s" | sed -E 's/^[a-z]+(\([^)]*\))?:[[:space:]]+//I')
+            # Release info lists CODE changes. A commit that touches only docs /
+            # CI / metadata (readme.md, dev_notes.md, .github/*, FUNDING.yml, …)
+            # is left out — unless its subject marks it critical, e.g.
+            # "docs: critical — new install steps", which is release info users
+            # must see. Code = core/ or gui/ sources, CMake/build.rs, deps.
+            code=$(git diff-tree --no-commit-id --name-only -r "$sha" \
+              | grep -E '^(core/|gui/|CMakeLists\.txt|build\.rs|deps/)' \
+              | grep -vE '\.md$' | head -n 1 || true)
+            if [ -z "$code" ] \
+              && ! printf '%s' "$s" | grep -qiE 'critical|breaking'; then
+              continue
+            fi
             case "$first" in
               feat|feature|add|adds|support|implement|new|initial)
                 features="${features}- ${clean}\n" ;;
@@ -901,7 +915,7 @@ jobs:
               *)
                 others="${others}- ${clean}\n" ;;
             esac
-          done < <(git log --no-merges --format='%s' "$RANGE")
+          done < <(git log --no-merges --format='%H%x09%s' "$RANGE")
 
           {
             echo '> [!NOTE]'
