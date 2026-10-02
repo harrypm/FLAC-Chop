@@ -1783,6 +1783,82 @@ mod tests {
     }
 
     #[test]
+    fn flaldf_style_native_flac_ldf_probes_cuts_and_edits_in_place() {
+        // FlaLDF (vhs-decode's GPU ld-compress) writes NATIVE FLAC named .ldf:
+        // [STREAMINFO (MD5 set)][VORBIS_COMMENT, vendor only, 0 comments]
+        // [PADDING 4096, last][frames]. Build exactly that layout and run it
+        // through the public paths a user hits: probe, cut (output must be
+        // .flac, never .ldf), and the in-place metadata editor.
+        use crate::ogg::testutil::{lcg_samples, native_flac, split_native};
+        let n = 200_000usize;
+        let samples = lcg_samples(n, 7);
+        let native = native_flac(&samples, 40_000, "fc_flaldf_src.flac");
+        let (mut si, frames) = split_native(&native);
+        si[18..34].copy_from_slice(&[0xBE, 0x56, 0x7A, 0x7A, 0x99, 0x87, 0x7B, 0x7B, 0xC1, 0xA9, 0xEC, 0x62, 0x5A, 0xCE, 0x57, 0xA8]);
+        let mut f = b"fLaC".to_vec();
+        f.extend_from_slice(&[0x00, 0, 0, 34]);
+        f.extend_from_slice(&si);
+        let mut vc = Vec::new();
+        vc.extend_from_slice(&12u32.to_le_bytes());
+        vc.extend_from_slice(b"FlaLDF 0.1.0");
+        vc.extend_from_slice(&0u32.to_le_bytes());
+        f.extend_from_slice(&[0x04, 0, 0, vc.len() as u8]);
+        f.extend_from_slice(&vc);
+        f.extend_from_slice(&[0x81, 0x00, 0x10, 0x00]);
+        f.extend_from_slice(&[0u8; 4096]);
+        for fr in &frames {
+            f.extend_from_slice(fr);
+        }
+        let dir = std::env::temp_dir().join("fc_flaldf");
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("Opening to Something (Widescreen Series).ldf");
+        std::fs::write(&src, &f).unwrap();
+        let src_s = src.to_str().unwrap();
+
+        // Probe: native FLAC (not Ogg), exact header total, RF /1000 rate.
+        let p = probe::probe(&src);
+        assert!(p.ok, "{}", p.error);
+        assert_eq!(p.format, probe::InputFormat::Flac);
+        assert_eq!(p.total_samples, n as u64);
+        assert!(p.is_rf && !p.total_samples_from_ogg);
+        assert!((p.real_rate_hz - 40_000_000.0).abs() < 1e-6);
+
+        // The generated output name must be .flac (SoX has no .ldf handler).
+        let out = generate_output_path(src_s, dir.to_str().unwrap(), "").unwrap();
+        assert!(out.ends_with("(Widescreen Series)-cut.flac"), "got {out}");
+        let r = chop_with_options(
+            src_s,
+            &out,
+            12_345,
+            100_000,
+            ChopOptions { is_rf: true, ..Default::default() },
+        );
+        assert!(r.ok, "{}", r.stderr);
+        let got = decode12(&out);
+        let want: Vec<i32> = samples[12_345..112_345].iter().map(|&v| v as i32).collect();
+        assert_eq!(got, want);
+
+        // Metadata editor: the 4 KiB padding absorbs new tags IN PLACE (same
+        // file size, frames untouched), and they read back.
+        let size_before = std::fs::metadata(&src).unwrap().len();
+        crate::tags::replace_all_comments(
+            &src,
+            &[
+                ("PROJECT".to_string(), "rocky".to_string()),
+                ("RF_SAMPLE_RATE".to_string(), "40000000".to_string()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), size_before);
+        let (vendor, tags) = crate::tags::read_all_comments(&src).unwrap();
+        assert_eq!(vendor, "FlaLDF 0.1.0");
+        assert!(tags.contains(&("PROJECT".to_string(), "rocky".to_string())));
+        let after = decode12(src_s);
+        assert_eq!(after.len(), n, "audio must be intact after the tag edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ogg_flac_cut_reports_a_clear_error_for_a_start_past_the_end() {
         let (p, _) = crate::ogg::testutil::make_ogg_ldf("fc_chop_ogg_pastend", 50_000, 40_000, 255, true, false);
         let out = std::env::temp_dir().join("fc_chop_ogg_pastend-cut.flac");

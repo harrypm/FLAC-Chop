@@ -531,7 +531,10 @@ fn check_total_samples(
         (declared as u128 / min_block as u128 + 1) * max_frame.unwrap() as u128
     } else {
         // Frame-size stats unknown: fall back to verbatim worst case + margin.
-        (declared as u128 * channels as u128 * (bps as u128 / 8) * 105 / 100) + 65536
+        // Use the EXACT bit depth: integer `bps / 8` rounds 12-bit down to 1
+        // byte/sample (really 1.5), which made a healthy 12-bit file look as
+        // if its 36-bit total had wrapped (reported 2^36 + real).
+        (declared as u128 * channels as u128 * bps as u128 * 105 / 800) + 65536
     };
 
     if (audio_bytes as u128) <= declared_max_bytes {
@@ -1659,6 +1662,18 @@ mod tests {
         assert!(r.is_rf);
         assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
         assert_eq!(r.total_samples, 200_000_000);
+    }
+
+    #[test]
+    fn check_does_not_flag_a_wrap_on_12bit_verbatim_without_frame_sizes() {
+        // 200_000 mono 12-bit samples stored verbatim = 300_000 B raw plus
+        // per-frame overhead (~0.4%). With no frame-size stats the fallback
+        // bound must use 1.5 B/sample; the old integer `bps/8` = 1 B/sample
+        // bound (275_536 B) wrongly declared a 2^36 wrap.
+        let (trust, corrected) =
+            check_total_samples(200_000, 301_500, 4096, 4096, None, None, 1, 12);
+        assert!(trust, "healthy 12-bit file must not be treated as wrapped");
+        assert_eq!(corrected, None);
     }
 
     #[test]
