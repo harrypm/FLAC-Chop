@@ -45,7 +45,8 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 
 - Unknown extensions with a `fLaC`, `OggS` or `RIFF` magic header are detected
   by sniffing the first bytes of the file, so renamed captures just work.
-- **`.ldf` files are Ogg-wrapped FLAC** (vhs-decode's `ld-compress` runs
+
+- **`.ldf` files are Ogg-wrapped FLAC** (decode's legacy`ld-compress` runs
   `ffmpeg … -acodec flac -f ogg`), not native FLAC. FLAC-Chop reads them with
   its own Ogg demuxer: the exact length comes from the last page's granule
   position (64-bit, so no 36-bit wrap, and correct even though a piped ffmpeg
@@ -56,17 +57,22 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
   Ogg support. The temp file is written next to the output (falling back to the
   system temp dir) and is removed afterwards; it is only as large as the cut.
   Cuts are always written as native `.flac`, whatever the input container.
+
 - Clear errors instead of a generic failure: non-FLAC Ogg (Vorbis/Opus/…), a
   headerless packed `.lds`, and an ID3v2-prefixed FLAC each get a message that
   says what the file is and what to do.
+
 - Ogg FLAC metadata is read-only in the Metadata Editor tab (Ogg header packets
   cannot be rewritten in place); the cut output is a native FLAC whose tags are
   editable.
+
 - Raw PCM files have no header at all: the rate comes only from the filename
   (`..._20msps.u8` → 20 MSPS) and total samples from the file size. Without an
   `<n>msps` hint the probe refuses to guess.
+
 - Raw files are treated as mono (cxadc/DdD RF convention) unless a channel
   count is set explicitly.
+
 - Headerless raw RF is pinned to the same /1000 SoX stream rate as the
   equivalent FLAC, so sinc cutoffs and resample modes behave identically.
 
