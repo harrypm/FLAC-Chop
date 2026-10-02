@@ -872,18 +872,59 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: Compose release notes (auto highlights)
+        id: notes
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -eux
+          # Base for the changelog range: the closest preceding v* tag.
+          # (deps-* tags are dep caches, not releases — never match them.)
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+
+          features=""; fixes=""; others=""
+          while IFS= read -r s; do
+            [ -z "$s" ] && continue
+            first=$(printf '%s' "$s" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]' | tr -d ':,')
+            # Strip a conventional-commit prefix (feat:/fix:/docs(scope):) for display.
+            clean=$(printf '%s' "$s" | sed -E 's/^[a-z]+(\([^)]*\))?:[[:space:]]+//I')
+            case "$first" in
+              feat|feature|add|adds|support|implement|new|initial)
+                features="${features}- ${clean}\n" ;;
+              fix|fixes|repair|correct|corrects|resolve|resolves|restore|handle|patch)
+                fixes="${fixes}- ${clean}\n" ;;
+              *)
+                others="${others}- ${clean}\n" ;;
+            esac
+          done < <(git log --no-merges --format='%s' "$RANGE")
+
+          {
+            echo '> [!NOTE]'
+            echo '> Published release artifacts are self-contained builds with bundled'
+            echo '> SoX and required runtime dependencies — no separate SoX install needed.'
+            echo
+            # printf '%b' (never a bare variable format): a bullet string
+            # starts with "- ", which printf would parse as an option.
+            [ -n "$features" ] && { echo '## ✨ Features'; printf '%b' "$features"; echo; }
+            [ -n "$fixes" ] && { echo '## 🐛 Bug Fixes'; printf '%b' "$fixes"; echo; }
+            [ -n "$others" ] && { echo '## 🛠 Other changes'; printf '%b' "$others"; echo; }
+            if [ -n "$PREV" ]; then
+              echo '**Full Changelog**: https://github.com/${{ github.repository }}/compare/'"${PREV}...${TAG}"''
+            fi
+          } > release-notes.md
+          echo "path=release-notes.md" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
-          generate_release_notes: true
-          body: |
-            ## Runtime requirement: SoX
-
-            FLAC-Chop shells out to **SoX** for the actual sample-exact cut.
-            Published release artifacts are packaged as self-contained builds
-            with bundled SoX/runtime dependencies.
+          body_path: ${{ steps.notes.outputs.path }}
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.AppImage
             release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
