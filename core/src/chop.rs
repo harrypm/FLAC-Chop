@@ -23,7 +23,7 @@
 //! requantization (MISRC-style scaling math), which also compresses better.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::probe::{self, InputFormat};
 #[cfg(not(feature = "static-sox"))]
@@ -33,13 +33,61 @@ use std::io::Read;
 #[cfg(not(feature = "static-sox"))]
 use std::process::Stdio;
 
-// Cancellation flag for an in-flight cut. The GUI sets this via
-// `cancel_chop()` / `fc_chop_cancel()`; the shell-out backend polls it while
-// waiting on the sox child and kills the child promptly when it is set. The
-// static-sox backend checks it before starting the effects chain (in-process
-// libSoX has no mid-flow cancellation hook, so a static-sox cut can only be
-// stopped before it begins — the shipping builds use the shell-out backend).
+// Cancellation for an in-flight cut, uniform across both backends.
+//
+// `Global` is the legacy single-cut flag: the GUI sets it via `cancel_chop()` /
+// `fc_chop_cancel()`; the shell-out backend polls it while waiting on the sox
+// child and kills the child promptly when it is set, and the static-sox
+// backend checks it before starting the effects chain (in-process libSoX has
+// no mid-flow cancellation hook). The flag is cleared at the START of every
+// chop, so it must never be shared by parallel cuts: one job starting would
+// clear another job's pending cancel, and one cancel request would kill every
+// running job.
+//
+// `Job` is the per-job flag for parallel batch processing: a plain `AtomicI32`
+// OWNED BY THE CALLER (the C++ GUI creates one `std::atomic<int>` per queued
+// file and passes it to `fc_chop_ex` / `chop_with_options_and_cancel`).
+// Nonzero = cancel requested. It is never written or reset here — the caller
+// owns its lifetime (it must stay alive for the whole call) and initializes
+// it fresh per job.
 static CANCEL: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy)]
+enum Cancel<'a> {
+    Global,
+    Job(&'a AtomicI32),
+}
+
+impl Cancel<'_> {
+    fn requested(&self) -> bool {
+        match self {
+            Cancel::Global => CANCEL.load(Ordering::Relaxed),
+            Cancel::Job(f) => f.load(Ordering::Relaxed) != 0,
+        }
+    }
+
+    // Consume the legacy global flag after a cancel was honoured so the next
+    // single cut starts clean. Per-job flags are caller-owned and untouched.
+    fn consume(&self) {
+        if matches!(self, Cancel::Global) {
+            CANCEL.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
+// Unique tag for every temp file this process creates (pid + monotonic
+// counter). The old pid-only names collided as soon as two cuts ran
+// concurrently in one process (parallel batch) — the two jobs would then
+// corrupt each other's 6/12-bit pass-1 temps.
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn temp_tag() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Optional post-cut processing controls for SoX.
 #[derive(Debug, Clone, Copy, Default)]
@@ -271,6 +319,7 @@ mod shelldet {
 fn run_sox_child(
     mut cmd: Command,
     feed: Option<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>>,
+    cancel: Cancel<'_>,
 ) -> Result<(std::process::ExitStatus, String), ChopResult> {
     if feed.is_some() {
         // SoX stops reading (and closes the pipe) once it has the full trim
@@ -288,7 +337,6 @@ fn run_sox_child(
     }
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
-    CANCEL.store(false, Ordering::Relaxed);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -327,14 +375,14 @@ fn run_sox_child(
         if let Some(s) = child.try_wait().unwrap_or(None) {
             break s;
         }
-        if CANCEL.load(Ordering::Relaxed) {
+        if cancel.requested() {
             let _ = child.kill();
             let _ = child.wait(); // reap the killed child
             let mut stderr = String::new();
             if let Some(mut se) = child.stderr.take() {
                 let _ = se.read_to_string(&mut stderr);
             }
-            CANCEL.store(false, Ordering::Relaxed); // consume the flag
+            cancel.consume(); // consume the flag
             return Err(ChopResult {
                 ok: false,
                 exit_code: -1,
@@ -441,6 +489,7 @@ fn chop_native_input(
     start_samples: u64,
     length_samples: u64,
     opts: ChopOptions,
+    cancel: Cancel<'_>,
 ) -> ChopResult {
     let start = format!("{}s", start_samples);
     let len = format!("{}s", length_samples);
@@ -479,6 +528,7 @@ fn chop_native_input(
                 start_samples,
                 length_samples,
                 opts.is_rf,
+                cancel,
             );
             if !si_note.is_empty() {
                 r.stderr = if r.stderr.is_empty() {
@@ -535,13 +585,15 @@ fn chop_native_input(
         None => 0,
     };
     let tmp_path = if six_bit {
-        Some(
-            std::env::temp_dir().join(format!("flac-chop-6bit-{}.flac", std::process::id())),
-        )
+        Some(std::env::temp_dir().join(format!(
+            "flac-chop-6bit-{tag}.flac",
+            tag = temp_tag()
+        )))
     } else if twelve_bit {
-        Some(
-            std::env::temp_dir().join(format!("flac-chop-12bit-{}.flac", std::process::id())),
-        )
+        Some(std::env::temp_dir().join(format!(
+            "flac-chop-12bit-{tag}.flac",
+            tag = temp_tag()
+        )))
     } else {
         None
     };
@@ -590,7 +642,7 @@ fn chop_native_input(
         cmd.arg("vol").arg("0.25");
     }
 
-    let (status, stderr) = match run_sox_child(cmd, stdin_feed) {
+    let (status, stderr) = match run_sox_child(cmd, stdin_feed, cancel) {
         Ok(v) => v,
         Err(cancelled) => {
             // Clean up the partial pass-1 temp file on failure/cancel.
@@ -616,7 +668,7 @@ fn chop_native_input(
         cmd2.arg("-b").arg("8");
         cmd2.arg(out_path);
         cmd2.arg("vol").arg("4");
-        match run_sox_child(cmd2, None) {
+        match run_sox_child(cmd2, None, cancel) {
             Ok((st, _se)) => {
                 if !st.success() {
                     r.ok = false;
@@ -689,11 +741,12 @@ fn chop_12bit_source_pure(
     start_samples: u64,
     length_samples: u64,
     is_rf: bool,
+    cancel: Cancel<'_>,
 ) -> ChopResult {
     use claxon::FlacReader;
 
     let fail = |stderr: String| ChopResult { ok: false, exit_code: -1, stderr };
-    if CANCEL.load(Ordering::Relaxed) {
+    if cancel.requested() {
         return fail("cancelled by user".into());
     }
     let mut reader = match FlacReader::open(in_path) {
@@ -747,10 +800,18 @@ use std::ffi::CString;
 #[cfg(feature = "static-sox")]
 use std::os::raw::c_char;
 #[cfg(feature = "static-sox")]
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 #[cfg(feature = "static-sox")]
 static SOX_INIT: Once = Once::new();
+
+/// libSoX global state (sox_init, format handlers, effects machinery) is not
+/// documented as thread-safe, so static-sox chops serialize on this mutex —
+/// parallel callers simply queue here until the running chain finishes. The
+/// shell-out backend has no such constraint: every cut is a separate sox
+/// *process*.
+#[cfg(feature = "static-sox")]
+static SOX_FLOW_MUTEX: Mutex<()> = Mutex::new(());
 
 #[cfg(feature = "static-sox")]
 fn ensure_sox_init() -> Result<(), String> {
@@ -1065,14 +1126,19 @@ fn chop_native_input(
     start_samples: u64,
     length_samples: u64,
     opts: ChopOptions,
+    cancel: Cancel<'_>,
 ) -> ChopResult {
-    CANCEL.store(false, Ordering::Relaxed);
+    // libSoX is not thread-safe: one in-process cut at a time; parallel
+    // callers queue on this lock until the running chain finishes.
+    let _sox_lock = SOX_FLOW_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     // The static-sox backend runs the cut in-process via sox_flow_effects,
     // which has no mid-flow cancellation hook. Honour a cancel that was
     // requested before the chain starts; once flow begins it runs to
     // completion (the shipping builds use the shell-out backend, which can
     // cancel mid-cut).
-    if CANCEL.load(Ordering::Relaxed) {
+    if cancel.requested() {
         return ChopResult { ok: false, exit_code: -1, stderr: "cancelled by user".into() };
     }
     if let Err(e) = ensure_sox_init() {
@@ -1109,7 +1175,7 @@ fn chop_native_input(
                 // Pass 1: quantize to the 6-bit grid (vol 0.25, 8-bit sink) into
                 // a temp file; pass 2 rescales x4 back to full container scale.
                 let tmp = std::env::temp_dir()
-                    .join(format!("flac-chop-6bit-{}.flac", std::process::id()));
+                    .join(format!("flac-chop-6bit-{tag}.flac", tag = temp_tag()));
                 let tmp_str = tmp.to_string_lossy().into_owned();
                 if let Err(e) = run_chain(
                     in_path,
@@ -1132,7 +1198,7 @@ fn chop_native_input(
                 // there exactly ×16 left-justified); pass 2 = true 12-bit encode
                 // via the shared `flac` CLI helper.
                 let tmp = std::env::temp_dir()
-                    .join(format!("flac-chop-12bit-{}.flac", std::process::id()));
+                    .join(format!("flac-chop-12bit-{tag}.flac", tag = temp_tag()));
                 let tmp_str = tmp.to_string_lossy().into_owned();
                 let mut pass1 = opts.clone();
                 pass1.output_bits = Some(16);
@@ -1215,7 +1281,7 @@ impl Drop for TempFileGuard {
 /// RAM-backed tmpfs), falling back to the system temp dir if that directory
 /// is not writable.
 fn ogg_window_temp_path(out_path: &str) -> PathBuf {
-    let name = format!(".flac-chop-oggsrc-{}.tmp.flac", std::process::id());
+    let name = format!(".flac-chop-oggsrc-{tag}.tmp.flac", tag = temp_tag());
     if let Some(dir) = Path::new(out_path).parent() {
         let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
         let cand = dir.join(&name);
@@ -1228,7 +1294,8 @@ fn ogg_window_temp_path(out_path: &str) -> PathBuf {
 
 /// Cut `length_samples` samples starting at `start_samples` from `in_path`,
 /// with the optional rate / bit-depth conversion in `opts`. Public entry point
-/// for both backends.
+/// for both backends. Uses the legacy global cancel flag (`cancel_chop`) —
+/// single-cut callers; see [`chop_with_options_and_cancel`] for parallel runs.
 ///
 /// Ogg FLAC inputs (the real-world `.ldf`) are first reduced to exactly the
 /// pages covering the cut and remuxed — losslessly, no re-encode — into a
@@ -1243,6 +1310,34 @@ pub fn chop_with_options(
     length_samples: u64,
     opts: ChopOptions,
 ) -> ChopResult {
+    chop_with_options_and_cancel(in_path, out_path, start_samples, length_samples, opts, None)
+}
+
+/// Per-job cancel variant of [`chop_with_options`] for parallel batch runs.
+///
+/// `cancel_flag` is a caller-owned [`AtomicI32`] (the C++ GUI passes one
+/// `std::atomic<int>` per queued file; nonzero = cancel requested). It is
+/// polled like the global flag but never written or reset here — the caller
+/// owns its lifetime. `None` selects the legacy global flag, which is cleared
+/// at the start of every chop and therefore must not be shared by parallel
+/// jobs.
+pub fn chop_with_options_and_cancel(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    opts: ChopOptions,
+    cancel_flag: Option<&AtomicI32>,
+) -> ChopResult {
+    let cancel = match cancel_flag {
+        Some(f) => Cancel::Job(f),
+        None => Cancel::Global,
+    };
+    if matches!(cancel, Cancel::Global) {
+        // Clear a stale flag left by a previous single cut. Per-job flags are
+        // caller-owned and never touched here.
+        CANCEL.store(false, Ordering::Relaxed);
+    }
     let fail = |stderr: String| ChopResult { ok: false, exit_code: -1, stderr };
     let fmt = match opts
         .input_format
@@ -1252,10 +1347,9 @@ pub fn chop_with_options(
         Err(e) => return fail(e),
     };
     if fmt != InputFormat::OggFlac {
-        return chop_native_input(in_path, out_path, start_samples, length_samples, opts);
+        return chop_native_input(in_path, out_path, start_samples, length_samples, opts, cancel);
     }
 
-    CANCEL.store(false, Ordering::Relaxed);
     let tmp = ogg_window_temp_path(out_path);
     let _guard = TempFileGuard(tmp.clone());
     let win = match crate::ogg::remux_window(
@@ -1263,12 +1357,12 @@ pub fn chop_with_options(
         &tmp,
         start_samples,
         length_samples,
-        &|| CANCEL.load(Ordering::Relaxed),
+        &|| cancel.requested(),
     ) {
         Ok(w) => w,
         Err(e) => {
             if e.contains("cancelled") {
-                CANCEL.store(false, Ordering::Relaxed); // consume the flag
+                cancel.consume(); // consume the flag
             }
             return fail(format!("Ogg FLAC: {e}"));
         }
@@ -1281,6 +1375,7 @@ pub fn chop_with_options(
         start_samples - win.first_sample,
         length_samples,
         inner,
+        cancel,
     );
     let note = format!(
         "note: Ogg FLAC input — cut from a lossless native-FLAC remux of samples {}..{} ({} frames)",
@@ -1448,8 +1543,10 @@ fn rewrite_tags_after_cut(out_path: &str, is_rf: bool, r: &mut ChopResult) {
     }
 }
 
-/// Request cancellation of the currently-running cut (if any). Safe to call
-/// from the GUI thread while `chop_with_options` runs on a worker thread.
+/// Request cancellation of the currently-running single cut (if any). Safe
+/// to call from the GUI thread while a `Cancel::Global` chop runs on a worker
+/// thread. Per-job (`Cancel::Job`) chops are cancelled by the caller's own
+/// flag, not this.
 pub fn cancel_chop() {
     CANCEL.store(true, Ordering::Relaxed);
 }

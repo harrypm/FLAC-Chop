@@ -1,5 +1,8 @@
 #include "mainwindow.h"
 
+#include "batchtab.h"
+#include "stemutil.h"
+
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
@@ -157,14 +160,17 @@ MainWindow::MainWindow(QWidget* parent)
     inLay->addWidget(m_browseBtn, 0);
 
     // --- Output directory (top row, next to the input file) ---
-    // Where cuts are written. Defaults to the input file's directory (the
-    // original sibling -cut.flac behaviour); the user can Browse for a
-    // dedicated output folder, persisted across sessions via QSettings.
+    // Where cuts are written. Empty = auto-follow the loaded input file's
+    // directory (the original sibling -cut.flac behaviour); the field then
+    // stays EMPTY and only the placeholder shows the live effective dir.
+    // The user can Browse for (or type) a dedicated output folder, which is
+    // persisted across sessions via QSettings; clearing the field resumes
+    // the follow. "Empty field == following" is the single state — there is
+    // no separate follow flag to drift out of sync.
     auto* outDirBox = new QGroupBox(tr("Output Directory"), chopPage);
     auto* outDirLay = new QHBoxLayout(outDirBox);
     m_outDirEdit = new QLineEdit(outDirBox);
-    m_outDirEdit->setPlaceholderText(tr("(same as input file)"));
-    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = next to the input file."));
+    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = follow the input file's folder."));
     m_outDirBrowseBtn = new QPushButton(tr("Browse..."), outDirBox);
     outDirLay->addWidget(m_outDirEdit, 1);
     outDirLay->addWidget(m_outDirBrowseBtn, 0);
@@ -290,6 +296,10 @@ MainWindow::MainWindow(QWidget* parent)
 
     m_tabs->addTab(chopPage, tr("Chop"));
 
+    // --- Batch Task page (multi-file queue + parallel processing) ---
+    m_batchTab = new BatchTab(m_tabs);
+    m_tabs->addTab(m_batchTab, tr("Batch Task"));
+
     // --- Metadata Editor page ---
     // Read-only STREAMINFO summary + an editable Vorbis-comment table that
     // writes back to the source FLAC in place via fc_replace_comments. The
@@ -410,18 +420,17 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_metaFieldCombo->lineEdit(), &QLineEdit::returnPressed,
             this, &MainWindow::addFieldFromBox);
 
-    // Restore the persisted output directory (empty = "same as input").
-    // If a dir was previously chosen (non-empty), auto-follow is off so it
-    // persists; if empty, auto-follow stays on and the field will track the
-    // input file's dir on first load.
+    // Restore the persisted output directory. Auto-follow IS "the field is
+    // empty": a persisted non-empty dir fills the field (pinned), an empty
+    // one leaves it following (the placeholder shows the effective dir).
     {
         QSettings s;
         s.beginGroup(QStringLiteral("output"));
         const QString persisted = s.value(QStringLiteral("dir")).toString().trimmed();
         s.endGroup();
         m_outDirEdit->setText(persisted);
-        m_outDirAutoFollow = persisted.isEmpty();
     }
+    refreshOutDirPlaceholder();
 
     // Drag & drop: the window accepts file drops; the time box must not swallow them.
     setAcceptDrops(true);
@@ -496,6 +505,23 @@ void MainWindow::persistOutDir(const QString& dir)
     s.endGroup();
 }
 
+void MainWindow::refreshOutDirPlaceholder()
+{
+    // While following (the field is empty), only the PLACEHOLDER shows the
+    // live effective dir — the field itself never gets text written into it.
+    // That kills two old state bugs: a no-op editingFinished (focus loss)
+    // used to silently pin the auto-followed dir and persist it, and a
+    // failed probe left the stale failed file's dir shown as the choice.
+    if (!m_outDirEdit)
+        return;
+    if (!m_outDirEdit->text().trimmed().isEmpty())
+        return; // pinned: the field itself shows the user's chosen dir
+    const QString eff = effectiveOutDir();
+    m_outDirEdit->setPlaceholderText(eff.isEmpty()
+        ? tr("(follows the input file's folder)")
+        : tr("(follows input: %1)").arg(eff));
+}
+
 void MainWindow::browseOutDir()
 {
     const QString startDir = effectiveOutDir().isEmpty() ? QDir::homePath() : effectiveOutDir();
@@ -503,59 +529,22 @@ void MainWindow::browseOutDir()
         this, tr("Select output directory"), startDir);
     if (d.isEmpty())
         return;
-    m_outDirEdit->setText(d);
-    m_outDirAutoFollow = false; // user explicitly chose a dir — stop auto-following
+    m_outDirEdit->setText(d); // non-empty = pinned (the user explicitly chose)
     persistOutDir(d);
+    refreshOutDirPlaceholder();
     applyCut();
 }
 
 void MainWindow::onOutDirEdited()
 {
-    // editingFinished fires on focus loss / Enter — persist + recompute the
-    // output path preview. Empty text means "same as input" (stock default).
+    // editingFinished fires on focus loss / Enter. Empty text = follow the
+    // input file's folder again; non-empty = the user's pinned dir. Either
+    // way persist it so the preference survives restarts (and a no-op
+    // focus-loss on an EMPTY field is harmless — it stays following).
     const QString d = m_outDirEdit->text().trimmed();
-    // If the user clears the field, resume auto-following the input dir.
-    m_outDirAutoFollow = d.isEmpty();
     persistOutDir(d);
+    refreshOutDirPlaceholder();
     applyCut();
-}
-
-QString MainWindow::renamedOutputStem() const
-{
-    // Rename the output stem to reflect the new altered metadata when the
-    // input name matches the MISRC capture naming convention, which (per
-    // MISRC-GUI gui_settings.c) is:  <base>_<rfTag>_<B>-bit_<N>msps[.flac]
-    // i.e. bits first, then rate — e.g.  ..._8-bit_20msps  ->  ..._6-bit_16msps.
-    // "Keep source rate/bits" keeps the original token. Non-matching names
-    // return "" (stock <stem>-cut).
-    if (m_inPath.isEmpty())
-        return QString();
-    const QString inStem = QFileInfo(m_inPath).completeBaseName();
-    // Match an optional prefix, then <B>-bit_<N>msps, then an optional suffix.
-    static const QRegularExpression re(QStringLiteral("^(.*?)([0-9]+)-bit_([0-9]+)msps(.*)$"));
-    const auto m = re.match(inStem);
-    if (!m.hasMatch())
-        return QString();
-    const QString prefix = m.captured(1);
-    const QString srcBitsTok = m.captured(2);
-    const QString srcMspsTok = m.captured(3);
-    const QString suffix = m.captured(4);
-
-    // New bits token: the selected output bit-depth, or keep the source token
-    // when "keep source bit-depth".
-    const uint outBits = m_outputBitsCombo ? m_outputBitsCombo->currentData().toUInt() : 0;
-    QString bitsTok = srcBitsTok;
-    if (outBits > 0)
-        bitsTok = QString::number(outBits);
-
-    // New rate token: the selected output mode (header kHz / 1000 = MSPS), or
-    // keep the source token when "keep source rate".
-    const quint64 outHeaderHz = m_outputModeCombo ? m_outputModeCombo->currentData().toULongLong() : 0;
-    QString mspsTok = srcMspsTok;
-    if (outHeaderHz > 0)
-        mspsTok = QString::number(outHeaderHz / 1000);
-
-    return prefix + bitsTok + QStringLiteral("-bit_") + mspsTok + QStringLiteral("msps") + suffix;
 }
 
 void MainWindow::unloadFile()
@@ -608,6 +597,10 @@ void MainWindow::unloadFile()
     }
     m_filterProfileLabel->setText(QStringLiteral("—"));
 
+    // No input loaded: the Output Directory placeholder drops the stale
+    // (possibly failed) input's dir and returns to the follow default.
+    refreshOutDirPlaceholder();
+
     setProbeInfo();
 }
 
@@ -622,11 +615,10 @@ void MainWindow::loadFile(const QString& fn)
     m_pathLabel->setText(QFileInfo(fn).fileName());
     m_pathLabel->setToolTip(fn);
 
-    // Output dir: if auto-following (no explicit user choice yet), update the
-    // field to the NEW input's directory so cuts land next to the new file. If
-    // the user chose a dedicated dir, it persists and is left untouched.
-    if (m_outDirAutoFollow)
-        m_outDirEdit->setText(QFileInfo(fn).absolutePath());
+    // Output dir while following (the field is empty): only the PLACEHOLDER
+    // moves to the new input's directory so cuts land next to the new file.
+    // A pinned dir (non-empty field) is left untouched, as before.
+    refreshOutDirPlaceholder();
 
     startProbe();
 }
@@ -820,16 +812,30 @@ void MainWindow::dropEvent(QDropEvent* e)
     const auto urls = e->mimeData()->urls();
     if (urls.isEmpty())
         return;
-    const QUrl u = urls.first();
-    if (!u.isLocalFile())
+    QStringList localFiles;
+    for (const QUrl& u : urls) {
+        if (u.isLocalFile())
+            localFiles.append(u.toLocalFile());
+    }
+    if (localFiles.isEmpty())
         return;
-    const QString fn = u.toLocalFile();
-    // Accept anything that looks like a capture: the core probe sniffs FLAC
-    // / WAV by magic header (so unknown extensions with the right magic
-    // work) and maps the raw PCM extensions. Anything else fails the probe
-    // with a clear error in the status line.
     e->acceptProposedAction();
-    loadFile(fn);
+    if (localFiles.size() == 1) {
+        // A single dropped file keeps the existing behaviour: load it into
+        // the Chop tab for marker cuts. Accept anything that looks like a
+        // capture: the core probe sniffs FLAC / WAV by magic header (so
+        // unknown extensions with the right magic work) and maps the raw PCM
+        // extensions. Anything else fails the probe with a clear error.
+        loadFile(localFiles.first());
+        return;
+    }
+    // Several dropped files: add them all to the Batch Task queue (lds-
+    // converter model) and show the tab.
+    const int added = m_batchTab ? m_batchTab->addInputFiles(localFiles) : 0;
+    m_tabs->setCurrentWidget(m_batchTab);
+    m_statusLabel->setText(added > 0
+        ? tr("Added %1 file(s) to the Batch Task queue.").arg(added)
+        : tr("No new files added to the Batch Task queue (already queued)."));
 }
 
 void MainWindow::onSliderInChanged(int v)
@@ -1069,11 +1075,11 @@ void MainWindow::applyCut()
     // Output path via the Rust helper — into the effective output directory,
     // with a renamed stem that reflects the new altered metadata
     // (e.g. 20msps_8-bit -> 16msps_6-bit) when the input name matches the
-    // MISRC capture naming convention.
+    // MISRC capture naming convention (shared helper — see stemutil.h).
     char buf[4096];
     const QString outDir = effectiveOutDir();
     const QByteArray outDirB = outDir.toUtf8();
-    const QString stem = renamedOutputStem();
+    const QString stem = renamedOutputStem(m_inPath, outHeaderRateHz, outBits);
     const QByteArray stemB = stem.toUtf8();
     if (fc_generate_output_path(m_inPath.toUtf8().constData(),
                                  outDirB.constData(),

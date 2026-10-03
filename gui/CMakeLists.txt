@@ -72,6 +72,9 @@ add_custom_target(flac_chop_core DEPENDS "${CORE_LIB}")
 set(GUI_SOURCES
     main.cpp
     mainwindow.cpp
+    batchtab.cpp
+    batchtab.h
+    stemutil.h
     rangeslider.cpp
     rangeslider.h
     resources.qrc

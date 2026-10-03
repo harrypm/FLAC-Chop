@@ -19,6 +19,7 @@ class QCheckBox;
 class QTabWidget;
 class QTableWidget;
 class QNetworkAccessManager;
+class BatchTab;
 
 // Result of an off-thread metadata save (fc_replace_comments). Carried across
 // the QtConcurrent future so onMetaSaveFinished can report success/failure.
@@ -98,10 +99,10 @@ private:
     // behaviour). Persisted in QSettings("output/dir").
     QString effectiveOutDir() const;
     void persistOutDir(const QString& dir);
-    // Rename the output stem to reflect the new altered metadata
-    // (e.g. 20msps_8-bit -> 16msps_6-bit) when the input name matches the
-    // MISRC `<N>msps_<B>-bit` convention; else empty (stock <stem>-cut).
-    QString renamedOutputStem() const;
+    // Keep the Output Directory field's placeholder in sync with the live
+    // effective dir while auto-following (the field itself stays empty — see
+    // the m_outDirEdit comment in the .cpp).
+    void refreshOutDirPlaceholder();
 
     QString m_inPath;
     FcProbe m_probe{};
@@ -176,7 +177,9 @@ private:
     bool m_probing = false; // true while fc_probe runs off-thread
     bool m_updateCheckInFlight = false;
     bool m_cancelRequested = false; // true while a cut cancel is pending
-    bool m_outDirAutoFollow = true; // true: output dir follows the input file's dir until the user explicitly chooses one
+
+    // Batch Task tab (multi-file queue + parallel processing).
+    BatchTab* m_batchTab = nullptr;
     // true while a re-probe triggered by a metadata save is in flight — then
     // the Chop page's IN/OUT markers are clamped (not reset to the full tape).
     bool m_probeIsRefresh = false;

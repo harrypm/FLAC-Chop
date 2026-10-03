@@ -72,6 +72,19 @@ int fc_generate_output_path(const char* in_path, const char* out_dir,
 int fc_sox_available(void);
 void fc_chop_cancel(void);
 
+// Per-job cancel variant of fc_chop for parallel batch processing: identical
+// arguments plus `cancel_flag` — a pointer to a C++-owned std::atomic<int>
+// (0 = keep running, nonzero = cancel this job; polled lock-free, never
+// written by the core). The flag must stay alive for the whole call. NULL
+// keeps the legacy global-cancel semantics (fc_chop / fc_chop_cancel), which
+// must not be shared by parallel jobs: the global flag is cleared at the
+// start of every chop. (Appended ABI — ABI-append-only like the structs.)
+void fc_chop_ex(const char* in_path, const char* out_path,
+                uint64_t start_samples, uint64_t length_samples,
+                uint64_t output_rate_hz, uint32_t output_bits,
+                int32_t basic_rf_filter, int32_t is_rf, FcChopResult* out,
+                const int32_t* cancel_flag);
+
 // --- Metadata editor (GUI Metadata Editor tab) -----------------------------
 // Read/rewrite every Vorbis comment on a *source* FLAC in place. The read path
 // packs comments into a little-endian blob: u32 LE count, then per comment

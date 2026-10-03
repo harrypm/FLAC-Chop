@@ -23,9 +23,12 @@ use flac_chop_core::chop::{chop_with_options, sox_available, ChopOptions};
 use flac_chop_core::enc12;
 use flac_chop_core::probe;
 
-/// `chop_with_options` shells out to SoX and stages 6/12-bit output in a
-/// fixed per-pid temp path, so concurrent tests would race on it. Serialize
-/// every cut.
+/// These tests drive the legacy-global-cancel entry point
+/// (`chop_with_options`), which clears the global flag at the start of every
+/// chop, so concurrent global-path cuts would cross-talk on cancellation;
+/// serialize them. (They no longer race on temp files — every chop now stages
+/// in a uniquely tagged temp path. The concurrent runs live in
+/// tests/parallel_cancel.rs.)
 static CHOP_LOCK: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------

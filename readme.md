@@ -96,6 +96,10 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 - Bit-depth control (keep source, 8-bit, true **12-bit FLAC** output, or 6-bit
   crush emulation stored in an 8-bit FLAC container; no dither — pure
   requantization for maximum compression efficiency and SNR).
+- **Batch Task tab**: multi-file queue with parallel whole-file processing
+  (up to one worker per CPU thread), per-file status, Stop, skip-existing or
+  overwrite, and per-input output naming (ported from tbc-tools
+  ld-lds-converter's batch model).
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 - Self-healing FLAC headers: when a capture's STREAMINFO `total_samples` was
   never finalized (some MISRC HiFi writers store the real count / 1000), the
@@ -128,6 +132,31 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 4. Click **Process**. FLAC-Chop writes `<input>-cut.flac` next to the source
    via `sox <in> <out> trim <start>s <len>s` (the `s` suffix = sample counts,
    so the cut is sample-exact at the real MSPS rate).
+
+## Using the Batch Task tab
+
+The **Batch Task** tab (ported from tbc-tools ld-lds-converter's batch model)
+processes many capture files with the same output settings:
+
+1. **Add…** files (multi-select), or drop several files anywhere on the window
+   (a single dropped file still loads into the Chop tab for marker cuts).
+   Duplicate paths are ignored; **Remove selected** / **Clear** edit the queue.
+2. Pick the output settings (mode / bit-depth / sinc filter) and an optional
+   output directory — empty means each input file's own folder. Every queued
+   file is processed **whole** (start → end), i.e. batch re-compression, not
+   marker cuts (use the Chop tab for those).
+3. **Parallel processing** (on by default) runs up to one job per CPU thread
+   concurrently; each job runs on a worker thread either way, so the window
+   never freezes and **Stop** always works (running jobs are cancelled, files
+   not yet started are skipped, partial outputs are cleaned up).
+4. Per-file status is shown in the queue (Queued / Working… / Done / Failed
+   with the reason / Cancelled / Skipped — output already exists). A file whose
+   rate is below the selected output mode (or that is not an RF capture)
+   fails individually with that reason; the rest of the batch continues.
+5. Existing outputs are skipped by default (re-runs are idempotent); tick
+   **Overwrite existing outputs** to replace them. Two queued files that map
+   to the same output name get `_2`, `_3` suffixes so they never overwrite
+   each other.
 
 ## Headless use
 

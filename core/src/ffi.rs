@@ -328,7 +328,9 @@ impl Default for FcChopResult {
     }
 }
 
-/// Run the SoX cut/conversion. Blocking — the GUI calls this on a worker thread.
+/// Run the SoX cut/conversion. Blocking — the GUI calls this on a worker
+/// thread. Uses the legacy global cancel flag (`fc_chop_cancel`); parallel
+/// batch callers must use [`fc_chop_ex`] with per-job flags instead.
 #[no_mangle]
 pub extern "C" fn fc_chop(
     in_path: *const c_char,
@@ -340,6 +342,67 @@ pub extern "C" fn fc_chop(
     basic_rf_filter: i32,
     is_rf: i32,
     out: *mut FcChopResult,
+) {
+    fc_chop_run(
+        in_path,
+        out_path,
+        start_samples,
+        length_samples,
+        output_rate_hz,
+        output_bits,
+        basic_rf_filter,
+        is_rf,
+        out,
+        std::ptr::null(),
+    );
+}
+
+/// Per-job cancel variant of [`fc_chop`] for parallel batch processing:
+/// identical arguments plus `cancel_flag`, a pointer to a C++-owned
+/// `std::atomic<int>` (0 = keep running, nonzero = cancel this job; polled
+/// lock-free, never written here). The flag must be valid, aligned, and alive
+/// for the whole call. NULL keeps the legacy global-cancel semantics of
+/// `fc_chop` / `fc_chop_cancel`, which must not be shared by parallel jobs
+/// (the global flag is cleared at the start of every chop).
+#[no_mangle]
+pub extern "C" fn fc_chop_ex(
+    in_path: *const c_char,
+    out_path: *const c_char,
+    start_samples: u64,
+    length_samples: u64,
+    output_rate_hz: u64,
+    output_bits: u32,
+    basic_rf_filter: i32,
+    is_rf: i32,
+    out: *mut FcChopResult,
+    cancel_flag: *const i32,
+) {
+    fc_chop_run(
+        in_path,
+        out_path,
+        start_samples,
+        length_samples,
+        output_rate_hz,
+        output_bits,
+        basic_rf_filter,
+        is_rf,
+        out,
+        cancel_flag,
+    );
+}
+
+/// Shared body of [`fc_chop`] / [`fc_chop_ex` (panic-guarded, like fc_probe).
+fn fc_chop_run(
+    in_path: *const c_char,
+    out_path: *const c_char,
+    start_samples: u64,
+    length_samples: u64,
+    output_rate_hz: u64,
+    output_bits: u32,
+    basic_rf_filter: i32,
+    is_rf: i32,
+    out: *mut FcChopResult,
+    cancel_flag: *const i32,
 ) {
     unsafe {
         if out.is_null() {
@@ -361,6 +424,7 @@ pub extern "C" fn fc_chop(
                 basic_rf_filter,
                 is_rf,
                 out,
+                cancel_flag,
             )
         }));
         if let Err(payload) = result {
@@ -381,6 +445,7 @@ fn fc_chop_impl(
     basic_rf_filter: i32,
     is_rf: i32,
     out: &mut FcChopResult,
+    cancel_flag: *const i32,
 ) {
     unsafe {
         if in_path.is_null() || out_path.is_null() {
@@ -413,7 +478,19 @@ fn fc_chop_impl(
             input_rate_hz: None,
             input_channels: None,
         };
-        let r = chop::chop_with_options(i, o, start_samples, length_samples, opts);
+        // NULL keeps the legacy global-cancel semantics; a non-null flag is
+        // the C++ caller's per-job std::atomic<int> (nonzero = cancel).
+        // SAFETY: the caller guarantees a valid, aligned `std::atomic<int>`
+        // that stays alive for the whole call and is only ever 0/1. from_ptr
+        // reinterprets it as a Rust AtomicI32 (same layout/alignment) for
+        // lock-free polling; this side never stores to it.
+        let cancel = if cancel_flag.is_null() {
+            None
+        } else {
+            // SAFETY (from_ptr): see the comment above.
+            Some(std::sync::atomic::AtomicI32::from_ptr(cancel_flag as *mut i32))
+        };
+        let r = chop::chop_with_options_and_cancel(i, o, start_samples, length_samples, opts, cancel);
         out.ok = if r.ok { 1 } else { 0 };
         out.exit_code = r.exit_code;
         set_str(&mut out.stderr_buf, &r.stderr);
@@ -480,9 +557,10 @@ pub extern "C" fn fc_sox_available() -> i32 {
     }
 }
 
-/// Request cancellation of the in-flight cut (if any). Called from the GUI
-/// thread while `fc_chop` runs on a worker thread; the shell-out backend kills
-/// the sox child promptly.
+/// Request cancellation of the in-flight single cut (if any). Called from
+/// the GUI thread while an `fc_chop` (NULL cancel flag) runs on a worker
+/// thread; the shell-out backend kills the sox child promptly. Per-job
+/// `fc_chop_ex` cuts are cancelled through their own flags instead.
 #[no_mangle]
 pub extern "C" fn fc_chop_cancel() {
     chop::cancel_chop();

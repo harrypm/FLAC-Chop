@@ -43,7 +43,26 @@ static void applyDarkFusion(QApplication& app)
     d.setColor(QPalette::Link, QColor(42, 130, 218));
     d.setColor(QPalette::Highlight, QColor(42, 130, 218));
     d.setColor(QPalette::HighlightedText, Qt::black);
+    // Input-box text contrast (a hard-won tbc-tools lesson — see
+    // docs/DEV_NOTE_dark_theme_input_contrast.md): a hand-built dark palette
+    // made from a default-constructed QPalette keeps the LIGHT-theme
+    // PlaceholderText and Disabled-Text defaults, so placeholder text (the
+    // "(follows input: …)" hints) and disabled text in the path/selection
+    // boxes render near-invisible dark-on-dark. Set them explicitly with the
+    // preferred dark-theme values from tbc-tools' uistyle.h.
+    d.setColor(QPalette::PlaceholderText, QColor(0xD0, 0xD4, 0xD9));
+    d.setColor(QPalette::Disabled, QPalette::Text, QColor(0xAA, 0xAF, 0xB5));
+    d.setColor(QPalette::Disabled, QPalette::PlaceholderText, QColor(0x8D, 0x93, 0x99));
     app.setPalette(d);
+    // Belt-and-braces, mirroring tbc-tools' enforceInputWidgetContrast guard
+    // stylesheet: pin input-widget colors to the palette so a platform theme
+    // override cannot re-darken them.
+    app.setStyleSheet(QStringLiteral(
+        "QLineEdit, QTextEdit, QPlainTextEdit {"
+        "  color: palette(text);"
+        "  selection-color: palette(highlighted-text);"
+        "  selection-background-color: palette(highlight);"
+        "}"));
 }
 
 // --- GUI launch forms ------------------------------------------------------
