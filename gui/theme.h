@@ -19,8 +19,9 @@
 //    the platform signals an application palette change (e.g. the macOS
 //    Dark Mode switchover).
 //  - Theme menu (mainwindow, a peer of File/Help): Dark / Light, applied
-//    immediately + persisted (QSettings "theme/mode"); the default follows
-//    the OS theme.
+//    immediately + persisted (QSettings "theme/mode"); Dark is the default
+//    with no saved choice (systemPrefersDark is kept for a future follow-OS
+//    option).
 
 #include <QApplication>
 #include <QColor>

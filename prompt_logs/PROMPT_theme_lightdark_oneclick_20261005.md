@@ -36,6 +36,7 @@
 - `docs/DEV_NOTE_theme_switch_one_click.md` (new hard dev note; the contrast note's stale FLAC-Chop references updated).
 - `readme.md`: the theme feature bullet.
 
-## Still awaiting user confirmation (on their screen)
-- The open instance: opens DARK (default); Theme → Light switches in ONE click; Theme → Dark back in one; the choice is remembered.
-- The earlier question is still open: which dialog shows "Vista/7 elements" (the file picker / the folder picker) — my window-class enumeration shows the file dialogs ARE the native Windows ones (#32770) in this build.
+## User confirmation (2026-10-05 15:58)
+- "good" — everything confirmed working on their screen.
+- The earlier file-dialog report is resolved: child-window enumeration proved the dialogs ARE the MODERN native IFileDialog (DirectUIHWND, Breadcrumb Parent, NamespaceTreeControl, Search Box — DEV_NOTE_native_file_dialogs.md); the "Vista/7 elements" report was against a pre-theme-port build; the current build's dialog user-confirmed good.
+- All fixes noted as hard dev notes: DEV_NOTE_theme_switch_one_click.md, DEV_NOTE_native_file_dialogs.md, DEV_NOTE_release_version.md (+ the earlier DEV_NOTE_dark_theme_input_contrast.md references refreshed).

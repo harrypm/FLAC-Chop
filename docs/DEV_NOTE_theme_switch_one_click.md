@@ -51,10 +51,10 @@ event() on ApplicationPaletteChange:
 
 The one-click test, on a machine whose OS is in DARK mode (the failure case):
 
-1. Launch: the saved choice (or the OS default) is applied — no half-themed widgets.
+1. Launch: the saved choice (else Dark — the default) is applied — no half-themed widgets.
 2. Theme → Light: the whole window switches to light in **one** click — no second click, no stale-dark patches, placeholders readable (the contrast pass).
 3. Theme → Dark: back to dark in one click.
-4. Restart: the last choice is remembered (QSettings "theme/mode"); deleting the setting falls back to the OS theme.
+4. Restart: the last choice is remembered (QSettings "theme/mode"); deleting the setting falls back to DARK (the default — the OS-follow behaviour was dropped on 2026-10-05 per user spec).
 
 Final proof is the user's screen, both themes, enabled AND disabled controls.
 
