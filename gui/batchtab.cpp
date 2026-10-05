@@ -268,7 +268,7 @@ void BatchTab::addFilesDialog()
         : QFileInfo(m_inputs.last()).absolutePath();
     const QStringList files = QFileDialog::getOpenFileNames(
         this, tr("Add capture files to the queue"), startDir,
-        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm)"
+        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm *.lds)"
            ";;FLAC / Ogg FLAC files (*.flac *.ldf *.oga *.ogg);;All files (*)"));
     if (files.isEmpty())
         return;

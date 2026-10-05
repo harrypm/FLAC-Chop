@@ -14,6 +14,13 @@ Ideally using captures produced by the [MISRC-GUI](https://github.com/harrypm/MI
 
 Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://github.com/harrypm/FLAC-Chop/releases)
 
+Windows (per arch, x86_64 + arm64):
+
+- `windows_FLAC-Chop_<version>_<arch>.exe` — the **installer** (Inno Setup, per-user: no admin needed, Start-menu/desktop shortcuts, uninstaller).
+- `windows_FLAC-Chop_<version>_<arch>.zip` — the **portable** build: extract anywhere and run `flac-chop.exe`; nothing is written outside that folder.
+
+Every packaged build reports its release version (window title, `flac-chop --version`); the CI packaging tests fail the build if a packaged binary would report a `dev-` version on a release.
+
 
 ## Screenshots
 
@@ -40,6 +47,7 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 
 | Input | Recognized by | Rate source |
 |---|---|---|
+| **DdD/ld-decode packed 10-bit `.lds`** (4 samples per 5 bytes, mono, centre 512 — the format `ld-lds-converter` unpacks) | extension | filename `<n>msps` hint, else the 40 MSPS ld-decode default (with a warning); totals exact from the file size |
 | Native FLAC (`.flac`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
 | **Ogg FLAC** (`.ldf`, `.oga`, `.raw.oga`, `.ogg` — any file starting with `OggS` + a FLAC mapping header) | magic, never the extension | header (RF /1000 rule applies); length from the last Ogg page |
 | PCM WAV (`.wav`) | header | header: audio rate as-is; >1 MHz = real RF rate; else /1000 |
@@ -60,9 +68,9 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
   system temp dir) and is removed afterwards; it is only as large as the cut.
   Cuts are always written as native `.flac`, whatever the input container.
 
-- Clear errors instead of a generic failure: non-FLAC Ogg (Vorbis/Opus/…), a
-  headerless packed `.lds`, and an ID3v2-prefixed FLAC each get a message that
-  says what the file is and what to do.
+- Clear errors instead of a generic failure: non-FLAC Ogg (Vorbis/Opus/…) and
+  an ID3v2-prefixed FLAC each get a message that says what the file is and what
+  to do.
 
 - Ogg FLAC metadata is read-only in the Metadata Editor tab (Ogg header packets
   cannot be rewritten in place); the cut output is a native FLAC whose tags are
@@ -119,6 +127,14 @@ A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
   (up to one worker per CPU thread), per-file status, Stop, skip-existing or
   overwrite, and per-input output naming (ported from tbc-tools
   ld-lds-converter's batch model).
+
+- **Packed 10-bit `.lds` inputs** (DdD/ld-decode raw RF — the format tbc-tools'
+  `ld-lds-converter` handles): probed exactly from the file size and cut like
+  any RF capture, with the reference `(value - 512) * 64` unpack scaling. Only
+  the packing groups covering the cut are unpacked (a temp s16 beside the
+  output, like the `.ldf` window remux) — a 10 s cut of a 352 GB `.lds` never
+  touches the rest of the file. Output conversions (8/12-bit, resampling)
+  work as on any input.
 
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 

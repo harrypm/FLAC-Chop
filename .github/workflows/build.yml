@@ -82,6 +82,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Full history + tags so the git-describe version fallback works;
+          # the explicit -DFLAC_CHOP_VERSION passed to cmake below is the
+          # primary version source for packaged builds.
+          fetch-depth: 0
 
       - name: Resolve build version
         id: version
@@ -133,9 +138,22 @@ jobs:
       - name: Build FLAC-Chop
         run: |
           set -eux
-          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # Pass the resolved release version explicitly so the in-app
+          # version (title bar, --version, update check) can never fall back
+          # to "dev-<sha>" on a release build (this shipped v1.0.8 as
+          # "dev-e744de2": the tagless shallow checkout broke git describe).
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop"
+
+      - name: Verify built binary reports the release version
+        run: |
+          set -eux
+          EXPECTED="FLAC-Chop ${{ steps.version.outputs.version }}"
+          OUT="$($BUILD_DIR/gui/flac-chop --version)"
+          echo "built binary reports: $OUT (expected: $EXPECTED)"
+          [ "$OUT" = "$EXPECTED" ]
 
       - name: Package AppImage
         env:
@@ -182,6 +200,20 @@ jobs:
           mv ./*.AppImage "$APPIMAGE_NAME"
           test -f "$APPIMAGE_NAME"
 
+      - name: Verify packaged AppImage reports the release version
+        # AppRun forwards CLI args headless (no desktop integration for
+        # --version); APPIMAGE_EXTRACT_AND_RUN runs it without FUSE, which
+        # the GitHub runner images do not ship.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -eux
+          APPIMAGE_NAME="linux_FLAC-Chop_${{ steps.version.outputs.version }}_${{ matrix.artifact_suffix }}.AppImage"
+          EXPECTED="FLAC-Chop ${{ steps.version.outputs.version }}"
+          OUT="$(./"$APPIMAGE_NAME" --version)"
+          echo "AppImage reports: $OUT (expected: $EXPECTED)"
+          [ "$OUT" = "$EXPECTED" ]
+
       - name: Upload Linux AppImage
         uses: actions/upload-artifact@v6
         with:
@@ -197,6 +229,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -244,11 +278,26 @@ jobs:
           export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
           cargo --version
           # Shared Qt6 + shared sox from MSYS2 MINGW64 (no static deps). The
-          # runtime DLLs are bundled into a portable SFX exe below, mirroring
-          # the arm64 job — this sidesteps the static-Qt single-exe problems.
-          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # runtime DLLs are bundled into the portable ZIP / installer below,
+          # mirroring the arm64 job — this sidesteps the static-Qt problems.
+          # Pass the resolved release version explicitly so the in-app
+          # version (title bar, --version, update check) can never fall back
+          # to "dev-<sha>" on a release build (this shipped v1.0.8 as
+          # "dev-e744de2": the tagless shallow checkout broke git describe).
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
+
+      - name: Verify built exe reports the release version
+        shell: pwsh
+        run: |
+          $expected = "FLAC-Chop ${{ steps.version.outputs.version }}"
+          $out = (& "$env:BUILD_DIR\gui\flac-chop.exe" --version | Out-String).Trim()
+          Write-Host "built exe reports: $out (expected: $expected)"
+          if ($out -ne $expected) {
+            throw "version mismatch: built exe must report '$expected', got '$out'"
+          }
 
       - name: Bundle Qt6 DLLs with windeployqt
         shell: msys2 {0}
@@ -313,53 +362,114 @@ jobs:
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
-      - name: Create single-file portable Windows EXE (SFX)
+      - name: Create portable ZIP (extract-and-run)
+        # Windows packaging rule (restored): keep a portable build in addition
+        # to the installer so users can run from an extracted folder — nothing
+        # is written outside it. (The 7z SFX exe this replaces showed a
+        # generic "7-Zip self-extracting archive" dialog and just dumped the
+        # files; the pre-SFX workflow shipped portable ZIP + Inno installer.)
         shell: pwsh
         run: |
-          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
-          if (-not $sevenZip) {
-            choco install 7zip --no-progress -y
-            $sevenZip = Get-Command 7z -ErrorAction Stop
-          }
-          $sevenZipExe = $sevenZip.Source
-          $sevenZipDir = Split-Path -Parent $sevenZipExe
-          $sfxCandidates = @(
-            (Join-Path $sevenZipDir "7z.sfx"),
-            (Join-Path $sevenZipDir "7zS.sfx"),
-            (Join-Path $env:ProgramFiles "7-Zip\7z.sfx"),
-            (Join-Path $env:ProgramFiles "7-Zip\7zS.sfx"),
-            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.sfx"),
-            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7zS.sfx")
-          )
-          $sfxModule = $sfxCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-          if (-not $sfxModule) {
-            throw "7-Zip SFX module not found."
-          }
           $version = "${{ steps.version.outputs.version }}"
-          $payload = "windows_FLAC-Chop_${version}_x86_64.7z"
-          & $sevenZipExe a -t7z -mx=9 $payload .\dist\*
-          if ($LASTEXITCODE -ne 0) {
-            throw "7-Zip archive creation failed."
-          }
-          $outExe = "windows_FLAC-Chop_${version}_x86_64.exe"
-          $outStream = [System.IO.File]::Open($outExe, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-          try {
-            foreach ($src in @($sfxModule, $payload)) {
-              $inStream = [System.IO.File]::OpenRead($src)
-              try { $inStream.CopyTo($outStream) } finally { $inStream.Dispose() }
-            }
-          } finally {
-            $outStream.Dispose()
-          }
-          if (-not (Test-Path $outExe)) {
-            throw "Portable EXE was not generated."
+          $ZipPath = "windows_FLAC-Chop_${version}_x86_64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+          if (-not (Test-Path $ZipPath)) {
+            throw "Portable ZIP was not generated."
           }
 
-      - name: Upload Windows x86_64 portable EXE
+      - name: Create Windows installer EXE (Inno Setup)
+        # assets/installer/flac-chop.iss is a real file (not an inline heredoc)
+        # so it cannot break this YAML; all paths are passed as absolute /D
+        # defines. Same packaging as the pre-SFX workflow (CI-green then).
+        shell: pwsh
+        run: |
+          # ISCC's location depends on how Inno Setup arrived: choco installs
+          # machine-wide to Program Files (x86); a winget/user install goes to
+          # LocalAppData\Programs (verified locally with winget Inno 6.7.3).
+          $isccPaths = @(
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+          )
+          $iscc = $isccPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = $isccPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+            if (-not $iscc) {
+              throw "ISCC.exe not found after attempting install."
+            }
+          }
+          $version = "${{ steps.version.outputs.version }}"
+          # VersionInfoVersion (the PE file-version resource) must be numeric:
+          # take the leading vX.Y.Z of the version; dev builds get a placeholder.
+          if ($version -match '^v?(\d+\.\d+\.\d+)') { $numeric = $Matches[1] } else { $numeric = "0.0.0.1" }
+          $root = $env:GITHUB_WORKSPACE
+          $issArgs = @(
+            "/Qp",
+            "/DFLAC_CHOP_APP_VERSION=$version",
+            "/DFLAC_CHOP_NUMERIC_VERSION=$numeric",
+            "/DFLAC_CHOP_ARCH_SUFFIX=x86_64",
+            "/DFLAC_CHOP_DIST_DIR=$(Join-Path $root 'dist')",
+            "/DFLAC_CHOP_ICON_FILE=$(Join-Path $root 'assets\icons\flac-chop-icon.ico')",
+            "/DFLAC_CHOP_OUTPUT_DIR=$root",
+            "assets\installer\flac-chop.iss"
+          )
+          & $iscc @issArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_x86_64.exe")) {
+            throw "Installer EXE was not generated."
+          }
+
+      - name: Verify packaged artifacts (version, layout, install + uninstall)
+        # CI packaging tests: a packaged build must report the release version
+        # (never "dev-..."), the portable ZIP must be a complete extract-and-run
+        # layout, and the installer must install AND uninstall cleanly.
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $expected = "FLAC-Chop $version"
+          $ZipPath = "windows_FLAC-Chop_${version}_x86_64.zip"
+          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_x86_64.exe").Path
+
+          # --- portable ZIP: extract, run the inner exe, check the layout ---
+          $portTest = Join-Path $env:RUNNER_TEMP "portable-test"
+          if (Test-Path $portTest) { Remove-Item $portTest -Recurse -Force }
+          Expand-Archive -Path $ZipPath -DestinationPath $portTest
+          $v = (& (Join-Path $portTest "flac-chop.exe") --version | Out-String).Trim()
+          Write-Host "portable exe reports: $v (expected: $expected)"
+          if ($v -ne $expected) { throw "portable ZIP: version mismatch" }
+          foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
+            if (-not (Test-Path (Join-Path $portTest $f))) {
+              throw "portable ZIP: missing $f"
+            }
+          }
+
+          # --- installer: silent install, verify, silent uninstall ---
+          $instDir = Join-Path $env:RUNNER_TEMP "installer-test"
+          $p = Start-Process -FilePath $ExePath -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$instDir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer: silent install failed ($($p.ExitCode))" }
+          $v2 = (& (Join-Path $instDir "flac-chop.exe") --version | Out-String).Trim()
+          Write-Host "installed exe reports: $v2 (expected: $expected)"
+          if ($v2 -ne $expected) { throw "installer: version mismatch" }
+          foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
+            if (-not (Test-Path (Join-Path $instDir $f))) {
+              throw "installer: missing $f"
+            }
+          }
+          $unins = Join-Path $instDir "unins000.exe"
+          if (-not (Test-Path $unins)) { throw "installer: uninstaller not found" }
+          $u = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "installer: silent uninstall failed ($($u.ExitCode))" }
+
+      - name: Upload Windows x86_64 portable ZIP + installer EXE
         uses: actions/upload-artifact@v6
         with:
-          name: windows-exe
-          path: windows_FLAC-Chop_*_x86_64.exe
+          name: windows-x86_64
+          path: |
+            windows_FLAC-Chop_*_x86_64.zip
+            windows_FLAC-Chop_*_x86_64.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -370,6 +480,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Setup MSYS2 (CLANGARM64)
         uses: msys2/setup-msys2@v2
@@ -426,9 +538,24 @@ jobs:
           # as the x86_64 job).
           export PATH="$(cygpath -u "${CARGO_HOME:-$HOME/.cargo}")/bin:$PATH"
           cargo --version
-          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # Pass the resolved release version explicitly so the in-app
+          # version (title bar, --version, update check) can never fall back
+          # to "dev-<sha>" on a release build (this shipped v1.0.8 as
+          # "dev-e744de2": the tagless shallow checkout broke git describe).
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
+
+      - name: Verify built exe reports the release version
+        shell: pwsh
+        run: |
+          $expected = "FLAC-Chop ${{ steps.version.outputs.version }}"
+          $out = (& "$env:BUILD_DIR\gui\flac-chop.exe" --version | Out-String).Trim()
+          Write-Host "built exe reports: $out (expected: $expected)"
+          if ($out -ne $expected) {
+            throw "version mismatch: built exe must report '$expected', got '$out'"
+          }
 
       - name: Bundle Qt6 DLLs with windeployqt
         shell: msys2 {0}
@@ -501,56 +628,106 @@ jobs:
           fi
           echo "Bundled DLLs in dist/:"
           ls -1 dist/*.dll | xargs -n1 basename | sort | sed 's/^/  /'
-      - name: Create single-file portable Windows EXE (SFX)
+      - name: Create portable ZIP (extract-and-run)
+        # Same Windows packaging rule as the x86_64 job: a portable ZIP in
+        # addition to the installer. (Replaces the generic 7z SFX exe.)
         shell: pwsh
         run: |
-          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
-          if (-not $sevenZip) {
-            choco install 7zip --no-progress -y
-            $sevenZip = Get-Command 7z -ErrorAction Stop
-          }
-          $sevenZipExe = $sevenZip.Source
-          $sevenZipDir = Split-Path -Parent $sevenZipExe
-          $sfxCandidates = @(
-            (Join-Path $sevenZipDir "7z.sfx"),
-            (Join-Path $sevenZipDir "7zS.sfx"),
-            (Join-Path $env:ProgramFiles "7-Zip\7z.sfx"),
-            (Join-Path $env:ProgramFiles "7-Zip\7zS.sfx"),
-            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7z.sfx"),
-            (Join-Path ${env:ProgramFiles(x86)} "7-Zip\7zS.sfx")
-          )
-          $sfxModule = $sfxCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-          if (-not $sfxModule) {
-            throw "7-Zip SFX module not found."
-          }
-
           $version = "${{ steps.version.outputs.version }}"
-          $payload = "windows_FLAC-Chop_${version}_arm64.7z"
-          & $sevenZipExe a -t7z -mx=9 $payload .\dist\*
-          if ($LASTEXITCODE -ne 0) {
-            throw "7-Zip archive creation failed."
+          $ZipPath = "windows_FLAC-Chop_${version}_arm64.zip"
+          Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
+          if (-not (Test-Path $ZipPath)) {
+            throw "Portable ZIP was not generated."
           }
 
-          $outExe = "windows_FLAC-Chop_${version}_arm64.exe"
-          $outStream = [System.IO.File]::Open($outExe, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-          try {
-            foreach ($src in @($sfxModule, $payload)) {
-              $inStream = [System.IO.File]::OpenRead($src)
-              try { $inStream.CopyTo($outStream) } finally { $inStream.Dispose() }
+      - name: Create Windows installer EXE (Inno Setup)
+        # ISCC runs under x86 emulation on the ARM64 runner (same packaging
+        # as the pre-SFX workflow, which was CI-green on windows-11-arm).
+        shell: pwsh
+        run: |
+          # ISCC's location depends on how Inno Setup arrived (choco:
+          # Program Files (x86); winget/user: LocalAppData\Programs).
+          $isccPaths = @(
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+          )
+          $iscc = $isccPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = $isccPaths | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+            if (-not $iscc) {
+              throw "ISCC.exe not found after attempting install."
             }
-          } finally {
-            $outStream.Dispose()
+          }
+          $version = "${{ steps.version.outputs.version }}"
+          # VersionInfoVersion (the PE file-version resource) must be numeric:
+          # take the leading vX.Y.Z of the version; dev builds get a placeholder.
+          if ($version -match '^v?(\d+\.\d+\.\d+)') { $numeric = $Matches[1] } else { $numeric = "0.0.0.1" }
+          $root = $env:GITHUB_WORKSPACE
+          $issArgs = @(
+            "/Qp",
+            "/DFLAC_CHOP_APP_VERSION=$version",
+            "/DFLAC_CHOP_NUMERIC_VERSION=$numeric",
+            "/DFLAC_CHOP_ARCH_SUFFIX=arm64",
+            "/DFLAC_CHOP_DIST_DIR=$(Join-Path $root 'dist')",
+            "/DFLAC_CHOP_ICON_FILE=$(Join-Path $root 'assets\icons\flac-chop-icon.ico')",
+            "/DFLAC_CHOP_OUTPUT_DIR=$root",
+            "assets\installer\flac-chop.iss"
+          )
+          & $iscc @issArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "ISCC failed with exit code $LASTEXITCODE."
+          }
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_arm64.exe")) {
+            throw "Installer EXE was not generated."
           }
 
-          if (-not (Test-Path $outExe)) {
-            throw "Portable EXE was not generated."
+      - name: Verify packaged artifacts (version, layout, install + uninstall)
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $expected = "FLAC-Chop $version"
+          $ZipPath = "windows_FLAC-Chop_${version}_arm64.zip"
+          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_arm64.exe").Path
+
+          # --- portable ZIP: extract, run the inner exe, check the layout ---
+          $portTest = Join-Path $env:RUNNER_TEMP "portable-test"
+          if (Test-Path $portTest) { Remove-Item $portTest -Recurse -Force }
+          Expand-Archive -Path $ZipPath -DestinationPath $portTest
+          $v = (& (Join-Path $portTest "flac-chop.exe") --version | Out-String).Trim()
+          Write-Host "portable exe reports: $v (expected: $expected)"
+          if ($v -ne $expected) { throw "portable ZIP: version mismatch" }
+          foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
+            if (-not (Test-Path (Join-Path $portTest $f))) {
+              throw "portable ZIP: missing $f"
+            }
           }
 
-      - name: Upload Windows arm64 artifact
+          # --- installer: silent install, verify, silent uninstall ---
+          $instDir = Join-Path $env:RUNNER_TEMP "installer-test"
+          $p = Start-Process -FilePath $ExePath -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=$instDir" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer: silent install failed ($($p.ExitCode))" }
+          $v2 = (& (Join-Path $instDir "flac-chop.exe") --version | Out-String).Trim()
+          Write-Host "installed exe reports: $v2 (expected: $expected)"
+          if ($v2 -ne $expected) { throw "installer: version mismatch" }
+          foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
+            if (-not (Test-Path (Join-Path $instDir $f))) {
+              throw "installer: missing $f"
+            }
+          }
+          $unins = Join-Path $instDir "unins000.exe"
+          if (-not (Test-Path $unins)) { throw "installer: uninstaller not found" }
+          $u = Start-Process -FilePath $unins -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait -PassThru
+          if ($u.ExitCode -ne 0) { throw "installer: silent uninstall failed ($($u.ExitCode))" }
+
+      - name: Upload Windows arm64 portable ZIP + installer EXE
         uses: actions/upload-artifact@v6
         with:
-          name: windows-exe-arm64
-          path: windows_FLAC-Chop_*_arm64.exe
+          name: windows-arm64
+          path: |
+            windows_FLAC-Chop_*_arm64.zip
+            windows_FLAC-Chop_*_arm64.exe
           if-no-files-found: error
 
   # --- macOS APP (arm64 + x86_64, then universal DMG) ---
@@ -569,6 +746,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Resolve build version
         id: version
@@ -619,9 +798,22 @@ jobs:
           set -eux
           # Make cmake find the keg-only Qt@6.
           export CMAKE_PREFIX_PATH="$(brew --prefix qt@6):${CMAKE_PREFIX_PATH:-}"
-          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # Pass the resolved release version explicitly so the in-app
+          # version (title bar, --version, update check) can never fall back
+          # to "dev-<sha>" on a release build (this shipped v1.0.8 as
+          # "dev-e744de2": the tagless shallow checkout broke git describe).
+          cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop"
+
+      - name: Verify built binary reports the release version
+        run: |
+          set -eux
+          EXPECTED="FLAC-Chop ${{ steps.version.outputs.version }}"
+          OUT="$($BUILD_DIR/gui/flac-chop --version)"
+          echo "built binary reports: $OUT (expected: $EXPECTED)"
+          [ "$OUT" = "$EXPECTED" ]
 
       - name: Stage .app bundle
         env:
@@ -718,6 +910,16 @@ jobs:
           "$APP_ROOT/MacOS/sox" --version
 
           echo "$BUILD_VERSION" > dist/BUILD_VERSION.txt
+
+      - name: Verify staged .app reports the release version
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -eux
+          EXPECTED="FLAC-Chop ${BUILD_VERSION}"
+          OUT="$(./dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop --version)"
+          echo "staged .app reports: $OUT (expected: $EXPECTED)"
+          [ "$OUT" = "$EXPECTED" ]
 
       - name: Upload macOS architecture stage
         uses: actions/upload-artifact@v6
@@ -939,9 +1141,11 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           body_path: ${{ steps.notes.outputs.path }}
-          files: |
-            release-assets/**/linux_FLAC-Chop_*_x86.AppImage
-            release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
-            release-assets/**/windows_FLAC-Chop_*_x86_64.exe
-            release-assets/**/windows_FLAC-Chop_*_arm64.exe
-            release-assets/**/macos_FLAC-Chop_*_universal.dmg
+        files: |
+          release-assets/**/linux_FLAC-Chop_*_x86.AppImage
+          release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
+          release-assets/**/windows_FLAC-Chop_*_x86_64.exe
+          release-assets/**/windows_FLAC-Chop_*_x86_64.zip
+          release-assets/**/windows_FLAC-Chop_*_arm64.exe
+          release-assets/**/windows_FLAC-Chop_*_arm64.zip
+          release-assets/**/macos_FLAC-Chop_*_universal.dmg

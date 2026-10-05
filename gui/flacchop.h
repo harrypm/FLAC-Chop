@@ -36,7 +36,8 @@ struct FcProbe {
     // mismatches), "; "-joined. Empty when everything checked out.
     char warnings[512];
     // Sniffed input container format (appended at the end — ABI-append-only):
-    // 0=flac 1=wav 2=u8(raw) 3=s8(raw) 4=u16(raw) 5=s16(raw) 6=ogg-flac (.ldf).
+    // 0=flac 1=wav 2=u8(raw) 3=s8(raw) 4=u16(raw) 5=s16(raw) 6=ogg-flac (.ldf)
+    // 7=lds (DdD packed 10-bit .lds raw RF).
     uint32_t format;
     // 1 if the total came from the last Ogg page's granule position (Ogg FLAC
     // input: exact, valid even when STREAMINFO was never finalised).

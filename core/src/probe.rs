@@ -593,9 +593,12 @@ pub enum InputFormat {
     S16,
     /// FLAC inside an Ogg container (`OggS` magic, `0x7F "FLAC"` mapping
     /// header) — the real-world `.ldf` / `.raw.oga` ld-compress output.
-    /// Appended LAST: the discriminants are part of the FFI format codes
-    /// (0=flac 1=wav 2=u8 3=s8 4=u16 5=s16 6=ogg-flac).
     OggFlac,
+    /// DdD/ld-decode packed 10-bit raw RF (`.lds`): mono, 4 samples per 5
+    /// bytes, centre 512 (see [`crate::lds`]). Appended LAST: the
+    /// discriminants are part of the FFI format codes (0=flac 1=wav 2=u8
+    /// 3=s8 4=u16 5=s16 6=ogg-flac 7=lds).
+    Lds,
 }
 
 impl InputFormat {
@@ -607,6 +610,9 @@ impl InputFormat {
             // Ogg FLAC is remuxed to a temp native FLAC before SoX sees it.
             OggFlac => None,
             Wav => None,
+            // Packed .lds never reaches SoX as-is: the chop wrapper unpacks
+            // the cut window to a temp s16 first (chop_with_options_and_cancel).
+            Lds => None,
             InputFormat::U8 => Some("u8"),
             S8 => Some("s8"),
             U16 => Some("u16"),
@@ -623,11 +629,12 @@ impl InputFormat {
             S8 => "s8",
             U16 => "u16",
             S16 => "s16",
+            Lds => "lds",
         }
     }
 }
 
-use InputFormat::{Flac, OggFlac, S16, S8, U16, U8, Wav};
+use InputFormat::{Flac, Lds, OggFlac, S16, S8, U16, U8, Wav};
 
 /// Sniff the container format: FLAC/WAV by magic header, raw PCM by the
 /// common ld-decode/cxadc file extensions (.u8/.s8/.u16/.s16/.r8/.r16 and
@@ -685,11 +692,12 @@ pub fn sniff_format(path: &Path) -> Result<InputFormat, String> {
         // neither magic is corrupt, so routing it to the FLAC prober yields
         // a precise "first bytes …" error.
         "ldf" => Ok(Flac),
-        // Uncompressed packed-10-bit RF: no header, cannot be cut by sample.
-        "lds" => Err(
-            "a .lds file is headerless packed 10-bit RF — it cannot be probed or cut here; compress/convert it first (vhs-decode `ld-compress` → .ldf, or `ld-lds-converter -u` → 16-bit .r16)"
-                .to_string(),
-        ),
+        // DdD/ld-decode packed 10-bit raw RF (the format tbc-tools'
+        // ld-lds-converter unpacks). No header, but the packing is fully
+        // defined — probe_lds derives the totals from the file size and the
+        // rate from an <n>msps filename hint (or the 40 MSPS ld-decode
+        // default), and the cutter unpacks the needed window (crate::lds).
+        "lds" => Ok(Lds),
         "raw" | "bin" | "pcm" => {
             // 8-bit vs 16-bit raw is ambiguous without a header; the cxadc
             // 8-bit mode is by far the most common, so default to u8 and say so.
@@ -821,6 +829,7 @@ pub fn probe(path: &Path) -> ProbeResult {
         InputFormat::U8 | InputFormat::S8 | InputFormat::U16 | InputFormat::S16 => {
             probe_raw(path, &mut r, fmt)
         }
+        InputFormat::Lds => probe_lds(path, &mut r),
     }
     r
 }
@@ -891,6 +900,51 @@ fn probe_raw(path: &Path, r: &mut ProbeResult, fmt: InputFormat) {
     r.header_sample_rate = (msps * 1000.0) as u64;
     r.total_samples = r.file_size / u64::from(r.bits_per_sample / 8);
     r.total_samples_known = true;
+}
+
+/// Probe a DdD/ld-decode packed 10-bit `.lds` file (the format tbc-tools'
+/// ld-lds-converter unpacks): the packing is fully defined (4 samples per 5
+/// bytes, mono, centre 512 — see [`crate::lds`]), so the totals are exact
+/// from the file size. Like raw PCM there is no header, but unlike u8/u16
+/// raw the format has a canonical rate: ld-decode LaserDisc RF is 40 MSPS
+/// (ld-lds-converter's own default), so a missing `<n>msps` hint falls back
+/// to that default WITH a warning instead of the raw path's hard error.
+fn probe_lds(path: &Path, r: &mut ProbeResult) {
+    let name = path.to_string_lossy();
+    let msps = match crate::msps::extract_msps(&name) {
+        Some(m) if m > 0.0 => m,
+        _ => {
+            add_warning(
+                r,
+                &format!(
+                    "packed .lds has no <n>msps filename hint: assuming the {} MSPS ld-decode RF default (ld-lds-converter's default) — rename the file (e.g. ..._{}msps.lds) to pin the rate",
+                    crate::lds::DEFAULT_MSPS as u64,
+                    crate::lds::DEFAULT_MSPS as u64
+                ),
+            );
+            crate::lds::DEFAULT_MSPS
+        }
+    };
+    r.ok = true;
+    r.bits_per_sample = 10; // the true source depth (packed into 5-byte groups)
+    r.channels = 1;
+    r.audio_offset = 0;
+    r.real_rate_hz = msps * 1_000_000.0;
+    r.is_rf = true;
+    // The /1000-convention header equivalent (40 MSPS → 40000 Hz), so the GUI
+    // rate label and the SoX stream rate match the FLAC pipeline.
+    r.header_sample_rate = (msps * 1000.0) as u64;
+    let (total, trailing) = crate::lds::total_samples(r.file_size);
+    r.total_samples = total;
+    r.total_samples_known = true;
+    if trailing > 0 {
+        add_warning(
+            r,
+            &format!(
+                "packed .lds file size is not a multiple of 5: dropping {trailing} trailing byte(s) that don't form a whole 4-sample group"
+            ),
+        );
+    }
 }
 
 /// Native-FLAC probe entry: opens the file, locates the first audio frame,
@@ -1846,10 +1900,14 @@ mod tests {
         let p = write_temp("fc_test_vorbis.ogg", &vorbis);
         let e = sniff_format(&p).unwrap_err();
         assert!(e.contains("Vorbis") && e.contains("not Ogg FLAC"), "got: {e}");
-        // .lds: explains what it is and what to do.
+        // .lds: now a supported packed-10-bit input — sniffs as Lds and
+        // probes exactly (no more refusal).
         let p2 = write_temp("fc_test_tape.lds", &[0u8; 64]);
-        let e2 = sniff_format(&p2).unwrap_err();
-        assert!(e2.contains(".lds") && e2.contains("packed 10-bit"), "got: {e2}");
+        assert_eq!(sniff_format(&p2).unwrap(), InputFormat::Lds);
+        let r2 = probe(&p2);
+        assert!(r2.ok, "{}", r2.error);
+        assert_eq!(r2.format, InputFormat::Lds);
+        assert_eq!(r2.total_samples, 48); // 64 bytes = 12 groups + 4 trailing
         // ID3v2-prefixed FLAC: explains the fix.
         let mut id3 = b"ID3\x04\0\0\0\0\0\0".to_vec();
         id3.extend_from_slice(b"fLaC\0\0\0\x22");
@@ -1863,6 +1921,63 @@ mod tests {
         for q in [p, p2, p3, p4] {
             let _ = std::fs::remove_file(&q);
         }
+    }
+
+    // --- Packed .lds (DdD/ld-decode 10-bit) ------------------------------
+
+    #[test]
+    fn lds_probes_exact_from_file_size_with_default_rate_warning() {
+        // 12 whole groups + 3 trailing bytes: 48 samples, a trailing-byte
+        // warning, and — no <n>msps hint in the name — the 40 MSPS ld-decode
+        // default WITH a warning.
+        let mut bytes = Vec::new();
+        for g in 0..12u16 {
+            bytes.extend_from_slice(&crate::lds::pack_group(&[
+                ((g % 1024) as i32 - 512) as i16 * 64,
+                0,
+                -64,
+                64,
+            ]));
+        }
+        bytes.extend_from_slice(&[0xAB; 3]);
+        let p = write_temp("fc_test_lds_probe.lds", &bytes);
+        assert_eq!(sniff_format(&p).unwrap(), InputFormat::Lds);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert_eq!(r.format, InputFormat::Lds);
+        assert_eq!(r.total_samples, 48);
+        assert!(r.total_samples_known);
+        assert_eq!(r.bits_per_sample, 10);
+        assert_eq!(r.channels, 1);
+        assert!(r.is_rf);
+        assert!((r.real_rate_hz - 40_000_000.0).abs() < 1e-6);
+        assert_eq!(r.header_sample_rate, 40_000);
+        assert!(r.warnings.contains("assuming the 40 MSPS"), "{}", r.warnings);
+        assert!(r.warnings.contains("dropping 3 trailing"), "{}", r.warnings);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn lds_msps_hint_pins_the_rate_without_warnings() {
+        // An <n>msps hint in the name pins the rate and silences the default
+        // warning; group-aligned size probes cleanly.
+        let mut bytes = Vec::new();
+        for g in 0..5u16 {
+            bytes.extend_from_slice(&crate::lds::pack_group(&[
+                g as i16 * 64,
+                0,
+                0,
+                0,
+            ]));
+        }
+        let p = write_temp("fc_test_lds_20msps.lds", &bytes);
+        let r = probe(&p);
+        assert!(r.ok, "{}", r.error);
+        assert!((r.real_rate_hz - 20_000_000.0).abs() < 1e-6);
+        assert_eq!(r.header_sample_rate, 20_000);
+        assert!(r.warnings.is_empty(), "{}", r.warnings);
+        assert_eq!(r.total_samples, 20);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

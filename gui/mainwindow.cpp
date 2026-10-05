@@ -477,7 +477,7 @@ void MainWindow::browse()
     const QString startDir = m_inPath.isEmpty() ? QDir::homePath() : QFileInfo(m_inPath).absolutePath();
     const QString fn = QFileDialog::getOpenFileName(
         this, tr("Select capture file"), startDir,
-        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm)"
+        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 *.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm *.lds)"
            ";;FLAC / Ogg FLAC files (*.flac *.ldf *.oga *.ogg);;All files (*)"));
     if (fn.isEmpty())
         return;
@@ -1431,18 +1431,20 @@ static QVector<QPair<QString, QString>> parseCommentsBlob(const QByteArray& blob
 void MainWindow::setMetaStreamInfo()
 {
     // Read-only STREAMINFO summary at the top of the editor page.
-    static const char* kFmtNames[] = { "FLAC", "PCM WAV", "raw u8", "raw s8", "raw u16", "raw s16", "Ogg FLAC" };
+    static const char* kFmtNames[] = { "FLAC", "PCM WAV", "raw u8", "raw s8", "raw u16", "raw s16", "Ogg FLAC", "Packed .lds (10-bit)" };
     if (!m_probeOk) {
         for (auto* lbl : {m_metaFormatLabel, m_metaHeaderRateLabel, m_metaBitsChLabel,
                           m_metaRealRateLabel, m_metaTotalSamplesLabel, m_metaFileSizeLabel})
             lbl->setText(QStringLiteral("—"));
         return;
     }
-    m_metaFormatLabel->setText((m_probe.format <= 6)
+    m_metaFormatLabel->setText((m_probe.format <= 7)
         ? QString::fromLatin1(kFmtNames[m_probe.format])
         : tr("unknown"));
     if (m_probe.format >= 2 && m_probe.format <= 5)
         m_metaHeaderRateLabel->setText(tr("raw PCM (rate from filename)"));
+    else if (m_probe.format == 7)
+        m_metaHeaderRateLabel->setText(tr("packed 10-bit (rate from filename)"));
     else
         m_metaHeaderRateLabel->setText(tr("%1 Hz").arg(m_probe.header_sample_rate));
     m_metaBitsChLabel->setText(tr("%1-bit / %2 ch")

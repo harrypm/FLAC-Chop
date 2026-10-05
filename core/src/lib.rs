@@ -7,6 +7,9 @@
 //!    RF-capture header convention where the real 20 MSPS rate is stored as
 //!    20 kHz in the FLAC header.
 //!  - [`chop`]: drive SoX to do the actual sample-exact `trim` cut.
+//!  - [`lds`]: unpack DdD/ld-decode packed 10-bit `.lds` raw RF (the format
+//!    tbc-tools' ld-lds-converter handles) into the s16 stream the rest of
+//!    the pipeline consumes.
 //!
 //! [`ffi`] re-exports those as a plain C ABI so the Qt6 C++ GUI can link the
 //! staticlib directly.
@@ -15,6 +18,7 @@ pub mod chop;
 pub mod companions;
 pub mod enc12;
 pub mod ffi;
+pub mod lds;
 pub mod msps;
 pub mod ogg;
 pub mod probe;

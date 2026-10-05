@@ -146,8 +146,15 @@ fn sox_input_args(
     Ok(match fmt {
         // SoX sniffs the fLaC marker. (Ogg FLAC never reaches here: the
         // chop wrapper remuxes it to a temp native FLAC first — the bundled
-        // SoX has no Ogg support.)
+        // SoX has no Ogg support. Packed .lds never reaches here either:
+        // the chop wrapper unpacks the cut window to a temp s16 first.)
         InputFormat::Flac | InputFormat::OggFlac => Vec::new(),
+        InputFormat::Lds => {
+            return Err(
+                "packed .lds must be unpacked to a temp s16 by the chop wrapper first"
+                    .to_string(),
+            )
+        }
         InputFormat::Wav => {
             // Pin only real-rate RF WAVs (header > 1 MHz): override SoX's
             // view of the input rate to the /1000 convention so the sinc
@@ -904,6 +911,14 @@ fn in_hints_for(
 ) -> Result<Option<InHints>, String> {
     let hints = match fmt {
         InputFormat::Flac | InputFormat::OggFlac => None,
+        // Packed .lds never reaches libSoX: the chop wrapper unpacks the cut
+        // window to a temp s16 first (see chop_with_options_and_cancel).
+        InputFormat::Lds => {
+            return Err(
+                "packed .lds must be unpacked to a temp s16 by the chop wrapper first"
+                    .to_string(),
+            )
+        }
         InputFormat::Wav => match (opts.is_rf, wav_header_real_rate(in_path)?) {
             (true, Some(real)) if real > 1_000_000.0 => Some(InHints {
                 signal: sox_ffi::sox_signalinfo_t {
@@ -1276,6 +1291,93 @@ impl Drop for TempFileGuard {
     }
 }
 
+/// Where to put the temp s16 for a packed .lds window: next to the OUTPUT
+/// file (same placement policy as the Ogg window remux — the user already
+/// needs space there), falling back to the system temp dir.
+fn lds_window_temp_path(out_path: &str) -> PathBuf {
+    let name = format!(".flac-chop-ldssrc-{tag}.tmp.s16", tag = temp_tag());
+    if let Some(dir) = Path::new(out_path).parent() {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let cand = dir.join(&name);
+        if std::fs::File::create(&cand).is_ok() {
+            return cand;
+        }
+    }
+    std::env::temp_dir().join(name)
+}
+
+/// Cut a packed 10-bit `.lds` input (DdD/ld-decode raw RF — see
+/// [`crate::lds`]). Mirrors the Ogg-FLAC window remux: only the packing
+/// groups covering the cut are unpacked — with the reference
+/// ld-lds-converter scaling `(value - 512) * 64`, so the temp s16 stream is
+/// byte-for-byte what that tool's unpack writes — into a temp s16 next to
+/// the output; the normal SoX / 12-bit pipeline then runs on that file with
+/// the start shifted by the window's first sample. Works in BOTH backends
+/// (the temp is a plain s16 fed with explicit input hints).
+fn chop_lds_input(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    opts: ChopOptions,
+    cancel: Cancel<'_>,
+) -> ChopResult {
+    // The temp filename carries no <n>msps hint: pin the stream rate from
+    // the .lds probe (msps hint or the 40 MSPS ld-decode default).
+    let p = probe::probe(Path::new(in_path));
+    if !p.ok {
+        return ChopResult {
+            ok: false,
+            exit_code: -1,
+            stderr: p.error,
+        };
+    }
+
+    let tmp = lds_window_temp_path(out_path);
+    let _guard = TempFileGuard(tmp.clone());
+    let win = match crate::lds::unpack_window(
+        Path::new(in_path),
+        &tmp,
+        start_samples,
+        length_samples,
+        &|| cancel.requested(),
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            if e.contains("cancelled") {
+                cancel.consume(); // consume the flag
+            }
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: format!("packed .lds: {e}"),
+            };
+        }
+    };
+    let mut inner = opts;
+    inner.input_format = Some(InputFormat::S16);
+    inner.input_rate_hz = Some(p.real_rate_hz);
+    let mut r = chop_native_input(
+        &tmp.to_string_lossy(),
+        out_path,
+        start_samples - win.first_sample,
+        length_samples,
+        inner,
+        cancel,
+    );
+    let note = format!(
+        "note: packed .lds input — cut from an unpacked 10-bit window of samples {}..{} (the ld-lds-converter (value-512)*64 scaling)",
+        win.first_sample,
+        win.first_sample + win.samples
+    );
+    r.stderr = if r.stderr.is_empty() {
+        note
+    } else {
+        format!("{note}\n{}", r.stderr)
+    };
+    r
+}
+
 /// Where to put the temp native FLAC for an Ogg FLAC window: next to the
 /// OUTPUT file (the user already needs space there, and `/tmp` is often a
 /// RAM-backed tmpfs), falling back to the system temp dir if that directory
@@ -1303,6 +1405,11 @@ fn ogg_window_temp_path(out_path: &str) -> PathBuf {
 /// 12-bit pipeline then runs on that file with the start shifted by the
 /// window's first sample. The bundled SoX has no Ogg support, so this is what
 /// makes `.ldf` work in the release builds (and the static-sox backend).
+///
+/// Packed `.lds` inputs (DdD/ld-decode 10-bit raw RF) are handled the same
+/// way: only the packing groups covering the cut are unpacked ([`crate::lds`],
+/// the ld-lds-converter bit layout and scaling) into a temp s16, on which the
+/// normal pipeline then runs ([`chop_lds_input`]).
 pub fn chop_with_options(
     in_path: &str,
     out_path: &str,
@@ -1347,6 +1454,11 @@ pub fn chop_with_options_and_cancel(
         Err(e) => return fail(e),
     };
     if fmt != InputFormat::OggFlac {
+        // Packed .lds (DdD 10-bit): unpack the cut window to a temp s16 first,
+        // then run the normal pipeline on that (chop_lds_input).
+        if fmt == InputFormat::Lds {
+            return chop_lds_input(in_path, out_path, start_samples, length_samples, opts, cancel);
+        }
         return chop_native_input(in_path, out_path, start_samples, length_samples, opts, cancel);
     }
 

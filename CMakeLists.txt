@@ -10,32 +10,41 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# Derive the build version from git so the in-app version (and update check)
-# match the actual release tag, not a hard-coded string. Mirrors the CI
-# artifact versioning in .github/workflows/build.yml:
+# Build version, shown in the window title, --version, and the update check.
+#
+# CI packaging (.github/workflows/build.yml) ALWAYS passes the resolved
+# release version explicitly via -DFLAC_CHOP_VERSION=<version> (tag push or
+# release dispatch), so a packaged release build can never fall back to
+# "dev-<sha>" — this was the bug that shipped v1.0.8 with "dev-e744de2"
+# in-app: the tagless shallow CI checkout made git describe fail.
+#
+# Without the override (local builds) the version is derived from git to
+# match the CI artifact versioning:
 #   git describe --tags --dirty --match 'v*'
 # falling back to "dev-<short-sha>" when there are no tags / git is absent.
-find_package(Git QUIET)
-set(FLAC_CHOP_VERSION "dev-unknown")
-if(GIT_FOUND)
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} describe --tags --dirty --match "v*"
-        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-        OUTPUT_VARIABLE _git_desc
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_QUIET
-        RESULT_VARIABLE _git_rc)
-    if(_git_rc EQUAL 0 AND _git_desc)
-        set(FLAC_CHOP_VERSION "${_git_desc}")
-    else()
+if(NOT DEFINED FLAC_CHOP_VERSION)
+    set(FLAC_CHOP_VERSION "dev-unknown")
+    find_package(Git QUIET)
+    if(GIT_FOUND)
         execute_process(
-            COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+            COMMAND ${GIT_EXECUTABLE} describe --tags --dirty --match "v*"
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-            OUTPUT_VARIABLE _git_sha
+            OUTPUT_VARIABLE _git_desc
             OUTPUT_STRIP_TRAILING_WHITESPACE
-            ERROR_QUIET)
-        if(_git_sha)
-            set(FLAC_CHOP_VERSION "dev-${_git_sha}")
+            ERROR_QUIET
+            RESULT_VARIABLE _git_rc)
+        if(_git_rc EQUAL 0 AND _git_desc)
+            set(FLAC_CHOP_VERSION "${_git_desc}")
+        else()
+            execute_process(
+                COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                OUTPUT_VARIABLE _git_sha
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(_git_sha)
+                set(FLAC_CHOP_VERSION "dev-${_git_sha}")
+            endif()
         endif()
     endif()
 endif()

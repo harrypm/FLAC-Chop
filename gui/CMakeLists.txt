@@ -31,18 +31,27 @@ else()
     set(CORE_LIB "${CORE_DIR}/target/release/libflac_chop_core.a")
 endif()
 
+# Keep this list in sync with the actual core/src files: a source missing
+# here means ninja will NOT rerun cargo when it changes (the Oct-3 batch-task
+# work added enc12/ogg/streaminfo/tags and the stale-staticlib link only
+# failed at missing-symbol time).
 set(RUST_SOURCES
     "${CORE_DIR}/Cargo.toml"
-    "${CORE_DIR}/src/lib.rs"
-    "${CORE_DIR}/src/probe.rs"
-    "${CORE_DIR}/src/msps.rs"
-    "${CORE_DIR}/src/rate.rs"
-    "${CORE_DIR}/src/vorbis.rs"
-    "${CORE_DIR}/src/companions.rs"
-    "${CORE_DIR}/src/chop.rs"
-    "${CORE_DIR}/src/ffi.rs"
-    "${CORE_DIR}/src/sox_ffi.rs"
     "${CORE_DIR}/build.rs"
+    "${CORE_DIR}/src/lib.rs"
+    "${CORE_DIR}/src/chop.rs"
+    "${CORE_DIR}/src/companions.rs"
+    "${CORE_DIR}/src/enc12.rs"
+    "${CORE_DIR}/src/ffi.rs"
+    "${CORE_DIR}/src/lds.rs"
+    "${CORE_DIR}/src/msps.rs"
+    "${CORE_DIR}/src/ogg.rs"
+    "${CORE_DIR}/src/probe.rs"
+    "${CORE_DIR}/src/rate.rs"
+    "${CORE_DIR}/src/sox_ffi.rs"
+    "${CORE_DIR}/src/streaminfo.rs"
+    "${CORE_DIR}/src/tags.rs"
+    "${CORE_DIR}/src/vorbis.rs"
 )
 
 if(FLAC_CHOP_STATIC_SOX)

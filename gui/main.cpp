@@ -17,10 +17,38 @@
 #include "mainwindow.h"
 #include "flacchop.h"
 
+#if defined(Q_OS_WIN)
+#include <windows.h>
+#endif
+
 // Git-derived build version, injected by CMake (FLAC_CHOP_VERSION). Falls
 // back to "dev-unknown" when built outside the CMake version step.
 #ifndef FLAC_CHOP_VERSION
 #define FLAC_CHOP_VERSION "dev-unknown"
+#endif
+
+#if defined(Q_OS_WIN)
+// The Windows build is a WIN32-subsystem (GUI) executable, so it gets no
+// console std handles: CLI-mode output (--version / --probe / chop report)
+// was invisible when run interactively from cmd/PowerShell — it only showed
+// up when the caller redirected stdout (pipes, CI capture). Re-attach the
+// parent console and reopen the std streams so interactive CLI use prints.
+// Only the INVALID inherited handles are reopened, so a real redirection
+// (pipe / CI capture) is never clobbered. GUI launches never call this.
+static void attachParentConsoleForCli()
+{
+    struct H { static bool bad(HANDLE h) { return h == nullptr || h == INVALID_HANDLE_VALUE; } };
+    const bool outBad = H::bad(GetStdHandle(STD_OUTPUT_HANDLE));
+    const bool errBad = H::bad(GetStdHandle(STD_ERROR_HANDLE));
+    const bool inBad  = H::bad(GetStdHandle(STD_INPUT_HANDLE));
+    if (!outBad && !errBad && !inBad)
+        return; // caller redirected our streams: keep those handles
+    if (!AttachConsole(ATTACH_PARENT_PROCESS))
+        return; // no parent console (launched from Explorer): nothing to do
+    if (outBad) std::freopen("CONOUT$", "w", stdout);
+    if (errBad) std::freopen("CONOUT$", "w", stderr);
+    if (inBad)  std::freopen("CONIN$",  "r", stdin);
+}
 #endif
 
 // Dark Fusion palette matching ld-analyse (ld-decode/tools/ld-analyse/main.cpp)
@@ -162,10 +190,13 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 //   flac-chop --version
 //
 // Inputs: FLAC (.flac + fLaC-magic files), Ogg FLAC (.ldf/.oga/.ogg — the
-// real vhs-decode ld-compress output, detected by the OggS magic), PCM WAV, and
+// real vhs-decode ld-compress output, detected by the OggS magic), PCM WAV,
 // headerless raw PCM (.u8/.u16/.s8/.s16/.r8/.r16 and the reversed
-// .8u/.8s/.16u/.16s; .raw/.bin/.pcm assumed u8). Raw files must carry the rate
-// in their name (e.g. ..._8-bit_20msps.u8).
+// .8u/.8s/.16u/.16s; .raw/.bin/.pcm assumed u8), and DdD packed 10-bit .lds
+// (the ld-decode raw RF format ld-lds-converter unpacks — unpacked on the
+// fly, only the cut window). Raw files must carry the rate in their name
+// (e.g. ..._8-bit_20msps.u8); .lds falls back to the 40 MSPS ld-decode
+// default with a warning.
 //
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).
@@ -178,11 +209,11 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 // process exit code (0 = probed ok, 1 = probe failed).
 static int printProbeJson(const FcProbe& p)
 {
-    static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac" };
+    static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac", "lds" };
     QJsonObject o;
     o.insert(QStringLiteral("ok"), p.ok != 0);
     o.insert(QStringLiteral("error"), QString::fromUtf8(p.error));
-    o.insert(QStringLiteral("format"), QString::fromLatin1(p.format <= 6 ? kFmtNames[p.format] : "?"));
+    o.insert(QStringLiteral("format"), QString::fromLatin1(p.format <= 7 ? kFmtNames[p.format] : "?"));
     o.insert(QStringLiteral("format_code"), int(p.format));
     o.insert(QStringLiteral("header_sample_rate"), double(p.header_sample_rate));
     o.insert(QStringLiteral("declared_total_samples"), double(p.declared_total_samples));
@@ -240,10 +271,10 @@ static int runCli(int argc, char* argv[])
         if (json)
             return printProbeJson(p);
         if (!p.ok) { std::fprintf(stderr, "probe error: %s\n", p.error); return 1; }
-        static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac" };
+        static const char* kFmtNames[] = { "flac", "wav", "raw u8", "raw s8", "raw u16", "raw s16", "ogg-flac", "packed 10-bit lds" };
         std::printf("ok                 : true\n");
         std::printf("format             : %s\n",
-                    p.format <= 6 ? kFmtNames[p.format] : "?");
+                    p.format <= 7 ? kFmtNames[p.format] : "?");
         std::printf("header_sample_rate : %llu Hz\n", (unsigned long long)p.header_sample_rate);
         std::printf("bits_per_sample    : %u\n", p.bits_per_sample);
         std::printf("channels           : %u\n", p.channels);
@@ -429,6 +460,9 @@ int main(int argc, char* argv[])
         // CLI mode: run headless via QCoreApplication (no GUI). This makes
         // the binary scriptable + automatable and gives a fast smoke path
         // for the whole cut pipeline on real RF captures.
+#if defined(Q_OS_WIN)
+        attachParentConsoleForCli(); // make CLI output visible interactively
+#endif
         QCoreApplication cliApp(argc, argv);
         cliApp.setApplicationName(QStringLiteral("FLAC-Chop"));
         cliApp.setApplicationVersion(QStringLiteral(FLAC_CHOP_VERSION));
