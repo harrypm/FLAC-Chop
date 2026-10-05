@@ -1141,11 +1141,11 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           body_path: ${{ steps.notes.outputs.path }}
-        files: |
-          release-assets/**/linux_FLAC-Chop_*_x86.AppImage
-          release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
-          release-assets/**/windows_FLAC-Chop_*_x86_64.exe
-          release-assets/**/windows_FLAC-Chop_*_x86_64.zip
-          release-assets/**/windows_FLAC-Chop_*_arm64.exe
-          release-assets/**/windows_FLAC-Chop_*_arm64.zip
-          release-assets/**/macos_FLAC-Chop_*_universal.dmg
+          files: |
+            release-assets/**/linux_FLAC-Chop_*_x86.AppImage
+            release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
+            release-assets/**/windows_FLAC-Chop_*_x86_64.exe
+            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
+            release-assets/**/windows_FLAC-Chop_*_arm64.exe
+            release-assets/**/windows_FLAC-Chop_*_arm64.zip
+            release-assets/**/macos_FLAC-Chop_*_universal.dmg
