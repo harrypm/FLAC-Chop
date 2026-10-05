@@ -2,7 +2,10 @@
 
 #include "batchtab.h"
 #include "stemutil.h"
+#include "theme.h"
 
+#include <QApplication>
+#include <QRadioButton>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
@@ -22,6 +25,7 @@
 #include <QMenuBar>
 #include <QMenu>
 #include <QAction>
+#include <QActionGroup>
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QDir>
@@ -128,11 +132,43 @@ MainWindow::MainWindow(QWidget* parent)
 
     // --- Top menu bar ---
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
-    QAction* openAct = fileMenu->addAction(tr("&Open FLAC..."));
+    QAction* openAct = fileMenu->addAction(tr("&Open Data..."));
     connect(openAct, &QAction::triggered, this, &MainWindow::browse);
     fileMenu->addSeparator();
     QAction* exitAct = fileMenu->addAction(tr("E&xit"));
     connect(exitAct, &QAction::triggered, this, &QWidget::close);
+
+    // --- Theme menu (top bar, a peer of File/Help): just Dark / Light ---
+    // The tbc-tools Lite/Dark modes. Applied immediately + remembered
+    // (QSettings "theme/mode"); with no saved choice the default follows the
+    // OS theme (the tbc-tools behaviour).
+    auto* themeMenu = menuBar()->addMenu(tr("&Theme"));
+    QAction* themeDarkAct = themeMenu->addAction(tr("&Dark"));
+    QAction* themeLightAct = themeMenu->addAction(tr("&Light"));
+    themeDarkAct->setCheckable(true);
+    themeLightAct->setCheckable(true);
+    auto* themeGroup = new QActionGroup(this);
+    themeGroup->setExclusive(true);
+    themeGroup->addAction(themeDarkAct);
+    themeGroup->addAction(themeLightAct);
+    {
+        // Reflect the ACTIVE theme (the same resolution as startup: an
+        // explicit saved choice, else Dark — the default).
+        QSettings ts;
+        ts.beginGroup(QStringLiteral("theme"));
+        const QString mode = ts.value(QStringLiteral("mode")).toString().toLower();
+        ts.endGroup();
+        const bool dark =
+            (mode == QStringLiteral("dark") || mode == QStringLiteral("light"))
+                ? (mode == QStringLiteral("dark"))
+                : true; // no saved choice: Dark is the default
+        if (dark)
+            themeDarkAct->setChecked(true);
+        else
+            themeLightAct->setChecked(true);
+    }
+    connect(themeDarkAct, &QAction::triggered, this, [this] { applyThemeChoice(true); });
+    connect(themeLightAct, &QAction::triggered, this, [this] { applyThemeChoice(false); });
 
     auto* helpMenu = menuBar()->addMenu(tr("&Help"));
     QAction* checkUpdatesAct = helpMenu->addAction(tr("Check for &Updates"));
@@ -453,6 +489,24 @@ MainWindow::MainWindow(QWidget* parent)
         m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — cutting will fail."));
     }
     maybeCheckForUpdates();
+}
+
+// Theme menu: apply Dark/Light immediately + persist the explicit choice
+// (QSettings "theme/mode"). The tbc-tools ThemedApplication does the full
+// one-click switch: the isDarkTheme property FIRST, then the stock palette,
+// the Qt>=6.8 color-scheme override, a force-repaint of every widget, and a
+// deferred second pass — so a single menu click always switches fully.
+void MainWindow::applyThemeChoice(bool dark)
+{
+    if (dark)
+        ThemeUi::applyStockDarkThemeToApp();
+    else
+        ThemeUi::applyStockLightThemeToApp();
+    QSettings s;
+    s.beginGroup(QStringLiteral("theme"));
+    s.setValue(QStringLiteral("mode"),
+               dark ? QStringLiteral("dark") : QStringLiteral("light"));
+    s.endGroup();
 }
 
 void MainWindow::setControlsEnabled(bool enabled)

@@ -3,6 +3,7 @@
 #include <QGuiApplication>
 #include <QIcon>
 #include <QPalette>
+#include <QSettings>
 #include <QSize>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -16,6 +17,7 @@
 #include <limits>
 #include "mainwindow.h"
 #include "flacchop.h"
+#include "theme.h"
 
 #if defined(Q_OS_WIN)
 #include <windows.h>
@@ -50,48 +52,6 @@ static void attachParentConsoleForCli()
     if (inBad)  std::freopen("CONIN$",  "r", stdin);
 }
 #endif
-
-// Dark Fusion palette matching ld-analyse (ld-decode/tools/ld-analyse/main.cpp)
-// so FLAC-Chop visually matches the rest of the DdD/ld-decode toolset.
-static void applyDarkFusion(QApplication& app)
-{
-    app.setStyle("Fusion");
-
-    QPalette d;
-    d.setColor(QPalette::Window, QColor(53, 53, 53));
-    d.setColor(QPalette::WindowText, Qt::white);
-    d.setColor(QPalette::Base, QColor(25, 25, 25));
-    d.setColor(QPalette::AlternateBase, QColor(53, 53, 53));
-    d.setColor(QPalette::ToolTipBase, Qt::white);
-    d.setColor(QPalette::ToolTipText, Qt::white);
-    d.setColor(QPalette::Text, Qt::white);
-    d.setColor(QPalette::Button, QColor(53, 53, 53));
-    d.setColor(QPalette::ButtonText, Qt::white);
-    d.setColor(QPalette::BrightText, Qt::red);
-    d.setColor(QPalette::Link, QColor(42, 130, 218));
-    d.setColor(QPalette::Highlight, QColor(42, 130, 218));
-    d.setColor(QPalette::HighlightedText, Qt::black);
-    // Input-box text contrast (a hard-won tbc-tools lesson — see
-    // docs/DEV_NOTE_dark_theme_input_contrast.md): a hand-built dark palette
-    // made from a default-constructed QPalette keeps the LIGHT-theme
-    // PlaceholderText and Disabled-Text defaults, so placeholder text (the
-    // "(follows input: …)" hints) and disabled text in the path/selection
-    // boxes render near-invisible dark-on-dark. Set them explicitly with the
-    // preferred dark-theme values from tbc-tools' uistyle.h.
-    d.setColor(QPalette::PlaceholderText, QColor(0xD0, 0xD4, 0xD9));
-    d.setColor(QPalette::Disabled, QPalette::Text, QColor(0xAA, 0xAF, 0xB5));
-    d.setColor(QPalette::Disabled, QPalette::PlaceholderText, QColor(0x8D, 0x93, 0x99));
-    app.setPalette(d);
-    // Belt-and-braces, mirroring tbc-tools' enforceInputWidgetContrast guard
-    // stylesheet: pin input-widget colors to the palette so a platform theme
-    // override cannot re-darken them.
-    app.setStyleSheet(QStringLiteral(
-        "QLineEdit, QTextEdit, QPlainTextEdit {"
-        "  color: palette(text);"
-        "  selection-color: palette(highlighted-text);"
-        "  selection-background-color: palette(highlight);"
-        "}"));
-}
 
 // --- GUI launch forms ------------------------------------------------------
 // Two argument forms launch the GUI instead of the headless CLI:
@@ -195,8 +155,8 @@ static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activa
 // .8u/.8s/.16u/.16s; .raw/.bin/.pcm assumed u8), and DdD packed 10-bit .lds
 // (the ld-decode raw RF format ld-lds-converter unpacks — unpacked on the
 // fly, only the cut window). Raw files must carry the rate in their name
-// (e.g. ..._8-bit_20msps.u8); .lds falls back to the 40 MSPS ld-decode
-// default with a warning.
+// (e.g. ..._8-bit_20msps.u8); .lds uses its 40 MSPS ld-decode format rate
+// (every .lds is a 40 MSPS capture; an <n>msps hint overrides).
 //
 // <out> may be a full output path OR a directory (the renamed stem is then
 // derived from the input name + the chosen rate/bits, matching the GUI).
@@ -477,7 +437,12 @@ int main(int argc, char* argv[])
         qputenv("RESOURCE_NAME", "flac-chop");
 #endif
 
-    QApplication app(argc, argv);
+    // Stock theme environment (the tbc-tools model): stop the desktop
+    // palette tracking BEFORE construction, or Qt re-reads the OS palette
+    // and overwrites the manually-applied stock theme (the reason a naive
+    // "Light" does nothing on a dark-mode OS).
+    ThemeUi::prepareStockThemeEnvironment();
+    ThemeUi::ThemedApplication app(argc, argv);
     app.setApplicationName("FLAC-Chop");
     app.setApplicationVersion(QStringLiteral(FLAC_CHOP_VERSION));
     app.setOrganizationName("FLAC-Chop");
@@ -489,7 +454,26 @@ int main(int argc, char* argv[])
     // creation), which happens at w.show() below.
     QGuiApplication::setDesktopFileName(QStringLiteral("flac-chop"));
 #endif
-    applyDarkFusion(app);
+    // Lite/Dark theme: an explicit saved choice (QSettings "theme/mode",
+    // set by the Theme menu), else DARK — the default (the ld-analyse-style
+    // dark Fusion look the toolset is known for). ThemedApplication does the
+    // full one-click apply (the property-first ordering, the palette, the
+    // Qt>=6.8 color scheme override, the forced repaint, the deferred second
+    // pass, and the palette-change re-assert).
+    {
+        QSettings ts;
+        ts.beginGroup(QStringLiteral("theme"));
+        const QString themeMode = ts.value(QStringLiteral("mode")).toString().toLower();
+        ts.endGroup();
+        const bool dark =
+            (themeMode == QStringLiteral("dark") || themeMode == QStringLiteral("light"))
+                ? (themeMode == QStringLiteral("dark"))
+                : true; // no saved choice: Dark is the default
+        if (dark)
+            app.applyStockDarkTheme();
+        else
+            app.applyStockLightTheme();
+    }
     // Multi-size QIcon so the taskbar/dock gets a crisp icon at every size
     // (16..512) instead of a scaled single raster. Matches ld-analyse's
     // multi-size icon set. On Windows prefer the .ico (multi-resolution)

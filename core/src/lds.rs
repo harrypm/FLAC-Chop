@@ -33,9 +33,10 @@ use std::path::Path;
 pub const GROUP_BYTES: u64 = 5;
 /// Samples in one packing group.
 pub const GROUP_SAMPLES: u64 = 4;
-/// Reference default rate for a hint-less `.lds`: 40 MSPS (the ld-decode
-/// LaserDisc RF convention; ld-lds-converter's default `--sample-rate 40000`
-/// is the same /1000-convention value).
+/// The `.lds` format rate: 40 MSPS — every `.lds` is a 40 MSPS ld-decode
+/// LaserDisc RF capture (ld-lds-converter's default `--sample-rate 40000`
+/// is the same /1000-convention value). The format's only rate, not a guess;
+/// used without a warning (an `<n>msps` filename hint overrides).
 pub const DEFAULT_MSPS: f64 = 40.0;
 
 /// Unpack one 5-byte group into 4 s16 samples (the reference scaling

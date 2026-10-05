@@ -103,6 +103,8 @@ private:
     // effective dir while auto-following (the field itself stays empty — see
     // the m_outDirEdit comment in the .cpp).
     void refreshOutDirPlaceholder();
+    // Theme menu: apply Dark/Light at runtime + persist the choice.
+    void applyThemeChoice(bool dark);
 
     QString m_inPath;
     FcProbe m_probe{};

@@ -47,7 +47,7 @@ release downloads however if you build FLAC-Chop from source, SoX still needs to
 
 | Input | Recognized by | Rate source |
 |---|---|---|
-| **DdD/ld-decode packed 10-bit `.lds`** (4 samples per 5 bytes, mono, centre 512 — the format `ld-lds-converter` unpacks) | extension | filename `<n>msps` hint, else the 40 MSPS ld-decode default (with a warning); totals exact from the file size |
+| **DdD/ld-decode packed 10-bit `.lds`** (4 samples per 5 bytes, mono, centre 512 — the format `ld-lds-converter` unpacks) | extension | the 40 MSPS ld-decode format rate (an `<n>msps` hint overrides); totals exact from the file size |
 | Native FLAC (`.flac`, any file starting with the `fLaC` magic) | header + magic | header (RF /1000 rule applies) |
 | **Ogg FLAC** (`.ldf`, `.oga`, `.raw.oga`, `.ogg` — any file starting with `OggS` + a FLAC mapping header) | magic, never the extension | header (RF /1000 rule applies); length from the last Ogg page |
 | PCM WAV (`.wav`) | header | header: audio rate as-is; >1 MHz = real RF rate; else /1000 |
@@ -135,6 +135,10 @@ A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
   output, like the `.ldf` window remux) — a 10 s cut of a 352 GB `.lds` never
   touches the rest of the file. Output conversions (8/12-bit, resampling)
   work as on any input.
+
+- **Lite/Dark theme** (Theme menu at the top, the tbc-tools model): Dark uses
+  the ld-analyse-style dark Fusion palette, Light the default; with no saved
+  choice the default follows your OS theme, and the choice is remembered.
 
 - Headless `probe_cli` and `chop_cli` for scripting / validation.
 

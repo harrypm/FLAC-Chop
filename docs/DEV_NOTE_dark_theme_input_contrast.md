@@ -2,7 +2,7 @@
 
 Status: HARD RULE for every Qt6 GUI in the family (FLAC-Chop, tbc-tools, tape-decode-rust GUI, vhs-decode, future apps). A dark palette is NOT done until the input-box roles below are set and measured. This bug has now been hit and fixed repeatedly (tbc-tools hit it across several tools; FLAC-Chop hit it again on 2026-10-03) — stop re-hitting it.
 
-Canonical shared implementation: `tbc-tools/src/library/tbc/uistyle.h` (`enforceInputWidgetContrast`, `stockDarkPalette`, `ThemedApplication`). This note is the distilled rule; FLAC-Chop carries a local copy of the fix in `gui/main.cpp applyDarkFusion()`.
+Canonical shared implementation: `tbc-tools/src/library/tbc/uistyle.h` (`enforceInputWidgetContrast`, `stockDarkPalette`, `ThemedApplication`). This note is the distilled rule; FLAC-Chop carries a faithful port in `gui/theme.h` (see also DEV_NOTE_theme_switch_one_click.md — the full one-click switching flow; the old `gui/main.cpp applyDarkFusion()` is gone).
 
 ## The bug (root cause)
 A hand-built dark palette made from a **default-constructed QPalette** keeps the LIGHT-theme defaults for the roles nobody remembers to set. The visible ones are inside QLineEdit "file selection" boxes (read-only path fields, output-dir fields, time boxes):
@@ -31,8 +31,8 @@ Light theme equivalents (0x5F6368 placeholder, 0x6B7280 / 0x9AA0A6 disabled) are
 
 ## The full tbc-tools solution (adopt what applies)
 - `enforceInputWidgetContrast()`: measure, don't assume — `|lightnessF(color) − lightnessF(Base)|` must be ≥ **0.45** for Text, ≥ **0.2** for PlaceholderText (also guards Highlight vs HighlightedText). Fix only when below the threshold.
-- `ThemedApplication` (uistyle.h): re-asserts the stock palette on `ApplicationPaletteChange` (the macOS scheduled Dark-Mode switchover silently re-reads the system palette and overwrites yours mid-run). Deferred with `QTimer::singleShot(0,…)` — a synchronous setPalette inside `event()` recurses and crashes. Needed for macOS-shipping apps; FLAC-Chop (Linux/Windows) currently carries only the guard stylesheet.
-- `QGuiApplication::setDesktopSettingsAware(false)` before QApplication + `styleHints()->setColorScheme(Qt::ColorScheme::Dark)` (Qt ≥ 6.8) as defense in depth.
+- `ThemedApplication` (uistyle.h): re-asserts the stock palette on `ApplicationPaletteChange` (the macOS scheduled Dark-Mode switchover silently re-reads the system palette and overwrites yours mid-run). Deferred with `QTimer::singleShot(0,…)` — a synchronous setPalette inside `event()` recurses and crashes. FLAC-Chop adopted the full `ThemedApplication` port (gui/theme.h) on 2026-10-05 — see DEV_NOTE_theme_switch_one_click.md (the runtime switch needs it everywhere, not just macOS).
+- `QGuiApplication::setDesktopSettingsAware(false)` before QApplication + `styleHints()->setColorScheme(...)` (Qt ≥ 6.8) as defense in depth — now part of FLAC-Chop's startup (gui/theme.h prepareStockThemeEnvironment).
 - Read-only path boxes: use QPalette::Text (not a hard-coded grey) so the theme owns the color.
 
 ## How to verify (hard data, not "looks fine")

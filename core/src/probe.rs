@@ -905,26 +905,15 @@ fn probe_raw(path: &Path, r: &mut ProbeResult, fmt: InputFormat) {
 /// Probe a DdD/ld-decode packed 10-bit `.lds` file (the format tbc-tools'
 /// ld-lds-converter unpacks): the packing is fully defined (4 samples per 5
 /// bytes, mono, centre 512 — see [`crate::lds`]), so the totals are exact
-/// from the file size. Like raw PCM there is no header, but unlike u8/u16
-/// raw the format has a canonical rate: ld-decode LaserDisc RF is 40 MSPS
-/// (ld-lds-converter's own default), so a missing `<n>msps` hint falls back
-/// to that default WITH a warning instead of the raw path's hard error.
+/// from the file size. Like raw PCM there is no header, but the format has
+/// exactly one rate: every `.lds` is a 40 MSPS ld-decode LaserDisc RF capture
+/// (ld-lds-converter's own default rate), so 40 MSPS is the format rate —
+/// used SILENTLY, not a guess that needs a warning. An explicit `<n>msps`
+/// filename hint still wins if the user renamed a file to pin something else.
 fn probe_lds(path: &Path, r: &mut ProbeResult) {
-    let name = path.to_string_lossy();
-    let msps = match crate::msps::extract_msps(&name) {
-        Some(m) if m > 0.0 => m,
-        _ => {
-            add_warning(
-                r,
-                &format!(
-                    "packed .lds has no <n>msps filename hint: assuming the {} MSPS ld-decode RF default (ld-lds-converter's default) — rename the file (e.g. ..._{}msps.lds) to pin the rate",
-                    crate::lds::DEFAULT_MSPS as u64,
-                    crate::lds::DEFAULT_MSPS as u64
-                ),
-            );
-            crate::lds::DEFAULT_MSPS
-        }
-    };
+    let msps = crate::msps::extract_msps(&path.to_string_lossy())
+        .filter(|m| *m > 0.0)
+        .unwrap_or(crate::lds::DEFAULT_MSPS);
     r.ok = true;
     r.bits_per_sample = 10; // the true source depth (packed into 5-byte groups)
     r.channels = 1;
@@ -1926,10 +1915,11 @@ mod tests {
     // --- Packed .lds (DdD/ld-decode 10-bit) ------------------------------
 
     #[test]
-    fn lds_probes_exact_from_file_size_with_default_rate_warning() {
-        // 12 whole groups + 3 trailing bytes: 48 samples, a trailing-byte
-        // warning, and — no <n>msps hint in the name — the 40 MSPS ld-decode
-        // default WITH a warning.
+    fn lds_probes_exact_with_the_40msps_format_rate() {
+        // 12 whole groups + 3 trailing bytes: 48 samples. No <n>msps hint in
+        // the name: the 40 MSPS ld-decode FORMAT rate is used silently (only
+        // .lds captures exist at 40 MSPS — a trailing-byte warning is the only
+        // diagnostic this probe emits here).
         let mut bytes = Vec::new();
         for g in 0..12u16 {
             bytes.extend_from_slice(&crate::lds::pack_group(&[
@@ -1952,15 +1942,15 @@ mod tests {
         assert!(r.is_rf);
         assert!((r.real_rate_hz - 40_000_000.0).abs() < 1e-6);
         assert_eq!(r.header_sample_rate, 40_000);
-        assert!(r.warnings.contains("assuming the 40 MSPS"), "{}", r.warnings);
+        assert!(!r.warnings.contains("40 MSPS"), "{}", r.warnings);
         assert!(r.warnings.contains("dropping 3 trailing"), "{}", r.warnings);
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn lds_msps_hint_pins_the_rate_without_warnings() {
-        // An <n>msps hint in the name pins the rate and silences the default
-        // warning; group-aligned size probes cleanly.
+        // An <n>msps hint in the name pins a non-default rate; group-aligned
+        // size probes cleanly with no warnings at all.
         let mut bytes = Vec::new();
         for g in 0..5u16 {
             bytes.extend_from_slice(&crate::lds::pack_group(&[

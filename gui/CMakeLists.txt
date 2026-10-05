@@ -84,6 +84,8 @@ set(GUI_SOURCES
     batchtab.cpp
     batchtab.h
     stemutil.h
+    theme.cpp
+    theme.h
     rangeslider.cpp
     rangeslider.h
     resources.qrc
