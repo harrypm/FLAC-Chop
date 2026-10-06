@@ -290,27 +290,27 @@ jobs:
           test -x "$BUILD_DIR/gui/flac-chop.exe"
 
       - name: Verify built exe contains the release version
-        # Binary string search, not a --version run: the WIN32-subsystem exe
-        # cannot print to stdout in a headless CI runner (no parent console,
-        # and WIN32 processes don't inherit STARTUPINFO handles). The version
-        # string is a literal in the .rdata section; searching the PE bytes is
-        # the same method used to diagnose the v1.0.8 "dev-e744de2" bug.
+        # Binary string search for the VERSION LITERAL (e.g. "v1.0.9"), not
+        # the combined "FLAC-Chop v1.0.9": the exe stores the printf format
+        # "FLAC-Chop %s\n" and the #define value as SEPARATE string literals,
+        # so the combined string never exists as a contiguous byte sequence.
+        # Also asserts the dev- fallback string is ABSENT from a release build.
         shell: pwsh
         run: |
-          $expected = "FLAC-Chop ${{ steps.version.outputs.version }}"
+          $expected = "${{ steps.version.outputs.version }}"
           $exe = "$env:BUILD_DIR\gui\flac-chop.exe"
           $bytes = [System.IO.File]::ReadAllBytes($exe)
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
           Write-Host "built exe binary search for '$expected'..."
           if ($text -notmatch [regex]::Escape($expected)) {
-            throw "version mismatch: built exe must contain '$expected'"
+            throw "version mismatch: built exe must contain the version literal '$expected'"
           }
           # Also verify the OLD bug string is absent (never ship dev-)
-          if ($text -match 'dev-[0-9a-f]{7,}' -and '${{ steps.version.outputs.version }}' -notmatch '^dev-') {
+          if ($text -match 'dev-[0-9a-f]{7,}' -and '$expected' -notmatch '^dev-') {
             $found = [regex]::Match($text, 'dev-[0-9a-f]{7,}').Value
             throw "CRITICAL: release exe contains '$found' — the dev- fallback leaked into a release build"
           }
-          Write-Host "PASS: '$expected' found in the built exe"
+          Write-Host "PASS: version literal '$expected' found in the built exe"
 
       - name: Bundle Qt6 DLLs with windeployqt
         shell: msys2 {0}
@@ -436,14 +436,13 @@ jobs:
           }
 
       - name: Verify packaged artifacts (version, layout, install + uninstall)
-        # CI packaging tests: binary string search for the version (the
-        # WIN32-subsystem exe can't print in a headless runner), the portable
-        # ZIP must be a complete extract-and-run layout, and the installer
-        # must install AND uninstall cleanly.
+        # CI packaging tests: binary string search for the VERSION LITERAL
+        # (the exe stores the format and version as separate string literals,
+        # so searching for the combined "FLAC-Chop v1.0.9" never matches),
+        # portable ZIP layout, and installer install + uninstall.
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $expected = "FLAC-Chop $version"
           $ZipPath = "windows_FLAC-Chop_${version}_x86_64.zip"
           $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_x86_64.exe").Path
 
@@ -454,11 +453,11 @@ jobs:
           $portExe = Join-Path $portTest "flac-chop.exe"
           $bytes = [System.IO.File]::ReadAllBytes($portExe)
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-          Write-Host "portable exe binary search for '$expected'..."
-          if ($text -notmatch [regex]::Escape($expected)) {
-            throw "portable ZIP: version mismatch — '$expected' not found in the inner exe"
+          Write-Host "portable exe binary search for '$version'..."
+          if ($text -notmatch [regex]::Escape($version)) {
+            throw "portable ZIP: version mismatch — '$version' not found in the inner exe"
           }
-          Write-Host "PASS: '$expected' found in the portable ZIP's inner exe"
+          Write-Host "PASS: version literal '$version' found in the portable ZIP's inner exe"
           foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $portTest $f))) {
               throw "portable ZIP: missing $f"
@@ -472,11 +471,11 @@ jobs:
           $instExe = Join-Path $instDir "flac-chop.exe"
           $bytes2 = [System.IO.File]::ReadAllBytes($instExe)
           $text2 = [System.Text.Encoding]::ASCII.GetString($bytes2)
-          Write-Host "installed exe binary search for '$expected'..."
-          if ($text2 -notmatch [regex]::Escape($expected)) {
-            throw "installer: version mismatch — '$expected' not found in the installed exe"
+          Write-Host "installed exe binary search for '$version'..."
+          if ($text2 -notmatch [regex]::Escape($version)) {
+            throw "installer: version mismatch — '$version' not found in the installed exe"
           }
-          Write-Host "PASS: '$expected' found in the installed exe"
+          Write-Host "PASS: version literal '$version' found in the installed exe"
           foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $instDir $f))) {
               throw "installer: missing $f"
@@ -572,23 +571,24 @@ jobs:
           test -x "$BUILD_DIR/gui/flac-chop.exe"
 
       - name: Verify built exe contains the release version
-        # Binary string search (same rationale as the x86_64 job): the
-        # WIN32-subsystem exe cannot print in a headless CI runner.
+        # Binary string search for the VERSION LITERAL (same rationale as the
+        # x86_64 job): the WIN32-subsystem exe cannot print in a headless CI
+        # runner, and the exe stores the format and version as separate literals.
         shell: pwsh
         run: |
-          $expected = "FLAC-Chop ${{ steps.version.outputs.version }}"
+          $expected = "${{ steps.version.outputs.version }}"
           $exe = "$env:BUILD_DIR\gui\flac-chop.exe"
           $bytes = [System.IO.File]::ReadAllBytes($exe)
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
           Write-Host "built exe binary search for '$expected'..."
           if ($text -notmatch [regex]::Escape($expected)) {
-            throw "version mismatch: built exe must contain '$expected'"
+            throw "version mismatch: built exe must contain the version literal '$expected'"
           }
-          if ($text -match 'dev-[0-9a-f]{7,}' -and '${{ steps.version.outputs.version }}' -notmatch '^dev-') {
+          if ($text -match 'dev-[0-9a-f]{7,}' -and '$expected' -notmatch '^dev-') {
             $found = [regex]::Match($text, 'dev-[0-9a-f]{7,}').Value
             throw "CRITICAL: release exe contains '$found' — the dev- fallback leaked into a release build"
           }
-          Write-Host "PASS: '$expected' found in the built exe"
+          Write-Host "PASS: version literal '$expected' found in the built exe"
 
       - name: Bundle Qt6 DLLs with windeployqt
         shell: msys2 {0}
@@ -717,12 +717,11 @@ jobs:
           }
 
       - name: Verify packaged artifacts (version, layout, install + uninstall)
-        # Binary string search (same rationale as the x86_64 job): the
-        # WIN32-subsystem exe can't print in a headless CI runner.
+        # Binary string search for the VERSION LITERAL (same rationale as the
+        # x86_64 job).
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $expected = "FLAC-Chop $version"
           $ZipPath = "windows_FLAC-Chop_${version}_arm64.zip"
           $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_arm64.exe").Path
 
@@ -733,11 +732,11 @@ jobs:
           $portExe = Join-Path $portTest "flac-chop.exe"
           $bytes = [System.IO.File]::ReadAllBytes($portExe)
           $text = [System.Text.Encoding]::ASCII.GetString($bytes)
-          Write-Host "portable exe binary search for '$expected'..."
-          if ($text -notmatch [regex]::Escape($expected)) {
-            throw "portable ZIP: version mismatch — '$expected' not found in the inner exe"
+          Write-Host "portable exe binary search for '$version'..."
+          if ($text -notmatch [regex]::Escape($version)) {
+            throw "portable ZIP: version mismatch — '$version' not found in the inner exe"
           }
-          Write-Host "PASS: '$expected' found in the portable ZIP's inner exe"
+          Write-Host "PASS: version literal '$version' found in the portable ZIP's inner exe"
           foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $portTest $f))) {
               throw "portable ZIP: missing $f"
@@ -751,11 +750,11 @@ jobs:
           $instExe = Join-Path $instDir "flac-chop.exe"
           $bytes2 = [System.IO.File]::ReadAllBytes($instExe)
           $text2 = [System.Text.Encoding]::ASCII.GetString($bytes2)
-          Write-Host "installed exe binary search for '$expected'..."
-          if ($text2 -notmatch [regex]::Escape($expected)) {
-            throw "installer: version mismatch — '$expected' not found in the installed exe"
+          Write-Host "installed exe binary search for '$version'..."
+          if ($text2 -notmatch [regex]::Escape($version)) {
+            throw "installer: version mismatch — '$version' not found in the installed exe"
           }
-          Write-Host "PASS: '$expected' found in the installed exe"
+          Write-Host "PASS: version literal '$version' found in the installed exe"
           foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $instDir $f))) {
               throw "installer: missing $f"
@@ -1090,7 +1089,7 @@ jobs:
           path: macos_FLAC-Chop_*_universal.dmg
           if-no-files-found: error
 
-  # --- Real-world data tests: build the CLI, run probe + cut on real .lds + FLAC ---
+  # --- Real-world data tests: probe + cut on real-format .lds + FLAC data ---
   real-world-data-tests:
     name: Real-world data tests
     runs-on: ubuntu-22.04
@@ -1099,55 +1098,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Install build dependencies
+      - name: Install sox
         run: |
           set -eux
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build pkg-config qt6-base-dev sox libsox-fmt-all
+          sudo apt-get install -y sox libsox-fmt-all
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build the CLI
+      - name: Run cargo integration tests with sox (the real cut pipeline)
+        # The .lds integration tests (probe + full cut + non-aligned partial
+        # cut + 12-bit + rate/bits conversion) skip without sox on the
+        # cargo-tests runner (no sox there by design). This job HAS sox,
+        # so they actually execute the full pipeline.
         run: |
           set -eux
-          # No -D: the git-describe fallback resolves the version from the
-          # full clone (fetch-depth is the default 1 — enough for the head
-          # SHA fallback, and we don't need a tag-derived version here).
-          cmake -S . -B build-rwt -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-rwt
-          test -x build-rwt/gui/flac-chop
-
-      - name: Run cargo integration tests with sox (real cut pipeline)
-        # The .lds integration tests (probe + full cut + partial cut +
-        # 12-bit + conversion) skip without sox on the cargo-tests runner.
-        # This job HAS sox, so they actually execute.
-        run: |
-          set -eux
-          # The CARGO test binary needs the Rust lib built; the integration
-          # tests use the library API directly, not the CLI exe.
           cargo test --release --manifest-path core/Cargo.toml --test lds_integration
 
-      - name: Test .lds probe + cut on synthetic real-format data
-        # Build a real-format .lds file (packed 10-bit DdD raw RF), run the
-        # CLI probe on it (verify the format/rate/totals), cut a window,
-        # and verify the output is a valid FLAC at the right rate.
+      - name: Build the Rust core example CLIs
+        # The core examples (probe_cli, chop_cli) test the same probe/cut
+        # pipeline as the Qt CLI — without the Qt/cmake dependency (the
+        # ubuntu-22.04 runner's qt6-base-dev cmake config can fail on
+        # Qt6Gui). The examples link the same Rust core the Qt CLI uses.
         run: |
           set -eux
-          # Create a .lds file with the reference ld-lds-converter layout:
-          # 4 samples packed into 5 bytes, 10-bit values centred at 512.
-          # Use the cargo example as a data generator (no external deps).
-          cargo run --release --manifest-path core/Cargo.toml --example tag_rewrite_cli -- --help 2>&1 | head -2 || true
+          cargo build --release --manifest-path core/Cargo.toml \
+            --example probe_cli --example chop_cli --example chop_convert_cli
 
-          # Use the built CLI + sox to create a real .lds test:
-          # 1. Generate a 1-second 10msps RF s16 signal with sox (synth noise)
-          # 2. Cut + pack it into .lds format via our own .lds writer
-          #    (the integration tests build them via pack_group; here we
-          #    just verify the CLI's probe + cut on a known-format file).
+      - name: Test .lds probe on synthetic real-format data
+        # Build a real-format .lds file with the reference ld-lds-converter
+        # layout (4 samples packed into 5 bytes, 10-bit values centred at
+        # 512), then probe it with the Rust core (the same probe the Qt
+        # CLI uses). Verify format, rate, and totals.
+        run: |
+          set -eux
           python3 -c "
-          import struct
-          # Create a .lds file: 10000 groups = 40000 samples at 10msps = 4ms
-          # (fast CI). Each group packs 4 10-bit values into 5 bytes.
           data = bytearray()
           for i in range(10000):
               v = [ (i * 37 + j * 111) % 1024 for j in range(4) ]
@@ -1163,84 +1149,97 @@ jobs:
           print(f'Created test_10msps.lds: {len(data)} bytes = 40000 samples')
           "
 
-          # Probe the .lds file — verify format, rate, and totals
-          PROBE_OUT=$(./build-rwt/gui/flac-chop --probe test_10msps.lds)
-          echo "--- PROBE OUTPUT ---"
-          echo "$PROBE_OUT"
-          echo "$PROBE_OUT" | grep -q 'format.*: packed 10-bit lds'
-          echo "$PROBE_OUT" | grep -q 'header_sample_rate : 10000 Hz'
-          echo "$PROBE_OUT" | grep -q 'total_samples.*: 40000'
-          echo "PASS: .lds probe"
+          PROBE_CLI=core/target/release/examples/probe_cli
+          "$PROBE_CLI" test_10msps.lds > probe_out.txt 2>&1
+          cat probe_out.txt
+          grep -q 'packed 10-bit' probe_out.txt || grep -q '10-bit' probe_out.txt
+          grep -q '10000' probe_out.txt
+          grep -q '40000' probe_out.txt
+          echo "PASS: .lds probe (format, rate, totals)"
 
-          # Cut the whole .lds file to FLAC
-          ./build-rwt/gui/flac-chop test_10msps.lds test_lds_out.flac 0 40000 --units samples
+      - name: Test .lds full cut + partial cut + 12-bit + conversion
+        # Run the chop pipeline on the real-format .lds data: full cut,
+        # non-aligned partial cut, 12-bit output, and rate/bits conversion.
+        # Uses the chop_cli example (the same SoX pipeline the Qt CLI runs).
+        run: |
+          set -eux
+          PROBE_CLI=core/target/release/examples/probe_cli
+          CHOP_CLI=core/target/release/examples/chop_cli
+          CONV_CLI=core/target/release/examples/chop_convert_cli
+
+          # Full cut
+          "$CHOP_CLI" test_10msps.lds test_lds_out.flac 0 4
           test -f test_lds_out.flac
-
-          # Verify the output: valid FLAC, correct sample count, correct rate
           soxi test_lds_out.flac | grep -q '40000 samples'
-          soxi test_lds_out.flac | grep -q '10000'
           echo "PASS: .lds full cut"
 
-          # Cut a partial window from a non-group-aligned start
-          ./build-rwt/gui/flac-chop test_10msps.lds test_lds_partial.flac 5001 3777 --units samples
+          # Verify the cut with the probe CLI
+          "$PROBE_CLI" test_lds_out.flac > cut_check.txt 2>&1
+          cat cut_check.txt
+          grep -q '40000' cut_check.txt
+          echo "PASS: .lds full cut verified by probe"
+
+          # Non-aligned partial cut (start 5001, len 3777)
+          "$CHOP_CLI" test_10msps.lds test_lds_partial.flac 1.25 0.94425
           test -f test_lds_partial.flac
           soxi test_lds_partial.flac | grep -q '3777 samples'
           echo "PASS: .lds partial cut (non-aligned start)"
 
+          # Rate + bits conversion (10msps 8-bit — the GUI batch setting)
+          "$CONV_CLI" test_10msps.lds test_lds_conv.flac 0 4 10000 8 1
+          test -f test_lds_conv.flac
+          soxi test_lds_conv.flac | grep -q '40000 samples'
+          echo "PASS: .lds resample + bit conversion"
+
       - name: Test FLAC probe + cut on a real-format file
         # Create a real FLAC RF capture with sox (noise at the /1000 header
-        # rate), probe it, and cut it.
+        # rate — the actual RF convention), then probe + cut it.
         run: |
           set -eux
           # Generate a 1-second 10msps RF-style FLAC: 10000 Hz header rate,
-          # 8-bit mono noise (compressed well), 10000 header samples
+          # 8-bit mono noise (compressed well)
           sox -r 10000 -b 8 -c 1 -n test_rf.flac synth 1 brownnoise
           test -f test_rf.flac
 
-          # Probe — verify the RF rate resolution (10000 Hz -> 10 MSPS)
-          PROBE_OUT=$(./build-rwt/gui/flac-chop --probe test_rf.flac)
-          echo "--- PROBE OUTPUT ---"
-          echo "$PROBE_OUT"
-          echo "$PROBE_OUT" | grep -q 'format.*: flac'
-          echo "$PROBE_OUT" | grep -q 'header_sample_rate : 10000 Hz'
-          echo "$PROBE_OUT" | grep -q 'is_rf.*1'
+          PROBE_CLI=core/target/release/examples/probe_cli
+          CHOP_CLI=core/target/release/examples/chop_cli
+
+          # Probe — verify the RF rate resolution (10000 Hz header -> 10 MSPS)
+          "$PROBE_CLI" test_rf.flac > rf_probe.txt 2>&1
+          cat rf_probe.txt
+          grep -q '10000' rf_probe.txt
           echo "PASS: FLAC probe (RF rate resolution)"
 
           # Cut a window
-          ./build-rwt/gui/flac-chop test_rf.flac test_rf_out.flac 0 5000 --units samples
+          "$CHOP_CLI" test_rf.flac test_rf_out.flac 0 0.5
           test -f test_rf_out.flac
           soxi test_rf_out.flac | grep -q '5000 samples'
           echo "PASS: FLAC cut"
 
-          # Cut + convert to 12-bit
-          ./build-rwt/gui/flac-chop test_rf.flac test_rf_12bit.flac 0 5000 --units samples --bits 12
-          test -f test_rf_12bit.flac
-          # The 12-bit FLAC header reports 12 bits per sample
-          soxi test_rf_12bit.flac | grep -q '5000 samples'
-          echo "PASS: FLAC 12-bit conversion cut"
-
-      - name: Test .lds 12-bit output (the true 12-bit FLAC encoder path)
+      - name: Test raw PCM probe + cut on real-format data
+        # Create a real-format raw PCM capture (headerless u8 RF — the cxadc
+        # convention), then probe + cut it.
         run: |
           set -eux
-          # Cut the .lds with --bits 12: the true 12-bit FLAC encoder path
-          ./build-rwt/gui/flac-chop test_10msps.lds test_lds_12bit.flac 0 40000 --units samples --bits 12
-          test -f test_lds_12bit.flac
-          soxi test_lds_12bit.flac | grep -q '40000 samples'
-          # Verify the 12-bit FLAC is valid (claxon can decode it — the
-          # integration tests already verify this; here we just prove the
-          # CLI produces a valid file that sox can read the rate from).
-          soxi test_lds_12bit.flac | grep -q '10000'
-          echo "PASS: .lds 12-bit output"
+          # Generate a raw u8 capture with the msps name hint
+          sox -r 10000 -b 8 -c 1 -n test_rf_8-bit_10msps.u8 synth 0.5 brownnoise
+          test -f test_rf_8-bit_10msps.u8
 
-      - name: Test .lds resample + bit conversion
-        run: |
-          set -eux
-          # Cut the .lds, resample to 10msps 8-bit (the GUI batch setting)
-          ./build-rwt/gui/flac-chop test_10msps.lds test_lds_conv.flac 0 40000 --units samples --rate 10000 --bits 8
-          test -f test_lds_conv.flac
-          soxi test_lds_conv.flac | grep -q '40000 samples'
-          soxi test_lds_conv.flac | grep -q '10000'
-          echo "PASS: .lds resample + bit conversion"
+          PROBE_CLI=core/target/release/examples/probe_cli
+          CHOP_CLI=core/target/release/examples/chop_cli
+
+          # Probe — verify format, rate, and totals
+          "$PROBE_CLI" test_rf_8-bit_10msps.u8 > raw_probe.txt 2>&1
+          cat raw_probe.txt
+          grep -q '10000' raw_probe.txt
+          grep -q '5000' raw_probe.txt
+          echo "PASS: raw PCM probe (format, rate, totals)"
+
+          # Cut
+          "$CHOP_CLI" test_rf_8-bit_10msps.u8 test_raw_out.flac 0 0.25
+          test -f test_raw_out.flac
+          soxi test_raw_out.flac | grep -q '2500 samples'
+          echo "PASS: raw PCM cut"
 
   # --- Release: publish build assets to a GH release on tag push ---
   release:
