@@ -55,7 +55,9 @@ AppUpdatesURL=https://github.com/harrypm/FLAC-Chop/releases
 DefaultDirName={localappdata}\Programs\FLAC-Chop
 DisableProgramGroupPage=yes
 OutputDir={#FLAC_CHOP_OUTPUT_DIR}
-OutputBaseFilename=windows_FLAC-Chop_{#FLAC_CHOP_APP_VERSION}_{#FLAC_CHOP_ARCH_SUFFIX}
+; _installer suffix: the release also ships a _portable.zip — the suffix
+; makes it unambiguous which is which on the release page.
+OutputBaseFilename=windows_FLAC-Chop_{#FLAC_CHOP_APP_VERSION}_{#FLAC_CHOP_ARCH_SUFFIX}_installer
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

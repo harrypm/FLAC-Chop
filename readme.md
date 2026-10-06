@@ -16,8 +16,8 @@ Downloads for Windows / MacOS / Linux X86 & ARM64 are under [Releases](https://g
 
 Windows (per arch, x86_64 + arm64):
 
-- `windows_FLAC-Chop_<version>_<arch>.exe` — the **installer** (Inno Setup, per-user: no admin needed, Start-menu/desktop shortcuts, uninstaller).
-- `windows_FLAC-Chop_<version>_<arch>.zip` — the **portable** build: extract anywhere and run `flac-chop.exe`; nothing is written outside that folder.
+- `windows_FLAC-Chop_<version>_<arch>_installer.exe` — the **installer** (Inno Setup, per-user: no admin needed, Start-menu/desktop shortcuts, uninstaller).
+- `windows_FLAC-Chop_<version>_<arch>_portable.zip` — the **portable** build: extract anywhere and run `flac-chop.exe`; nothing is written outside that folder.
 
 Every packaged build reports its release version (window title, `flac-chop --version`); the CI packaging tests fail the build if a packaged binary would report a `dev-` version on a release.
 

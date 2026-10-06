@@ -384,7 +384,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $ZipPath = "windows_FLAC-Chop_${version}_x86_64.zip"
+          $ZipPath = "windows_FLAC-Chop_${version}_x86_64_portable.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
           if (-not (Test-Path $ZipPath)) {
             throw "Portable ZIP was not generated."
@@ -431,7 +431,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "ISCC failed with exit code $LASTEXITCODE."
           }
-          if (-not (Test-Path "windows_FLAC-Chop_${version}_x86_64.exe")) {
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_x86_64_installer.exe")) {
             throw "Installer EXE was not generated."
           }
 
@@ -443,8 +443,8 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $ZipPath = "windows_FLAC-Chop_${version}_x86_64.zip"
-          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_x86_64.exe").Path
+          $ZipPath = "windows_FLAC-Chop_${version}_x86_64_portable.zip"
+          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_x86_64_installer.exe").Path
 
           # --- portable ZIP: extract, binary-search the inner exe, check the layout ---
           $portTest = Join-Path $env:RUNNER_TEMP "portable-test"
@@ -491,8 +491,8 @@ jobs:
         with:
           name: windows-x86_64
           path: |
-            windows_FLAC-Chop_*_x86_64.zip
-            windows_FLAC-Chop_*_x86_64.exe
+            windows_FLAC-Chop_*_x86_64_portable.zip
+            windows_FLAC-Chop_*_x86_64_installer.exe
           if-no-files-found: error
 
   # --- Windows EXE (arm64 via MSYS2 CLANGARM64, native on windows-11-arm) ---
@@ -667,7 +667,7 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $ZipPath = "windows_FLAC-Chop_${version}_arm64.zip"
+          $ZipPath = "windows_FLAC-Chop_${version}_arm64_portable.zip"
           Compress-Archive -Path "dist\*" -DestinationPath $ZipPath -Force
           if (-not (Test-Path $ZipPath)) {
             throw "Portable ZIP was not generated."
@@ -712,7 +712,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "ISCC failed with exit code $LASTEXITCODE."
           }
-          if (-not (Test-Path "windows_FLAC-Chop_${version}_arm64.exe")) {
+          if (-not (Test-Path "windows_FLAC-Chop_${version}_arm64_installer.exe")) {
             throw "Installer EXE was not generated."
           }
 
@@ -722,8 +722,8 @@ jobs:
         shell: pwsh
         run: |
           $version = "${{ steps.version.outputs.version }}"
-          $ZipPath = "windows_FLAC-Chop_${version}_arm64.zip"
-          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_arm64.exe").Path
+          $ZipPath = "windows_FLAC-Chop_${version}_arm64_portable.zip"
+          $ExePath = (Resolve-Path "windows_FLAC-Chop_${version}_arm64_installer.exe").Path
 
           # --- portable ZIP: extract, binary-search the inner exe, check the layout ---
           $portTest = Join-Path $env:RUNNER_TEMP "portable-test"
@@ -770,8 +770,8 @@ jobs:
         with:
           name: windows-arm64
           path: |
-            windows_FLAC-Chop_*_arm64.zip
-            windows_FLAC-Chop_*_arm64.exe
+            windows_FLAC-Chop_*_arm64_portable.zip
+            windows_FLAC-Chop_*_arm64_installer.exe
           if-no-files-found: error
 
   # --- macOS APP (arm64 + x86_64, then universal DMG) ---
@@ -1363,8 +1363,8 @@ jobs:
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.AppImage
             release-assets/**/linux_FLAC-Chop_*_arm64.AppImage
-            release-assets/**/windows_FLAC-Chop_*_x86_64.exe
-            release-assets/**/windows_FLAC-Chop_*_x86_64.zip
-            release-assets/**/windows_FLAC-Chop_*_arm64.exe
-            release-assets/**/windows_FLAC-Chop_*_arm64.zip
+            release-assets/**/windows_FLAC-Chop_*_x86_64_installer.exe
+            release-assets/**/windows_FLAC-Chop_*_x86_64_portable.zip
+            release-assets/**/windows_FLAC-Chop_*_arm64_installer.exe
+            release-assets/**/windows_FLAC-Chop_*_arm64_portable.zip
             release-assets/**/macos_FLAC-Chop_*_universal.dmg
