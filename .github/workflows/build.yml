@@ -1152,7 +1152,10 @@ jobs:
           PROBE_CLI=core/target/release/examples/probe_cli
           "$PROBE_CLI" test_10msps.lds > probe_out.txt 2>&1
           cat probe_out.txt
-          grep -q 'packed 10-bit' probe_out.txt || grep -q '10-bit' probe_out.txt
+          # The probe_cli example prints raw field names (bits_per_sample: 10),
+          # not the Qt CLI's format labels (packed 10-bit lds). Grep the
+          # raw values: 10 bits, 10000 Hz header rate, 40000 total samples.
+          grep -q 'bits_per_sample.*10' probe_out.txt
           grep -q '10000' probe_out.txt
           grep -q '40000' probe_out.txt
           echo "PASS: .lds probe (format, rate, totals)"
