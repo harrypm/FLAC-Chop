@@ -1170,7 +1170,8 @@ jobs:
           CHOP_CLI=core/target/release/examples/chop_cli
           CONV_CLI=core/target/release/examples/chop_convert_cli
 
-          # Full cut
+          # Full cut: 0 to "past the end" — the plan clamps to the file end
+          # (40000 samples at 10 MSPS real rate = 0.004 s; 4 s is far past — clamped).
           "$CHOP_CLI" test_10msps.lds test_lds_out.flac 0 4
           test -f test_lds_out.flac
           soxi test_lds_out.flac | grep -q '40000 samples'
@@ -1182,13 +1183,15 @@ jobs:
           grep -q '40000' cut_check.txt
           echo "PASS: .lds full cut verified by probe"
 
-          # Non-aligned partial cut (start 5001, len 3777)
-          "$CHOP_CLI" test_10msps.lds test_lds_partial.flac 1.25 0.94425
+          # Partial cut: start 0.001 s (10000 samples), len 0.001 s (10000
+          # samples) — within the 0.004 s file. The chop_cli converts seconds
+          # to samples at the REAL rate (10 MSPS), not the header rate.
+          "$CHOP_CLI" test_10msps.lds test_lds_partial.flac 0.001 0.001
           test -f test_lds_partial.flac
-          soxi test_lds_partial.flac | grep -q '3777 samples'
-          echo "PASS: .lds partial cut (non-aligned start)"
+          soxi test_lds_partial.flac | grep -q '10000 samples'
+          echo "PASS: .lds partial cut"
 
-          # Rate + bits conversion (10msps 8-bit — the GUI batch setting)
+          # Rate + bits conversion (the same output — 10 kHz header rate, 8-bit)
           "$CONV_CLI" test_10msps.lds test_lds_conv.flac 0 4 10000 8 1
           test -f test_lds_conv.flac
           soxi test_lds_conv.flac | grep -q '40000 samples'
@@ -1213,10 +1216,11 @@ jobs:
           grep -q '10000' rf_probe.txt
           echo "PASS: FLAC probe (RF rate resolution)"
 
-          # Cut a window
+          # Cut the whole file (10000 samples at 10 MSPS = 0.001 s real;
+          # 0.5 s is past the end — clamped to the full 10000 samples)
           "$CHOP_CLI" test_rf.flac test_rf_out.flac 0 0.5
           test -f test_rf_out.flac
-          soxi test_rf_out.flac | grep -q '5000 samples'
+          soxi test_rf_out.flac | grep -q '10000 samples'
           echo "PASS: FLAC cut"
 
       - name: Test raw PCM probe + cut on real-format data
@@ -1238,10 +1242,10 @@ jobs:
           grep -q '5000' raw_probe.txt
           echo "PASS: raw PCM probe (format, rate, totals)"
 
-          # Cut
+          # Cut (5000 samples at 10 MSPS = 0.0005 s; 0.25 s is past — clamped)
           "$CHOP_CLI" test_rf_8-bit_10msps.u8 test_raw_out.flac 0 0.25
           test -f test_raw_out.flac
-          soxi test_raw_out.flac | grep -q '2500 samples'
+          soxi test_raw_out.flac | grep -q '5000 samples'
           echo "PASS: raw PCM cut"
 
   # --- Release: publish build assets to a GH release on tag push ---
