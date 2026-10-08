@@ -1358,7 +1358,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
+          name: FLAC Chop ${{ steps.tag.outputs.tag }}
           body_path: ${{ steps.notes.outputs.path }}
           files: |
             release-assets/**/linux_FLAC-Chop_*_x86.AppImage
