@@ -25,6 +25,10 @@
 /// to the RF assumption.
 const AUDIO_RATES: &[u64] = &[
     22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 352800, 384000,
+    // 78100: the DdD/VHS-decode HiFi baseband capture rate (the MISRC-GUI
+    // pipeline writes 78.1 kHz WAV/FLAC captures). Without this, 78100 falls
+    // through to the RF /1000 convention (78.1 MSPS) — wrong: baseband audio.
+    78100,
 ];
 
 /// Tolerance (fraction of the target rate) for matching an audio rate.
@@ -159,5 +163,24 @@ mod tests {
     #[test]
     fn wav_khz_convention_header_assumes_msps() {
         assert_eq!(resolve_wav_rate(20_000), (20_000_000.0, true));
+    }
+
+    #[test]
+    fn baseband_78khz1_is_audio() {
+        // The DdD HiFi baseband capture rate (78.1 kHz WAV/FLAC) is real
+        // audio, NOT RF — without this, it falls to the /1000 convention
+        // (78.1 MSPS) which is nonsensical for a baseband capture.
+        let (r, rf) = resolve_wav_rate(78_100);
+        assert!(!rf);
+        assert!((r - 78_100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rf_rates_still_not_audio() {
+        // The standard RF /1000 rates must NOT be caught by the 78100 entry
+        // or any other audio rate (78100 is far from all of them).
+        assert!(is_audio_rate(10_000) == false);
+        assert!(is_audio_rate(20_000) == false);
+        assert!(is_audio_rate(40_000) == false);
     }
 }

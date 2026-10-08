@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 
 #include "batchtab.h"
+#include "syncedittab.h"
 #include "stemutil.h"
 #include "theme.h"
 
@@ -335,6 +336,10 @@ MainWindow::MainWindow(QWidget* parent)
     // --- Batch Task page (multi-file queue + parallel processing) ---
     m_batchTab = new BatchTab(m_tabs);
     m_tabs->addTab(m_batchTab, tr("Batch Task"));
+
+    // --- Sync Edit page (synchronized time-range cuts across a file set) ---
+    m_syncEditTab = new SyncEditTab(m_tabs);
+    m_tabs->addTab(m_syncEditTab, tr("Sync Edit"));
 
     // --- Metadata Editor page ---
     // Read-only STREAMINFO summary + an editable Vorbis-comment table that
@@ -880,11 +885,29 @@ void MainWindow::dropEvent(QDropEvent* e)
         // capture: the core probe sniffs FLAC / WAV by magic header (so
         // unknown extensions with the right magic work) and maps the raw PCM
         // extensions. Anything else fails the probe with a clear error.
+        // Exception: if the Sync Edit tab is the active tab, add to the
+        // Sync Edit set (a single file can be the first of a set).
+        if (m_tabs->currentWidget() == m_syncEditTab && m_syncEditTab) {
+            const int added = m_syncEditTab->addInputFiles(localFiles);
+            m_statusLabel->setText(added > 0
+                ? tr("Added 1 file to the Sync Edit set.")
+                : tr("File already in the Sync Edit set."));
+            return;
+        }
         loadFile(localFiles.first());
         return;
     }
-    // Several dropped files: add them all to the Batch Task queue (lds-
-    // converter model) and show the tab.
+    // Several dropped files: if the Sync Edit tab is the active tab, add
+    // to the Sync Edit set (a full file set is the normal drop); otherwise
+    // the Batch Task queue (lds-converter model).
+    if (m_tabs->currentWidget() == m_syncEditTab && m_syncEditTab) {
+        const int added = m_syncEditTab->addInputFiles(localFiles);
+        m_tabs->setCurrentWidget(m_syncEditTab);
+        m_statusLabel->setText(added > 0
+            ? tr("Added %1 file(s) to the Sync Edit set.").arg(added)
+            : tr("No new files added to the Sync Edit set (already there)."));
+        return;
+    }
     const int added = m_batchTab ? m_batchTab->addInputFiles(localFiles) : 0;
     m_tabs->setCurrentWidget(m_batchTab);
     m_statusLabel->setText(added > 0

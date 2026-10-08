@@ -83,6 +83,8 @@ set(GUI_SOURCES
     mainwindow.cpp
     batchtab.cpp
     batchtab.h
+    syncedittab.cpp
+    syncedittab.h
     stemutil.h
     theme.cpp
     theme.h

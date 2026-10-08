@@ -20,6 +20,7 @@ class QTabWidget;
 class QTableWidget;
 class QNetworkAccessManager;
 class BatchTab;
+class SyncEditTab;
 
 // Result of an off-thread metadata save (fc_replace_comments). Carried across
 // the QtConcurrent future so onMetaSaveFinished can report success/failure.
@@ -182,6 +183,9 @@ private:
 
     // Batch Task tab (multi-file queue + parallel processing).
     BatchTab* m_batchTab = nullptr;
+
+    // Sync Edit tab (synchronized time-range cuts across a file set).
+    SyncEditTab* m_syncEditTab = nullptr;
     // true while a re-probe triggered by a metadata save is in flight — then
     // the Chop page's IN/OUT markers are clamped (not reset to the full tape).
     bool m_probeIsRefresh = false;

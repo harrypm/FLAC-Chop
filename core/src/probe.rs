@@ -753,9 +753,9 @@ fn parse_wav(path: &Path) -> Result<(u32, u16, u16, u64, u64), String> {
                     "WAV fmt is not PCM (format tag 0x{audio_format:04x}) — only PCM WAV is supported"
                 ));
             }
-            if !matches!(bits, 8 | 16) || channels == 0 || channels > 8 {
+            if !matches!(bits, 8 | 16 | 24 | 32) || channels == 0 || channels > 8 {
                 return Err(format!(
-                    "WAV: unsupported PCM layout ({bits}-bit, {channels} ch) — expected 8/16-bit mono/stereo"
+                    "WAV: unsupported PCM layout ({bits}-bit, {channels} ch) — expected 8/16/24/32-bit mono/stereo"
                 ));
             }
             fmt = Some((rate, bits, channels));
