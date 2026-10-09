@@ -23,13 +23,11 @@
 //! requantization (MISRC-style scaling math), which also compresses better.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::probe::{self, InputFormat};
 #[cfg(not(feature = "static-sox"))]
 use std::process::Command;
-#[cfg(not(feature = "static-sox"))]
-use std::io::Read;
 #[cfg(not(feature = "static-sox"))]
 use std::process::Stdio;
 
@@ -51,6 +49,46 @@ use std::process::Stdio;
 // owns its lifetime (it must stay alive for the whole call) and initializes
 // it fresh per job.
 static CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Progress of the currently-running single cut (0-100; 101 = idle/not started).
+/// The shell-out backend updates it from the SoX `-S` stderr reader thread.
+/// The GUI polls it via `fc_chop_get_progress()` from a QTimer.
+static PROGRESS: AtomicU32 = AtomicU32::new(101);
+
+/// Read the current progress (0-100, 101 = idle).
+pub fn get_progress() -> u32 {
+    PROGRESS.load(Ordering::Relaxed)
+}
+
+// Caller-authored Vorbis comments for the NEXT cut's output (the GUI's
+// pre-conversion metadata editor rows for raw/packed sources, which cannot
+// carry tags themselves). Set (or cleared) by the GUI immediately before
+// every Process; consumed by that cut's post-cut tag rewrite
+// (rewrite_tags_after_cut), which merges them into the output before the
+// core's own RF numeric tags (those win).
+static PENDING_OUTPUT_COMMENTS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Set the caller-authored comments embedded into the NEXT cut's output
+/// (replaces any previous pending set; an empty list clears). See
+/// [`PENDING_OUTPUT_COMMENTS`].
+pub fn set_pending_output_comments(comments: Vec<String>) {
+    *PENDING_OUTPUT_COMMENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = comments;
+}
+
+/// Parse SoX's `-S` "overall:X.XX%" from a chunk of stderr output.
+/// SoX writes progress with `\r` (carriage return), not newlines, so the
+/// reader feeds raw chunks and we search the last occurrence of "overall:".
+fn parse_sox_overall_progress(chunk: &str) -> Option<u32> {
+    let pos = chunk.rfind("overall:")?;
+    let after = chunk[pos + 8..].trim_start();
+    let pct_pos = after.find('%')?;
+    let num_str = &after[..pct_pos];
+    let pct: f64 = num_str.parse().ok()?;
+    Some((pct as u32).min(100))
+}
 
 #[derive(Clone, Copy)]
 enum Cancel<'a> {
@@ -346,8 +384,10 @@ fn run_sox_child(
     cmd.stderr(Stdio::piped());
 
     let mut child = match cmd.spawn() {
+        // spawned below (the stderr reader is set up after the child)
         Ok(c) => c,
         Err(e) => {
+            PROGRESS.store(101, Ordering::Relaxed); // back to idle
             return Err(ChopResult {
                 ok: false,
                 exit_code: -1,
@@ -375,6 +415,39 @@ fn run_sox_child(
         slot
     });
 
+    // stderr reader thread: reads stderr continuously, parses SoX's -S
+    // "overall:X.XX%" progress into PROGRESS, and accumulates the text for
+    // the error/notes message after exit. EOF is seen when the child exits
+    // (or is killed), and the channel delivers the accumulated stderr.
+    let mut stderr_handle = child.stderr.take().expect("stderr was piped");
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        let mut acc = String::new();
+        let mut partial = String::new();
+        loop {
+            match stderr_handle.read(&mut buf) {
+                Ok(0) => break, // EOF: the child exited (or was killed)
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    acc.push_str(&chunk);
+                    partial.push_str(&chunk);
+                    if let Some(pct) = parse_sox_overall_progress(&partial) {
+                        PROGRESS.store(pct, Ordering::Relaxed);
+                    }
+                    // Keep only the tail: SoX overwrites progress with \r,
+                    // so only the last few KB are needed for parsing.
+                    if partial.len() > 16384 {
+                        partial = partial[partial.len().saturating_sub(8192)..].to_string();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stderr_tx.send(acc);
+    });
+
     // Poll try_wait (non-blocking) so a cancel request can kill sox without
     // waiting for the whole (potentially long) cut to finish. Checked every
     // 50 ms — low overhead, sub-100ms cancel latency.
@@ -385,10 +458,12 @@ fn run_sox_child(
         if cancel.requested() {
             let _ = child.kill();
             let _ = child.wait(); // reap the killed child
-            let mut stderr = String::new();
-            if let Some(mut se) = child.stderr.take() {
-                let _ = se.read_to_string(&mut stderr);
-            }
+            // The stderr reader sees EOF after the kill; wait briefly for
+            // the accumulated stderr.
+            let stderr = stderr_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_default();
+            PROGRESS.store(101, Ordering::Relaxed); // back to idle
             cancel.consume(); // consume the flag
             return Err(ChopResult {
                 ok: false,
@@ -403,10 +478,13 @@ fn run_sox_child(
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
 
-    let mut stderr = String::new();
-    if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_string(&mut stderr);
-    }
+    // Normal exit: the stderr reader sees EOF and delivers the text. The
+    // reader's last PROGRESS store precedes its send, so this is race-free.
+    let stderr = stderr_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_default();
+    PROGRESS.store(101, Ordering::Relaxed); // back to idle
+
     // A failed feed means the audio stream was cut short: fail the cut even
     // though sox itself exited cleanly on the (early) EOF.
     if let Some(slot) = feed_err {
@@ -418,7 +496,6 @@ fn run_sox_child(
     }
     Ok((status, stderr))
 }
-
 #[cfg(not(feature = "static-sox"))]
 /// Build the stdin feeder for a true 12-bit FLAC source: streams the decoded
 /// samples (claxon), left-justified ×16 into 16-bit little-endian — byte-for-
@@ -487,6 +564,113 @@ fn make_12bit_s16_feed(
 }
 
 #[cfg(not(feature = "static-sox"))]
+/// Where a streamed `.lds` cut starts and what it feeds.
+struct LdsFeedPlan {
+    /// On-disk sample index of the FIRST sample fed to SoX (the group-aligned
+    /// floor of the requested start).
+    first_sample: u64,
+    /// Leading group-mates before the requested start (0..=3) — the inner SoX
+    /// `trim <skip>s` drops them exactly.
+    skip: u64,
+    /// Total samples the stream yields (skip + length, clamped at the last
+    /// whole packing group).
+    samples: u64,
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Build the packed-`.lds` stdin feeder: unpacks ONLY the packing groups
+/// covering the cut window straight into SoX's stdin as s16 LE (the
+/// ld-lds-converter `(value - 512) * 64` scaling) instead of materializing
+/// the whole unpacked window as a temp s16 on disk — a whole-file conversion
+/// of a 352 GB `.lds` streams through the pipe (~704 GB) without ever needing
+/// window-sized free space, and reads the source exactly once. SoX reads the
+/// trimmed window and closes the pipe — a BrokenPipe write is the benign
+/// end-of-feed (same contract as [`make_12bit_s16_feed`]).
+fn make_lds_s16_feed(
+    in_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+) -> Result<
+    (
+        Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>,
+        LdsFeedPlan,
+    ),
+    String,
+> {
+    let file_size = std::fs::metadata(in_path)
+        .map_err(|e| format!("stat failed: {e}"))?
+        .len();
+    let (total, _trailing) = crate::lds::total_samples(file_size);
+    if start_samples >= total {
+        return Err(format!(
+            "start sample {start_samples} is at or past the end of the .lds data ({total} samples)"
+        ));
+    }
+    if length_samples == 0 {
+        return Err("length must be > 0".to_string());
+    }
+    let first_group = start_samples / crate::lds::GROUP_SAMPLES;
+    let skip = start_samples % crate::lds::GROUP_SAMPLES; // 0..=3 leading group-mates
+    let first_sample = first_group * crate::lds::GROUP_SAMPLES;
+    // The stream covers [first_sample, first_sample + skip + len) — the leading
+    // group-mates INCLUDED (the inner `trim <skip>s` drops them; see
+    // [`crate::lds::unpack_window`]) — clamped at the last whole group (a short
+    // stream makes SoX clamp the cut to the file end, like the Ogg path).
+    let need = skip + length_samples;
+    let available = total - first_sample;
+    let target = need.min(available); // total samples the stream will yield
+
+    let in_path = in_path.to_string();
+    const BATCH: usize = 8 * 1024 * 1024;
+    Ok((
+        Box::new(move |stdin: &mut std::process::ChildStdin| {
+            use std::io::{BufReader, Seek, SeekFrom, Write};
+            // One batch write: BrokenPipe = SoX has the window (it stops
+            // reading once the trim is satisfied) — the benign end-of-feed,
+            // not a truncation.
+            fn write_batch(stdin: &mut std::process::ChildStdin, buf: &[u8]) -> Result<(), String> {
+                match stdin.write_all(buf) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(e) => Err(format!("packed .lds: sox stdin write failed: {e}")),
+                }
+            }
+            let mut src = std::fs::File::open(&in_path)
+                .map_err(|e| format!("open failed: {e}"))?;
+            src.seek(SeekFrom::Start(first_group * crate::lds::GROUP_BYTES))
+                .map_err(|e| format!("seek failed: {e}"))?;
+            // Buffered group reads: no per-5-byte syscall storms on huge files.
+            let mut src = BufReader::with_capacity(BATCH, src);
+            let mut group = [0u8; 5];
+            let mut batch: Vec<u8> = Vec::with_capacity(BATCH);
+            let mut written: u64 = 0; // samples fed (incl. the skip)
+            'outer: while written < target {
+                crate::lds::read_exact_group(&mut src, &mut group)?;
+                let unpacked = crate::lds::unpack_group(&group);
+                for s in unpacked {
+                    if written >= target {
+                        break 'outer; // the full window has been fed
+                    }
+                    batch.extend_from_slice(&s.to_le_bytes());
+                    written += 1;
+                }
+                if batch.len() >= BATCH {
+                    write_batch(stdin, &batch)?;
+                    batch.clear();
+                }
+            }
+            if !batch.is_empty() {
+                // The final partial batch flushes BEFORE returning (a
+                // full-window cut must not come up short).
+                write_batch(stdin, &batch)?;
+            }
+            Ok(())
+        }),
+        LdsFeedPlan { first_sample, skip, samples: target },
+    ))
+}
+
+#[cfg(not(feature = "static-sox"))]
 /// Run `sox in out trim <start>s <len>s` with optional output conversion on
 /// a NATIVE (non-Ogg) input. [`chop_with_options`] is the public entry point:
 /// it remuxes Ogg FLAC inputs to a temp native FLAC and then calls this.
@@ -497,6 +681,40 @@ fn chop_native_input(
     length_samples: u64,
     opts: ChopOptions,
     cancel: Cancel<'_>,
+    extra_comments: &[String],
+) -> ChopResult {
+    chop_native_input_ex(
+        in_path,
+        out_path,
+        start_samples,
+        length_samples,
+        opts,
+        cancel,
+        None,
+        extra_comments,
+    )
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// [`chop_native_input`] plus a caller-provided stdin feed: `ext_feed` is
+/// (input args that precede the stdin "-" input, the feeder). The packed-`.lds`
+/// streaming path uses it — the unpacked window flows straight into SoX.
+fn chop_native_input_ex(
+    in_path: &str,
+    out_path: &str,
+    start_samples: u64,
+    length_samples: u64,
+    opts: ChopOptions,
+    cancel: Cancel<'_>,
+    ext_feed: Option<
+        (
+            Vec<String>,
+            Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>,
+        ),
+    >,
+    // Caller-authored comments for the output, threaded to the post-cut
+    // tag rewrite (the GUI's pre-conversion metadata rows).
+    extra_comments: &[String],
 ) -> ChopResult {
     let start = format!("{}s", start_samples);
     let len = format!("{}s", length_samples);
@@ -536,6 +754,7 @@ fn chop_native_input(
                 length_samples,
                 opts.is_rf,
                 cancel,
+                extra_comments,
             );
             if !si_note.is_empty() {
                 r.stderr = if r.stderr.is_empty() {
@@ -557,25 +776,30 @@ fn chop_native_input(
     // 16-bit FLAC. The rest of the pipeline (trim/sinc/rate/6-bit/12-bit
     // passes) is unchanged; the stream rate is the FLAC header rate (the
     // /1000-convention value for RF, same stream SoX sees for the FLAC).
-    let (in_args, sox_input, stdin_feed) = match twelve_bit_flac_source(in_fmt, in_path) {
-        Some((rate, ch)) => match make_12bit_s16_feed(in_path) {
-            Ok(feed) => (
-                vec![
-                    "-t".to_string(),
-                    "s16".to_string(),
-                    "-r".to_string(),
-                    rate.to_string(),
-                    "-c".to_string(),
-                    ch.to_string(),
-                ],
-                "-".to_string(),
-                Some(feed),
-            ),
-            Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
-        },
-        None => match sox_input_args(in_fmt, in_path, &opts) {
-            Ok(a) => (a, in_path.to_string(), None),
-            Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+    let (in_args, sox_input, stdin_feed) = match ext_feed {
+        // A caller-provided stdin stream (the packed-.lds path): the input is
+        // stdin ("-") with the caller's raw-s16 input args.
+        Some((args, feed)) => (args, "-".to_string(), Some(feed)),
+        None => match twelve_bit_flac_source(in_fmt, in_path) {
+            Some((rate, ch)) => match make_12bit_s16_feed(in_path) {
+                Ok(feed) => (
+                    vec![
+                        "-t".to_string(),
+                        "s16".to_string(),
+                        "-r".to_string(),
+                        rate.to_string(),
+                        "-c".to_string(),
+                        ch.to_string(),
+                    ],
+                    "-".to_string(),
+                    Some(feed),
+                ),
+                Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+            },
+            None => match sox_input_args(in_fmt, in_path, &opts) {
+                Ok(a) => (a, in_path.to_string(), None),
+                Err(e) => return ChopResult { ok: false, exit_code: -1, stderr: e },
+            },
         },
     };
 
@@ -608,7 +832,10 @@ fn chop_native_input(
     let mut cmd = Command::new(&sox_program);
     // Global -D: no automatic dithering anywhere (dither noise is
     // incompressible and hurts both SNR and FLAC compression efficiency).
+    // Global -S: show progress — SoX writes "in:X% overall:X%" to stderr,
+    // which the stderr reader thread parses into the PROGRESS atomic.
     cmd.arg("-D");
+    cmd.arg("-S");
     // Input options (filetype/rate/channels) must precede the input path.
     for a in &in_args {
         cmd.arg(a);
@@ -671,6 +898,7 @@ fn chop_native_input(
     if r.ok && six_bit {
         let mut cmd2 = Command::new(&sox_program);
         cmd2.arg("-D");
+        cmd2.arg("-S");
         cmd2.arg(tmp_path.as_ref().unwrap());
         cmd2.arg("-b").arg("8");
         cmd2.arg(out_path);
@@ -720,7 +948,7 @@ fn chop_native_input(
         };
     }
     if r.ok {
-        rewrite_tags_after_cut(out_path, opts.is_rf, &mut r);
+        rewrite_tags_after_cut(out_path, opts.is_rf, extra_comments, &mut r);
     }
     r
 }
@@ -749,6 +977,8 @@ fn chop_12bit_source_pure(
     length_samples: u64,
     is_rf: bool,
     cancel: Cancel<'_>,
+    // Caller-authored comments for the output (threaded to the tag rewrite).
+    extra_comments: &[String],
 ) -> ChopResult {
     use claxon::FlacReader;
 
@@ -791,7 +1021,7 @@ fn chop_12bit_source_pure(
     // stream yields fewer samples than requested and the encoder already
     // rejected the count mismatch, so reaching here means the cut is exact.
     let mut r = ChopResult { ok: true, exit_code: 0, stderr: String::new() };
-    rewrite_tags_after_cut(out_path, is_rf, &mut r);
+    rewrite_tags_after_cut(out_path, is_rf, extra_comments, &mut r);
     r
 }
 
@@ -1142,6 +1372,9 @@ fn chop_native_input(
     length_samples: u64,
     opts: ChopOptions,
     cancel: Cancel<'_>,
+    // Caller-authored comments for the output, threaded to the post-cut
+    // tag rewrite (the GUI's pre-conversion metadata rows).
+    extra_comments: &[String],
 ) -> ChopResult {
     // libSoX is not thread-safe: one in-process cut at a time; parallel
     // callers queue on this lock until the running chain finishes.
@@ -1267,7 +1500,7 @@ fn chop_native_input(
     // (MISRC-GUI embedding model). Non-fatal: the cut already succeeded, so a
     // tag-rewrite failure is surfaced as a warning in stderr, not a hard fail.
     if r.ok {
-        rewrite_tags_after_cut(out_path, opts.is_rf, &mut r);
+        rewrite_tags_after_cut(out_path, opts.is_rf, extra_comments, &mut r);
     }
     r
 }
@@ -1293,7 +1526,10 @@ impl Drop for TempFileGuard {
 
 /// Where to put the temp s16 for a packed .lds window: next to the OUTPUT
 /// file (same placement policy as the Ogg window remux — the user already
-/// needs space there), falling back to the system temp dir.
+/// needs space there), falling back to the system temp dir. Only used by the
+/// static-sox backend now (in-process libSoX reads files); the shell-out
+/// backend streams the unpacked window straight into the sox stdin pipe.
+#[cfg(feature = "static-sox")]
 fn lds_window_temp_path(out_path: &str) -> PathBuf {
     let name = format!(".flac-chop-ldssrc-{tag}.tmp.s16", tag = temp_tag());
     if let Some(dir) = Path::new(out_path).parent() {
@@ -1307,13 +1543,18 @@ fn lds_window_temp_path(out_path: &str) -> PathBuf {
 }
 
 /// Cut a packed 10-bit `.lds` input (DdD/ld-decode raw RF — see
-/// [`crate::lds`]). Mirrors the Ogg-FLAC window remux: only the packing
-/// groups covering the cut are unpacked — with the reference
-/// ld-lds-converter scaling `(value - 512) * 64`, so the temp s16 stream is
-/// byte-for-byte what that tool's unpack writes — into a temp s16 next to
-/// the output; the normal SoX / 12-bit pipeline then runs on that file with
-/// the start shifted by the window's first sample. Works in BOTH backends
-/// (the temp is a plain s16 fed with explicit input hints).
+/// [`crate::lds`]). Only the packing groups covering the cut are unpacked,
+/// with the reference ld-lds-converter scaling `(value - 512) * 64` (the
+/// stream is byte-for-byte what that tool's unpack writes).
+///
+/// Shell-out backend: the unpacking STREAMS straight into SoX's stdin (the
+/// same contract as the true-12-bit feed, [`make_lds_s16_feed`]) — no temp
+/// s16 is ever materialized, so a whole-file conversion of a huge `.lds`
+/// needs no window-sized free space and reads the source exactly once (the
+/// old temp-file path wrote the ENTIRE unpacked window to disk first — a
+/// 352 GB `.lds` unpacked to a ~704 GB s16 — then read it all back to
+/// compress it). Static-sox backend: in-process libSoX reads files, so the
+/// unpacked window keeps the temp-s16 form there.
 fn chop_lds_input(
     in_path: &str,
     out_path: &str,
@@ -1321,9 +1562,12 @@ fn chop_lds_input(
     length_samples: u64,
     opts: ChopOptions,
     cancel: Cancel<'_>,
+    // Caller-authored comments for the output, threaded to the post-cut
+    // tag rewrite (the GUI's pre-conversion metadata rows).
+    pending_extra: &[String],
 ) -> ChopResult {
-    // The temp filename carries no <n>msps hint: pin the stream rate from
-    // the .lds probe (msps hint or the 40 MSPS ld-decode default).
+    // The temp/stream filename carries no <n>msps hint: pin the stream rate
+    // from the .lds probe (msps hint or the 40 MSPS ld-decode default).
     let p = probe::probe(Path::new(in_path));
     if !p.ok {
         return ChopResult {
@@ -1333,42 +1577,96 @@ fn chop_lds_input(
         };
     }
 
-    let tmp = lds_window_temp_path(out_path);
-    let _guard = TempFileGuard(tmp.clone());
-    let win = match crate::lds::unpack_window(
-        Path::new(in_path),
-        &tmp,
-        start_samples,
-        length_samples,
-        &|| cancel.requested(),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            if e.contains("cancelled") {
-                cancel.consume(); // consume the flag
+    let (first_sample, samples, mut r);
+    #[cfg(not(feature = "static-sox"))]
+    {
+        // Streaming path: unpack straight into SoX's stdin — no temp s16.
+        let (feed, plan) = match make_lds_s16_feed(in_path, start_samples, length_samples) {
+            Ok(v) => v,
+            Err(e) => {
+                return ChopResult {
+                    ok: false,
+                    exit_code: -1,
+                    stderr: format!("packed .lds: {e}"),
+                }
             }
-            return ChopResult {
-                ok: false,
-                exit_code: -1,
-                stderr: format!("packed .lds: {e}"),
-            };
-        }
-    };
-    let mut inner = opts;
-    inner.input_format = Some(InputFormat::S16);
-    inner.input_rate_hz = Some(p.real_rate_hz);
-    let mut r = chop_native_input(
-        &tmp.to_string_lossy(),
-        out_path,
-        start_samples - win.first_sample,
-        length_samples,
-        inner,
-        cancel,
-    );
+        };
+        // The raw-s16 stdin stream pinned to the /1000-convention stream rate
+        // for RF — exactly what sox_input_args(S16) pinned for the old
+        // temp-file path (a byte-identical stream into SoX).
+        let stream_rate = if p.is_rf {
+            p.real_rate_hz / 1000.0
+        } else {
+            p.real_rate_hz
+        };
+        let in_args = vec![
+            "-t".to_string(),
+            "s16".to_string(),
+            "-r".to_string(),
+            stream_rate.to_string(),
+            "-c".to_string(),
+            "1".to_string(),
+        ];
+        let mut inner = opts;
+        inner.input_format = Some(InputFormat::S16);
+        inner.input_rate_hz = Some(p.real_rate_hz);
+        r = chop_native_input_ex(
+            "-", // the input is the unpacked stdin stream
+            out_path,
+            plan.skip, // the leading group-mates the inner trim drops
+            length_samples,
+            inner,
+            cancel,
+            Some((in_args, feed)),
+            pending_extra,
+        );
+        first_sample = plan.first_sample;
+        samples = plan.samples;
+    }
+    #[cfg(feature = "static-sox")]
+    {
+        // Static-sox path: in-process libSoX reads files — unpack the covering
+        // window to a temp s16 next to the output, then run on that file.
+        let tmp = lds_window_temp_path(out_path);
+        let _guard = TempFileGuard(tmp.clone());
+        let win = match crate::lds::unpack_window(
+            Path::new(in_path),
+            &tmp,
+            start_samples,
+            length_samples,
+            &|| cancel.requested(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                if e.contains("cancelled") {
+                    cancel.consume(); // consume the flag
+                }
+                return ChopResult {
+                    ok: false,
+                    exit_code: -1,
+                    stderr: format!("packed .lds: {e}"),
+                };
+            }
+        };
+        let mut inner = opts;
+        inner.input_format = Some(InputFormat::S16);
+        inner.input_rate_hz = Some(p.real_rate_hz);
+        r = chop_native_input(
+            &tmp.to_string_lossy(),
+            out_path,
+            start_samples - win.first_sample,
+            length_samples,
+            inner,
+            cancel,
+            pending_extra,
+        );
+        first_sample = win.first_sample;
+        samples = win.samples;
+    }
     let note = format!(
         "note: packed .lds input — cut from an unpacked 10-bit window of samples {}..{} (the ld-lds-converter (value-512)*64 scaling)",
-        win.first_sample,
-        win.first_sample + win.samples
+        first_sample,
+        first_sample + samples
     );
     r.stderr = if r.stderr.is_empty() {
         note
@@ -1445,7 +1743,26 @@ pub fn chop_with_options_and_cancel(
         // caller-owned and never touched here.
         CANCEL.store(false, Ordering::Relaxed);
     }
-    let fail = |stderr: String| ChopResult { ok: false, exit_code: -1, stderr };
+    // Reset the progress (0% = started; updated by the stderr reader thread;
+    // the GUI polls fc_chop_get_progress() from a QTimer).
+    PROGRESS.store(0, Ordering::Relaxed);
+    // The single-cut (Global) path owns the caller-authored output comments
+    // (the GUI's pre-conversion metadata editor rows): take them HERE — at
+    // the cut START — so exactly this cut consumes them (the take window is
+    // one statement, not the whole cut), threaded down to the post-cut tag
+    // rewrite. Per-job (batch/sync) cuts never touch them.
+    let pending_extra: Vec<String> = if matches!(cancel, Cancel::Global) {
+        std::mem::take(&mut *PENDING_OUTPUT_COMMENTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))
+    } else {
+        Vec::new()
+    };
+    // Early failures never reach a sox child: go straight back to idle.
+    let fail = |stderr: String| {
+        PROGRESS.store(101, Ordering::Relaxed);
+        ChopResult { ok: false, exit_code: -1, stderr }
+    };
     let fmt = match opts
         .input_format
         .map_or_else(|| probe::sniff_format(Path::new(in_path)), Ok)
@@ -1457,9 +1774,25 @@ pub fn chop_with_options_and_cancel(
         // Packed .lds (DdD 10-bit): unpack the cut window to a temp s16 first,
         // then run the normal pipeline on that (chop_lds_input).
         if fmt == InputFormat::Lds {
-            return chop_lds_input(in_path, out_path, start_samples, length_samples, opts, cancel);
+            return chop_lds_input(
+                in_path,
+                out_path,
+                start_samples,
+                length_samples,
+                opts,
+                cancel,
+                &pending_extra,
+            );
         }
-        return chop_native_input(in_path, out_path, start_samples, length_samples, opts, cancel);
+        return chop_native_input(
+            in_path,
+            out_path,
+            start_samples,
+            length_samples,
+            opts,
+            cancel,
+            &pending_extra,
+        );
     }
 
     let tmp = ogg_window_temp_path(out_path);
@@ -1488,6 +1821,7 @@ pub fn chop_with_options_and_cancel(
         length_samples,
         inner,
         cancel,
+        &pending_extra,
     );
     let note = format!(
         "note: Ogg FLAC input — cut from a lossless native-FLAC remux of samples {}..{} ({} frames)",
@@ -1624,9 +1958,18 @@ fn validate_cut_output(out_path: &str, stderr: &str) -> Result<(), String> {
 /// self-verifies before renaming over the output, so a failure never damages
 /// the cut; the catch_unwind is belt-and-braces in case a dependency still
 /// panics on a pathological file.
-fn rewrite_tags_after_cut(out_path: &str, is_rf: bool, r: &mut ChopResult) {
+fn rewrite_tags_after_cut(
+    out_path: &str,
+    is_rf: bool,
+    // Caller-authored comments for the output — the caller took them from
+    // the global pending list at the CUT START (chop_with_options_and_cancel)
+    // and threaded them here; merged into the output before the owned RF
+    // numeric tags (those win).
+    extra: &[String],
+    r: &mut ChopResult,
+) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::tags::rewrite_cut_tags(std::path::Path::new(out_path), is_rf)
+        crate::tags::rewrite_cut_tags(std::path::Path::new(out_path), is_rf, extra)
     }));
     let inner = match outcome {
         Ok(v) => v,

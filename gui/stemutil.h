@@ -44,4 +44,30 @@ inline QString renamedOutputStem(const QString& inPath, quint64 outHeaderHz, uin
     return prefix + bitsTok + QStringLiteral("-bit_") + mspsTok + QStringLiteral("msps") + suffix;
 }
 
+// Format an elapsed time in milliseconds for the finished-job status lines
+// (shared by the Chop / Batch Task / Sync Edit tabs): "0.8 s", "42 s",
+// "2m 31s", "1h 04m 12s".
+inline QString formatElapsedMSecs(qint64 ms)
+{
+    if (ms < 0)
+        ms = 0;
+    const double secs = ms / 1000.0;
+    if (secs < 10.0)
+        return QStringLiteral("%1 s").arg(secs, 0, 'f', 1);
+    const qint64 total = qint64(secs + 0.5);
+    if (total < 60)
+        return QStringLiteral("%1 s").arg(total);
+    const qint64 h = total / 3600;
+    const qint64 m = (total % 3600) / 60;
+    const qint64 s = total % 60;
+    if (h > 0)
+        return QStringLiteral("%1h %2m %3s")
+            .arg(h)
+            .arg(m, 2, 10, QLatin1Char('0'))
+            .arg(s, 2, 10, QLatin1Char('0'));
+    return QStringLiteral("%1m %2s")
+        .arg(m)
+        .arg(s, 2, 10, QLatin1Char('0'));
+}
+
 #endif // FLACCHOP_STEMUTIL_H

@@ -97,8 +97,10 @@ pub struct Window {
 }
 
 /// Read exactly `buf.len()` bytes, refilling short reads (Windows `Read`
-/// returns partial buffers; a true EOF mid-group is a hard error).
-fn read_exact_group(src: &mut File, buf: &mut [u8; 5]) -> Result<(), String> {
+/// returns partial buffers; a true EOF mid-group is a hard error). Works on
+/// any buffered reader (the temp-file unpacker's `File` and the stdin
+/// streamer's `BufReader`).
+pub(crate) fn read_exact_group(src: &mut impl Read, buf: &mut [u8; 5]) -> Result<(), String> {
     let mut got = 0;
     while got < buf.len() {
         let n = src

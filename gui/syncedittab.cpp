@@ -8,6 +8,7 @@
 #include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
@@ -43,6 +44,7 @@ struct SyncResult {
     bool ok = false;
     bool cancelled = false;
     QString message;
+    qint64 elapsedMSecs = 0; // wall-clock processing time of the job
 };
 
 QString normalizeInputPath(const QString& raw)
@@ -515,6 +517,7 @@ void SyncEditTab::processQueue()
 
     // --- Run (the Batch tab's sliding-window pump loop model) ---
     m_running = true;
+    const qint64 runStartMSecs = QDateTime::currentMSecsSinceEpoch();
     m_stopRequested.store(false);
     setControlsEnabled(false);
     m_stopBtn->setEnabled(true);
@@ -551,6 +554,7 @@ void SyncEditTab::processQueue()
         futures.push_back(std::async(std::launch::async,
             [inPath, outPath, startSamp, lenSamp, outRate, outBits, basic,
              isRf, cancelFlag]() -> SyncResult {
+            const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
             FcChopResult r{};
             fc_chop_ex(inPath.toUtf8().constData(), outPath.toUtf8().constData(),
                         startSamp, lenSamp, outRate, outBits, basic, isRf,
@@ -558,6 +562,7 @@ void SyncEditTab::processQueue()
             SyncResult res;
             res.ok = r.ok != 0;
             res.message = QString::fromUtf8(r.stderr_buf);
+            res.elapsedMSecs = QDateTime::currentMSecsSinceEpoch() - t0;
             if (cancelFlag->load() != 0)
                 res.cancelled = true;
             return res;
@@ -570,7 +575,8 @@ void SyncEditTab::processQueue()
     pumpTimer->setInterval(0);
     int joined = 0, done = 0, failed = 0, cancelledCount = 0;
     connect(pumpTimer, &QTimer::timeout, this, [this, pumpTimer, &futures,
-            &joined, &done, &failed, &cancelledCount, totalJobs, &jobs]() {
+            &joined, &done, &failed, &cancelledCount, totalJobs, &jobs,
+            &runStartMSecs]() {
         // Stop requested: cancel any not-yet-joined jobs.
         if (m_stopRequested.load()) {
             for (size_t i = joined; i < m_cancelFlags.size(); ++i)
@@ -584,15 +590,19 @@ void SyncEditTab::processQueue()
             const auto& job = jobs[joined];
             const SyncResult res = fut.get();
             if (res.cancelled) {
-                setRowStatus(job.row, tr("Cancelled"), QStringLiteral("#b8860b"));
+                setRowStatus(job.row, tr("Cancelled (after %1)")
+                                 .arg(formatElapsedMSecs(res.elapsedMSecs)),
+                             QStringLiteral("#b8860b"));
                 ++cancelledCount;
             } else if (res.ok) {
-                setRowStatus(job.row, tr("Done — %1").arg(
+                setRowStatus(job.row, tr("Done in %1 — %2").arg(
+                    formatElapsedMSecs(res.elapsedMSecs),
                     QDir::toNativeSeparators(job.output)),
                     QStringLiteral("#2d8a4e"));
                 ++done;
             } else {
-                setRowStatus(job.row, tr("Failed — %1").arg(res.message),
+                setRowStatus(job.row, tr("Failed (after %1) — %2").arg(
+                    formatElapsedMSecs(res.elapsedMSecs), res.message),
                     QStringLiteral("#c0392b"));
                 ++failed;
             }
@@ -607,8 +617,10 @@ void SyncEditTab::processQueue()
             m_stopRequested.store(false);
             m_stopBtn->setEnabled(false);
             setControlsEnabled(true);
-            m_statusLabel->setText(tr("Sync edit done: %1 ok, %2 failed, %3 cancelled.")
-                .arg(done).arg(failed).arg(cancelledCount));
+            m_statusLabel->setText(tr("Sync edit done: %1 ok, %2 failed, %3 cancelled. Total time: %4.")
+                .arg(done).arg(failed).arg(cancelledCount)
+                .arg(formatElapsedMSecs(
+                    QDateTime::currentMSecsSinceEpoch() - runStartMSecs)));
         }
     });
     pumpTimer->start();

@@ -567,6 +567,42 @@ pub extern "C" fn fc_chop_cancel() {
     chop::cancel_chop();
 }
 
+/// Current progress of the running single cut (0-100; 101 = idle/not started).
+/// Poll from a QTimer while fc_chop runs on a worker thread. The shell-out
+/// backend updates it from SoX's -S stderr "overall:X.XX%" output.
+#[no_mangle]
+pub extern "C" fn fc_chop_get_progress() -> u32 {
+    chop::get_progress()
+}
+
+/// Set the Vorbis comments embedded into the NEXT cut's output FLAC (the
+/// GUI's pre-conversion metadata editor rows for raw/packed sources, which
+/// cannot carry tags themselves). `comments` = `n` NUL-terminated
+/// "KEY=value" strings; replaces the previous pending set; `n` = 0 (or NULL)
+/// clears. The core's RF numeric tags are applied after these and win.
+/// Consumed by the next completed cut's post-cut tag rewrite.
+#[no_mangle]
+pub extern "C" fn fc_set_output_comments(comments: *const *const c_char, n: u32) {
+    let mut rows = Vec::new();
+    if !comments.is_null() {
+        for i in 0..n as usize {
+            // SAFETY: the caller guarantees `n` valid NUL-terminated strings
+            // that stay alive for the call.
+            let p = unsafe { *comments.add(i) };
+            if p.is_null() {
+                continue;
+            }
+            if let Ok(s) = unsafe { CStr::from_ptr(p) }.to_str() {
+                let t = s.trim();
+                if !t.is_empty() {
+                    rows.push(t.to_string());
+                }
+            }
+        }
+    }
+    chop::set_pending_output_comments(rows);
+}
+
 // --- Metadata editor (GUI Metadata Editor tab) -------------------------------
 //
 // Read / rewrite every Vorbis comment on a *source* FLAC in place, via

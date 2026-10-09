@@ -8,6 +8,7 @@
 #include <QColor>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
@@ -41,6 +42,15 @@ struct BatchResult {
     bool ok = false;
     bool cancelled = false;
     QString message; // Done: output path / Failed: reason
+    qint64 elapsedMSecs = 0; // wall-clock processing time of the job
+};
+
+// Stamps the job's wall-clock processing time into `out` at EVERY exit
+// (RAII — the job lambda has many return paths).
+struct ElapsedStamp {
+    qint64 t0;
+    qint64* out;
+    ~ElapsedStamp() { *out = QDateTime::currentMSecsSinceEpoch() - t0; }
 };
 
 QString normalizeInputPath(const QString& raw)
@@ -518,6 +528,7 @@ void BatchTab::processQueue()
         m_cancelFlags.emplace_back(std::make_unique<std::atomic<int>>(0));
 
     m_running = true;
+    const qint64 runStartMSecs = QDateTime::currentMSecsSinceEpoch();
     m_stopRequested.store(false, std::memory_order_relaxed);
     setControlsEnabled(false);
     m_stopBtn->setEnabled(true);
@@ -562,6 +573,9 @@ void BatchTab::processQueue()
                 std::async(std::launch::async,
                            [this, job, jobIndex, mode, outBits, basic, doOverwrite, flag]() -> BatchResult {
                                BatchResult res;
+                               const ElapsedStamp stamp{
+                                   QDateTime::currentMSecsSinceEpoch(),
+                                   &res.elapsedMSecs};
                                // A stop that arrived before launch: never start.
                                if (flag->load(std::memory_order_relaxed) != 0) {
                                    res.cancelled = true;
@@ -714,22 +728,32 @@ void BatchTab::processQueue()
         const BatchResult& res = orderedResults[static_cast<size_t>(i)];
         if (res.ok) {
             ++done;
-            setRowStatus(job.row, tr("Done — %1").arg(res.message), QStringLiteral("#6fbf73"));
+            setRowStatus(job.row, tr("Done in %1 — %2")
+                             .arg(formatElapsedMSecs(res.elapsedMSecs), res.message),
+                         QStringLiteral("#6fbf73"));
         } else if (res.cancelled) {
             ++cancelledCount;
-            setRowStatus(job.row, tr("Cancelled"), QStringLiteral("#e8a040"));
+            setRowStatus(job.row, tr("Cancelled (after %1)")
+                             .arg(formatElapsedMSecs(res.elapsedMSecs)),
+                         QStringLiteral("#e8a040"));
         } else {
             failed.append(job.input);
-            setRowStatus(job.row, tr("Failed — %1").arg(res.message), QStringLiteral("#e06c60"));
+            setRowStatus(job.row, tr("Failed (after %1) — %2")
+                             .arg(formatElapsedMSecs(res.elapsedMSecs), res.message),
+                         QStringLiteral("#e06c60"));
         }
     }
 
     const bool stopped = m_stopRequested.load(std::memory_order_relaxed);
-    QString summary = tr("Batch complete: %1 done, %2 skipped, %3 failed, %4 cancelled.")
-                          .arg(done).arg(skipped).arg(failed.size()).arg(cancelledCount);
+    const QString totalTime = formatElapsedMSecs(
+        QDateTime::currentMSecsSinceEpoch() - runStartMSecs);
+    QString summary = tr("Batch complete: %1 done, %2 skipped, %3 failed, %4 cancelled. Total time: %5.")
+                          .arg(done).arg(skipped).arg(failed.size()).arg(cancelledCount)
+                          .arg(totalTime);
     if (stopped)
-        summary = tr("Batch stopped: %1 done, %2 skipped, %3 failed, %4 cancelled.")
-                      .arg(done).arg(skipped).arg(failed.size()).arg(cancelledCount);
+        summary = tr("Batch stopped: %1 done, %2 skipped, %3 failed, %4 cancelled. Total time: %5.")
+                      .arg(done).arg(skipped).arg(failed.size()).arg(cancelledCount)
+                      .arg(totalTime);
     m_statusLabel->setText(summary);
     if (!failed.isEmpty())
         QMessageBox::warning(this, tr("Batch completed with errors"),

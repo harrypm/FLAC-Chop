@@ -19,6 +19,7 @@ class QCheckBox;
 class QTabWidget;
 class QTableWidget;
 class QNetworkAccessManager;
+class QTimer;
 class BatchTab;
 class SyncEditTab;
 
@@ -59,8 +60,7 @@ private slots:
     void setInFromBox();
     void setOutFromBox();
     void checkForUpdatesManual();
-    void browseOutDir();
-    void onOutDirEdited();
+    void browseOutputFile();
     void cancelProcess();
     void addMetaRow();
     void removeMetaRow();
@@ -83,6 +83,11 @@ private:
     void setControlsEnabled(bool enabled);
     // --- Metadata Editor tab ---
     void loadMetadata();         // fill the editor table from the source file
+    // A convertible non-FLAC source cannot carry tags: pre-populate the
+    // editor as the authoring surface for the OUTPUT's metadata (RF template
+    // + DATE_RECORDED from the source's filename + ingest rows), embedded
+    // into the output on Process (fc_set_output_comments).
+    void populatePreConversionMetadata();
     void setMetaEnabled(bool on); // gate the editor controls by load/format
     void setMetaStreamInfo();    // populate the read-only STREAMINFO summary
     bool metaHasKey(const QString& key) const; // case-insensitive table lookup
@@ -95,21 +100,23 @@ private:
     void setTimeBox(double sec);
     void maybeCheckForUpdates();
     void checkForUpdates(bool manual);
-    // Effective output directory for cuts: the user-chosen dir if non-empty,
-    // else the input file's directory (the original sibling -cut.flac
-    // behaviour). Persisted in QSettings("output/dir").
+    // Effective output directory for cuts: the loaded input file's folder
+    // (the Output File box replaced the old Output Directory field — other
+    // destinations are full paths typed into that box).
     QString effectiveOutDir() const;
-    void persistOutDir(const QString& dir);
-    // Keep the Output Directory field's placeholder in sync with the live
-    // effective dir while auto-following (the field itself stays empty — see
-    // the m_outDirEdit comment in the .cpp).
-    void refreshOutDirPlaceholder();
     // Theme menu: apply Dark/Light at runtime + persist the choice.
     void applyThemeChoice(bool dark);
 
     QString m_inPath;
     FcProbe m_probe{};
     bool m_probeOk = false;
+    // True once the user has typed in the Output file box — their path sticks
+    // (kept through marker/mode changes) until they clear the box (back to
+    // the auto path) or a new load/finished conversion resets it.
+    bool m_outPathCustom = false;
+    // Wall-clock start of the in-flight single cut (for the finished-time
+    // status in onChopFinished).
+    qint64 m_cutStartMSecs = 0;
     int m_sliderMaxDs = 0;    // slider range in deciseconds (0.1 s)
     double m_totalSec = 0.0;  // real total duration (s), 0 if unknown
 
@@ -136,9 +143,8 @@ private:
     QLabel* m_totalLabel = nullptr;
     QLabel* m_startSampLabel = nullptr;
     QLabel* m_lenSampLabel = nullptr;
-    QLabel* m_outPathLabel = nullptr;
-    QLineEdit* m_outDirEdit = nullptr;     // user-chosen output directory
-    QPushButton* m_outDirBrowseBtn = nullptr;
+    QLineEdit* m_outPathEdit = nullptr;   // output path + name (top row; auto-derived until edited)
+    QPushButton* m_outPathBrowseBtn = nullptr; // Browse: pick the output folder for the current name
     QComboBox* m_outputModeCombo = nullptr;
     QComboBox* m_outputBitsCombo = nullptr;
     QCheckBox* m_basicFilterCheck = nullptr;
@@ -146,6 +152,7 @@ private:
     QPushButton* m_processBtn = nullptr;
     QPushButton* m_cancelBtn = nullptr;   // stops an in-flight cut
     QProgressBar* m_progress = nullptr;
+    QTimer* m_progressTimer = nullptr;  // polls fc_chop_get_progress() during a cut
     QLabel* m_statusLabel = nullptr;
 
     // --- Metadata Editor tab widgets (Metadata page) ---

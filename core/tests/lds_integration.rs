@@ -11,7 +11,9 @@
 //! rate (a 20 MSPS `.lds` reads as a 20000 Hz stream, exactly what that tool
 //! writes for `--sample-rate 20000`).
 
-use flac_chop_core::chop::{chop_with_options, sox_available, ChopOptions};
+use flac_chop_core::chop::{
+    chop_with_options, chop_with_options_and_cancel, sox_available, ChopOptions,
+};
 use flac_chop_core::lds::pack_group;
 use flac_chop_core::probe;
 
@@ -56,12 +58,19 @@ fn cut(in_path: &std::path::Path, out_name: &str, start: u64, len: u64, opts: Ch
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join(out_name);
-    let r = chop_with_options(
+    // A per-job cancel flag (the production batch/sync model): these cuts
+    // never touch the global pending output comments, so a concurrently
+    // running test's chop can never steal the pending set that another
+    // test's single-cut (Global) chop should consume — the tests run in
+    // parallel threads of ONE process and share that global.
+    let cancel = std::sync::atomic::AtomicI32::new(0);
+    let r = chop_with_options_and_cancel(
         &in_path.to_string_lossy(),
         &out.to_string_lossy(),
         start,
         len,
         opts,
+        Some(&cancel),
     );
     (r, out)
 }
@@ -175,6 +184,56 @@ fn lds_cut_to_true_12bit_flac_is_exact() {
     }
     let _ = std::fs::remove_file(&in_path);
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn lds_cut_embeds_pending_output_comments() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // The GUI's pre-conversion metadata editor: rows authored while a
+    // (tag-less) .lds is loaded are set right before Process and embedded
+    // into the converted output by the post-cut tag rewrite, alongside the
+    // core's own RF numeric tags (which win over an extra with the same key).
+    let samples = ramp(20_000);
+    let in_path = write_lds("fc_lds_meta_20msps.lds", &samples);
+    flac_chop_core::chop::set_pending_output_comments(vec![
+        "DATE_RECORDED=2022-12-11 00:00:34".to_string(),
+        "PROJECT=demo".to_string(),
+        "RF_TOTAL_SAMPLES=999999".to_string(), // owned: must be overridden
+    ]);
+    // A single-cut (Global-cancel) chop — the GUI's Process path that owns
+    // and consumes the pending set (the `cut` helper uses per-job flags,
+    // which never take it).
+    let dir = temp("fc_lds_it_meta");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("fc_lds_meta_out.flac");
+    let r = chop_with_options(
+        &in_path.to_string_lossy(),
+        &out.to_string_lossy(),
+        0,
+        20_000,
+        opts_rf(),
+    );
+    assert!(r.ok, "{}", r.stderr);
+    let (_, comments) = flac_chop_core::tags::read_all_comments(&out).unwrap();
+    let get = |k: &str| {
+        comments
+            .iter()
+            .find(|(ck, _)| ck.eq_ignore_ascii_case(k))
+            .map(|(_, v)| v.clone())
+    };
+    assert_eq!(get("DATE_RECORDED").as_deref(), Some("2022-12-11 00:00:34"));
+    assert_eq!(get("PROJECT").as_deref(), Some("demo"));
+    // The core's RF numeric tags win over the extras and are exact for the
+    // cut: 20_000 samples, 20 MSPS real rate (20000 Hz /1000 header).
+    assert_eq!(get("RF_TOTAL_SAMPLES").as_deref(), Some("20000"));
+    assert_eq!(get("RF_SAMPLE_RATE").as_deref(), Some("20000000"));
+    assert_eq!(get("RF_SAMPLE_RATE_KHZ").as_deref(), Some("20000"));
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_dir_all(out.parent().unwrap());
 }
 
 #[test]

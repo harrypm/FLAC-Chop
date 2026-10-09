@@ -72,6 +72,14 @@ int fc_generate_output_path(const char* in_path, const char* out_dir,
                             const char* stem, char* out_buf, uintptr_t buf_len);
 int fc_sox_available(void);
 void fc_chop_cancel(void);
+uint32_t fc_chop_get_progress(void); // 0-100 = running; 101 = idle
+
+// Set the Vorbis comments embedded into the NEXT cut's output FLAC (the
+// GUI's pre-conversion metadata editor rows for raw/packed sources, which
+// cannot carry tags themselves). `comments` = n NUL-terminated "KEY=value"
+// strings; replaces the previous pending set; n = 0 / NULL clears. The
+// core's RF numeric tags are applied after these and win.
+void fc_set_output_comments(const char* const* comments, uint32_t n);
 
 // Per-job cancel variant of fc_chop for parallel batch processing: identical
 // arguments plus `cancel_flag` — a pointer to a C++-owned std::atomic<int>

@@ -35,6 +35,7 @@
 #include <QCoreApplication>
 #include <QtConcurrent>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <QDragEnterEvent>
 #include <QDropEvent>
 #include <QMimeData>
@@ -183,7 +184,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     // --- Input file ---
     // Read-only QLineEdit (not a flat QLabel) so the input path sits in the
-    // same sunken "in-lay" frame as the Output Directory field — both
+    // same sunken "in-lay" frame as the Output File field — both
     // top-row boxes then look identical, with clear white text on the dark
     // Fusion Base background.
     auto* inBox = new QGroupBox(tr("Input File"), chopPage);
@@ -196,26 +197,29 @@ MainWindow::MainWindow(QWidget* parent)
     inLay->addWidget(m_pathLabel, 1);
     inLay->addWidget(m_browseBtn, 0);
 
-    // --- Output directory (top row, next to the input file) ---
-    // Where cuts are written. Empty = auto-follow the loaded input file's
-    // directory (the original sibling -cut.flac behaviour); the field then
-    // stays EMPTY and only the placeholder shows the live effective dir.
-    // The user can Browse for (or type) a dedicated output folder, which is
-    // persisted across sessions via QSettings; clearing the field resumes
-    // the follow. "Empty field == following" is the single state — there is
-    // no separate follow flag to drift out of sync.
-    auto* outDirBox = new QGroupBox(tr("Output Directory"), chopPage);
-    auto* outDirLay = new QHBoxLayout(outDirBox);
-    m_outDirEdit = new QLineEdit(outDirBox);
-    m_outDirEdit->setToolTip(tr("Cuts are written here. Empty = follow the input file's folder."));
-    m_outDirBrowseBtn = new QPushButton(tr("Browse..."), outDirBox);
-    outDirLay->addWidget(m_outDirEdit, 1);
-    outDirLay->addWidget(m_outDirBrowseBtn, 0);
+    // --- Output file (top row, next to the input file) ---
+    // The destination of the cut as a full path + name: the auto-derived
+    // path (next to the input file) until edited — rename in place, or type
+    // any full path; a bare name lands in the input file's folder as
+    // <name>.flac. Clearing the box restores the auto path. (This REPLACED
+    // the old Output Directory box: a dedicated folder is just a full path
+    // typed here with the name left editable — one destination field, at
+    // the top where the input is.)
+    auto* outFileBox = new QGroupBox(tr("Output File"), chopPage);
+    auto* outFileLay = new QHBoxLayout(outFileBox);
+    m_outPathEdit = new QLineEdit(outFileBox);
+    m_outPathEdit->setToolTip(tr("The output file path + name (the auto-derived path until you edit it). Rename by editing the text; a bare name lands in the input file's folder as <name>.flac; clear the box to restore the auto path. Edits while a cut runs apply to the NEXT cut."));
+    m_outPathEdit->setEnabled(false); // enabled once a file is probed (setControlsEnabled)
+    m_outPathBrowseBtn = new QPushButton(tr("Browse..."), outFileBox);
+    m_outPathBrowseBtn->setToolTip(tr("Pick the output folder for the current file name (the full path in the box moves there)."));
+    m_outPathBrowseBtn->setEnabled(false);
+    outFileLay->addWidget(m_outPathEdit, 1);
+    outFileLay->addWidget(m_outPathBrowseBtn, 0);
 
     // Input + output side by side at the very top of the window.
     auto* ioRow = new QHBoxLayout();
     ioRow->addWidget(inBox, 1);
-    ioRow->addWidget(outDirBox, 1);
+    ioRow->addWidget(outFileBox, 1);
     chopLay->addLayout(ioRow);
 
     // --- Markers: one editable time box + Set IN / Set OUT buttons ---
@@ -302,16 +306,22 @@ MainWindow::MainWindow(QWidget* parent)
     auto* prevLay = new QFormLayout(prevBox);
     m_startSampLabel = new QLabel(QStringLiteral("—"), prevBox);
     m_lenSampLabel = new QLabel(QStringLiteral("—"), prevBox);
-    m_outPathLabel = new QLabel(QStringLiteral("—"), prevBox);
-    m_outPathLabel->setWordWrap(true);
     prevLay->addRow(tr("Start sample:"), m_startSampLabel);
     prevLay->addRow(tr("Length samples:"), m_lenSampLabel);
-    prevLay->addRow(tr("Output file:"), m_outPathLabel);
     chopLay->addWidget(prevBox);
 
     // --- Process + progress + status ---
     m_processBtn = new QPushButton(tr("Process FLAC"), chopPage);
     m_processBtn->setEnabled(false);
+    m_progressTimer = new QTimer(this);
+    m_progressTimer->setInterval(200);
+    connect(m_progressTimer, &QTimer::timeout, this, [this]() {
+        const uint32_t pct = fc_chop_get_progress();
+        if (pct <= 100) {
+            m_progress->setValue(int(pct));
+            m_progress->setFormat(tr("%p%"));
+        }
+    });
     m_cancelBtn = new QPushButton(tr("Cancel"), chopPage);
     m_cancelBtn->setEnabled(false); // only live while a cut is in flight
     m_cancelBtn->setToolTip(tr("Stop the in-progress cut."));
@@ -321,9 +331,10 @@ MainWindow::MainWindow(QWidget* parent)
     // 'Check for Updates' lives only in the Help menu now (auto-checked on
     // startup); no button next to Process to keep the action row clean.
     m_progress = new QProgressBar(chopPage);
-    m_progress->setRange(0, 1);
+    m_progress->setRange(0, 100);
     m_progress->setValue(0);
-    m_progress->setTextVisible(false);
+    m_progress->setTextVisible(true);
+    m_progress->setFormat(tr("%p%"));
     m_statusLabel = new QLabel(tr("Ready — select a FLAC file."), chopPage);
     m_statusLabel->setWordWrap(true);
     chopLay->addLayout(actionLay);
@@ -447,8 +458,16 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::applyCut);
     connect(m_basicFilterCheck, &QCheckBox::toggled,
             this, &MainWindow::applyCut);
-    connect(m_outDirBrowseBtn, &QPushButton::clicked, this, &MainWindow::browseOutDir);
-    connect(m_outDirEdit, &QLineEdit::editingFinished, this, &MainWindow::onOutDirEdited);
+    // Browse: pick the output folder for the current name (the browsed path
+    // becomes the user's custom choice via textChanged).
+    connect(m_outPathBrowseBtn, &QPushButton::clicked, this, &MainWindow::browseOutputFile);
+    // Any user edit of the Output file box marks the path as custom (kept
+    // until the box is cleared — which restores the auto path — or a new
+    // load/finished conversion resets it); the plan recomputes live.
+    connect(m_outPathEdit, &QLineEdit::textChanged, this, [this]() {
+        m_outPathCustom = m_outPathEdit && !m_outPathEdit->text().trimmed().isEmpty();
+        applyCut();
+    });
     // --- Metadata Editor tab ---
     connect(m_metaAddBtn, &QPushButton::clicked, this, &MainWindow::addMetaRow);
     connect(m_metaRemoveBtn, &QPushButton::clicked, this, &MainWindow::removeMetaRow);
@@ -461,21 +480,16 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_metaFieldCombo->lineEdit(), &QLineEdit::returnPressed,
             this, &MainWindow::addFieldFromBox);
 
-    // Restore the persisted output directory. Auto-follow IS "the field is
-    // empty": a persisted non-empty dir fills the field (pinned), an empty
-    // one leaves it following (the placeholder shows the effective dir).
-    {
-        QSettings s;
-        s.beginGroup(QStringLiteral("output"));
-        const QString persisted = s.value(QStringLiteral("dir")).toString().trimmed();
-        s.endGroup();
-        m_outDirEdit->setText(persisted);
-    }
-    refreshOutDirPlaceholder();
-
-    // Drag & drop: the window accepts file drops; the time box must not swallow them.
+    // Drag & drop: the window accepts file drops, and NO child may swallow
+    // them. QLineEdits accept file drops by default (they insert the path as
+    // text) — the Output File box at the top is exactly where a dropped file
+    // naturally lands, and it would eat the drop instead of loading the
+    // file. Opt EVERY line edit in every tab out (the time box was the only
+    // one before; this also covers the batch/sync out-dir boxes and the
+    // metadata quick-add combo's internal edit).
     setAcceptDrops(true);
-    m_timeEdit->setAcceptDrops(false);
+    for (QLineEdit* le : findChildren<QLineEdit*>())
+        le->setAcceptDrops(false);
 
     m_watcher = new QFutureWatcher<FcChopResult>(this);
     connect(m_watcher, &QFutureWatcher<FcChopResult>::finished,
@@ -525,8 +539,11 @@ void MainWindow::setControlsEnabled(bool enabled)
     m_outputBitsCombo->setEnabled(enabled && m_probeOk);
     const quint64 outRate = m_outputModeCombo->currentData().toULongLong();
     m_basicFilterCheck->setEnabled(enabled && m_probeOk && outRate > 0);
-    m_outDirEdit->setEnabled(enabled);
-    m_outDirBrowseBtn->setEnabled(enabled);
+    // The output-path box stays editable even while a cut runs (an edit
+    // applies to the NEXT cut — the running one already captured its path);
+    // it is only disabled with no file loaded or while probing.
+    m_outPathEdit->setEnabled(enabled || (m_probeOk && !m_probing));
+    m_outPathBrowseBtn->setEnabled(enabled || (m_probeOk && !m_probing));
 }
 
 void MainWindow::browse()
@@ -545,65 +562,37 @@ void MainWindow::browse()
 
 QString MainWindow::effectiveOutDir() const
 {
-    // User-chosen dir wins; empty (or a dir that doesn't yet exist but the
-    // user typed) falls back to the input file's directory so cuts always land
-    // somewhere sensible by default. Returns "" when no file is loaded.
-    const QString chosen = m_outDirEdit ? m_outDirEdit->text().trimmed() : QString();
-    if (!chosen.isEmpty())
-        return chosen;
+    // The Output File box (top row) replaced the old Output Directory
+    // field: the default destination is the loaded input file's folder (the
+    // original sibling -cut.flac behaviour); any other destination is a
+    // full path typed into the Output File box itself. Returns "" when no
+    // file is loaded.
     if (m_inPath.isEmpty())
         return QString();
     return QFileInfo(m_inPath).absolutePath();
 }
 
-void MainWindow::persistOutDir(const QString& dir)
+void MainWindow::browseOutputFile()
 {
-    QSettings s;
-    s.beginGroup(QStringLiteral("output"));
-    s.setValue(QStringLiteral("dir"), dir);
-    s.endGroup();
-}
-
-void MainWindow::refreshOutDirPlaceholder()
-{
-    // While following (the field is empty), only the PLACEHOLDER shows the
-    // live effective dir — the field itself never gets text written into it.
-    // That kills two old state bugs: a no-op editingFinished (focus loss)
-    // used to silently pin the auto-followed dir and persist it, and a
-    // failed probe left the stale failed file's dir shown as the choice.
-    if (!m_outDirEdit)
+    if (!m_probeOk || !m_outPathEdit)
         return;
-    if (!m_outDirEdit->text().trimmed().isEmpty())
-        return; // pinned: the field itself shows the user's chosen dir
-    const QString eff = effectiveOutDir();
-    m_outDirEdit->setPlaceholderText(eff.isEmpty()
-        ? tr("(follows the input file's folder)")
-        : tr("(follows input: %1)").arg(eff));
-}
-
-void MainWindow::browseOutDir()
-{
-    const QString startDir = effectiveOutDir().isEmpty() ? QDir::homePath() : effectiveOutDir();
-    const QString d = QFileDialog::getExistingDirectory(
-        this, tr("Select output directory"), startDir);
-    if (d.isEmpty())
+    // Pick the output folder for the CURRENT name (auto or the user's) —
+    // the full path in the box moves into the chosen folder.
+    const QString current = m_outPathEdit->text().trimmed();
+    const QString name = QFileInfo(current).fileName();
+    const QString startDir = QFileInfo(current).absolutePath();
+    const QString dir = QFileDialog::getExistingDirectory(
+        this, tr("Select output directory"),
+        QDir().exists(startDir) ? startDir : QDir::homePath());
+    if (dir.isEmpty())
         return;
-    m_outDirEdit->setText(d); // non-empty = pinned (the user explicitly chose)
-    persistOutDir(d);
-    refreshOutDirPlaceholder();
-    applyCut();
-}
-
-void MainWindow::onOutDirEdited()
-{
-    // editingFinished fires on focus loss / Enter. Empty text = follow the
-    // input file's folder again; non-empty = the user's pinned dir. Either
-    // way persist it so the preference survives restarts (and a no-op
-    // focus-loss on an EMPTY field is harmless — it stays following).
-    const QString d = m_outDirEdit->text().trimmed();
-    persistOutDir(d);
-    refreshOutDirPlaceholder();
-    applyCut();
+    const QString newName = name.isEmpty()
+        ? QStringLiteral("output.flac")
+        : name;
+    const QString newPath = QDir(dir).filePath(newName);
+    // Programmatic setText goes through textChanged, so the browsed path
+    // becomes the user's custom choice (kept until cleared).
+    m_outPathEdit->setText(QDir::toNativeSeparators(newPath));
 }
 
 void MainWindow::unloadFile()
@@ -637,7 +626,13 @@ void MainWindow::unloadFile()
     m_durLabel->setText(QStringLiteral("--:--:--.--"));
     m_startSampLabel->setText(QStringLiteral("—"));
     m_lenSampLabel->setText(QStringLiteral("—"));
-    m_outPathLabel->setText(QStringLiteral("—"));
+    m_outPathCustom = false;
+    if (m_outPathEdit) {
+        QSignalBlocker b(m_outPathEdit);
+        m_outPathEdit->clear();
+        m_outPathEdit->setPlaceholderText(tr("(no file selected)"));
+        m_outPathEdit->setEnabled(false);
+    }
     {
         QSignalBlocker b1(m_outputModeCombo);
         m_outputModeCombo->clear();
@@ -656,10 +651,6 @@ void MainWindow::unloadFile()
     }
     m_filterProfileLabel->setText(QStringLiteral("—"));
 
-    // No input loaded: the Output Directory placeholder drops the stale
-    // (possibly failed) input's dir and returns to the follow default.
-    refreshOutDirPlaceholder();
-
     setProbeInfo();
 }
 
@@ -673,11 +664,6 @@ void MainWindow::loadFile(const QString& fn)
     m_inPath = fn;
     m_pathLabel->setText(QFileInfo(fn).fileName());
     m_pathLabel->setToolTip(fn);
-
-    // Output dir while following (the field is empty): only the PLACEHOLDER
-    // moves to the new input's directory so cuts land next to the new file.
-    // A pinned dir (non-empty field) is left untouched, as before.
-    refreshOutDirPlaceholder();
 
     startProbe();
 }
@@ -710,7 +696,8 @@ void MainWindow::startProbe()
     m_probing = true;
     setControlsEnabled(false);
     setMetaEnabled(false);
-    m_progress->setRange(0, 0); // busy indicator
+    m_progress->setRange(0, 0); // busy indicator (no % text while busy)
+    m_progress->setTextVisible(false);
     m_statusLabel->setText(tr("Probing… (scanning frame headers if the total is unknown)"));
 
     const QString path = m_inPath;
@@ -880,18 +867,39 @@ void MainWindow::dropEvent(QDropEvent* e)
         return;
     e->acceptProposedAction();
     if (localFiles.size() == 1) {
-        // A single dropped file keeps the existing behaviour: load it into
-        // the Chop tab for marker cuts. Accept anything that looks like a
-        // capture: the core probe sniffs FLAC / WAV by magic header (so
-        // unknown extensions with the right magic work) and maps the raw PCM
-        // extensions. Anything else fails the probe with a clear error.
-        // Exception: if the Sync Edit tab is the active tab, add to the
-        // Sync Edit set (a single file can be the first of a set).
+        // A single dropped file: load it into the Chop tab for marker cuts —
+        // EXCEPT when a queue tab is the active tab: one-by-one drag-and-drop
+        // onto the Batch Task / Sync Edit tab adds to that queue (the natural
+        // way to build a queue file by file). Accept anything that looks
+        // like a capture: the core probe sniffs FLAC / WAV by magic header
+        // (so unknown extensions with the right magic work) and maps the raw
+        // PCM extensions. Anything else fails the probe with a clear error.
         if (m_tabs->currentWidget() == m_syncEditTab && m_syncEditTab) {
             const int added = m_syncEditTab->addInputFiles(localFiles);
             m_statusLabel->setText(added > 0
                 ? tr("Added 1 file to the Sync Edit set.")
                 : tr("File already in the Sync Edit set."));
+            return;
+        }
+        if (m_tabs->currentWidget() == m_batchTab && m_batchTab) {
+            // A run in flight refuses adds — say so instead of "already queued".
+            if (m_batchTab->isBusy()) {
+                m_statusLabel->setText(tr("A batch run is in progress — add more files after it finishes."));
+                return;
+            }
+            const int added = m_batchTab->addInputFiles(localFiles);
+            m_statusLabel->setText(added > 0
+                ? tr("Added 1 file to the Batch Task queue.")
+                : tr("File already in the Batch Task queue."));
+            return;
+        }
+        // Loading into the Chop tab mid-cut would reset the GUI state under
+        // the running cut (unloadFile clears the plan the finish handler
+        // reports against) — wait for it. (Adding to the batch/sync queues
+        // above is still fine while a cut runs: those tabs run their own
+        // jobs.)
+        if (m_watcher && m_watcher->isRunning()) {
+            m_statusLabel->setText(tr("A cut is in progress — wait for it to finish before loading another file."));
             return;
         }
         loadFile(localFiles.first());
@@ -1004,6 +1012,7 @@ void MainWindow::setProbeInfo()
         m_totalLabel->setText(QStringLiteral("—"));
         m_totalLabel->setToolTip(QString());
         m_totalLabel->setStyleSheet(QString());
+        m_processBtn->setText(tr("Process FLAC")); // no conversion pending
         return;
     }
     if (m_probe.format >= 2 && m_probe.format <= 5) {
@@ -1018,6 +1027,10 @@ void MainWindow::setProbeInfo()
     } else {
         m_headerRateLabel->setText(tr("%1 Hz (header)").arg(m_probe.header_sample_rate));
     }
+    // Process button label: FLAC (0) and Ogg FLAC (6) are cut FLAC→FLAC;
+    // anything else (WAV / raw PCM / packed .lds) is CONVERTED to FLAC.
+    m_processBtn->setText((m_probe.format == 0 || m_probe.format == 6)
+        ? tr("Process FLAC") : tr("Process to FLAC"));
     if (m_probe.is_rf)
         m_mspsLabel->setText(tr("RF — %1 Hz real")
             .arg(m_probe.real_rate_hz, 0, 'f', 0));
@@ -1090,7 +1103,7 @@ void MainWindow::applyCut()
         m_durLabel->setText(QStringLiteral("--:--:--.--"));
         m_startSampLabel->setText(QStringLiteral("—"));
         m_lenSampLabel->setText(QStringLiteral("—"));
-        m_outPathLabel->setText(QStringLiteral("—"));
+        if (m_outPathEdit) m_outPathEdit->setPlaceholderText(tr("(no file selected)"));
         m_filterProfileLabel->setText(QStringLiteral("—"));
         m_processBtn->setEnabled(false);
         return;
@@ -1158,12 +1171,40 @@ void MainWindow::applyCut()
     const QByteArray outDirB = outDir.toUtf8();
     const QString stem = renamedOutputStem(m_inPath, outHeaderRateHz, outBits);
     const QByteArray stemB = stem.toUtf8();
+    QString autoPath;
     if (fc_generate_output_path(m_inPath.toUtf8().constData(),
                                  outDirB.constData(),
                                  stemB.constData(), buf, sizeof(buf))) {
-        m_outPath = QString::fromUtf8(buf);
+        autoPath = QString::fromUtf8(buf);
     } else {
-        m_outPath = m_inPath + QStringLiteral("-cut.flac");
+        autoPath = m_inPath + QStringLiteral("-cut.flac");
+    }
+    // The Output file box carries the REAL path as text (the "easy rename"
+    // form): the auto-derived path while untouched, the user's edit once
+    // they type (m_outPathCustom; clearing the box restores the auto path).
+    // A bare name (no directory) resolves against the effective output
+    // directory — never the process CWD, where a raw relative path would
+    // silently land (the "typed name not applied" case) — and a name without
+    // an extension gets .flac appended (the cut is ALWAYS written as FLAC,
+    // and SoX picks its output handler from the extension).
+    QString custom;
+    if (m_outPathCustom && m_outPathEdit)
+        custom = m_outPathEdit->text().trimmed();
+    if (!custom.isEmpty()) {
+        if (!QFileInfo(custom).isAbsolute())
+            custom = QDir(effectiveOutDir()).absoluteFilePath(custom);
+        if (QFileInfo(custom).completeSuffix().isEmpty())
+            custom += QStringLiteral(".flac");
+        m_outPath = custom;
+    } else {
+        m_outPath = autoPath;
+        // The untouched box shows the live auto path as REAL (black,
+        // directly editable) text — a gray placeholder reads as a disabled
+        // field. Blocked so the update can't loop back through textChanged.
+        if (m_outPathEdit) {
+            QSignalBlocker b(m_outPathEdit);
+            m_outPathEdit->setText(QDir::toNativeSeparators(autoPath));
+        }
     }
 
     m_inLabel->setText(secsToHms(m_inSec));
@@ -1173,18 +1214,21 @@ void MainWindow::applyCut()
         .arg(ulongStr(m_plan.start_samples))
         .arg(m_plan.real_sample_rate_hz, 0, 'f', 0));
     m_lenSampLabel->setText(ulongStr(m_plan.length_samples));
-    m_outPathLabel->setText(m_outPath);
     m_processBtn->setEnabled(true);
     const QString bitsText =
         (outBits == 0) ? tr("source depth")
       : (outBits == 6) ? tr("6-bit crush in 8-bit FLAC")
       : tr("%1-bit").arg(outBits);
     const QString modeText = modeDisplay(outHeaderRateHz);
-    m_statusLabel->setText(tr("Plan ready: %1 + %2 samples | output %3 | %4.")
+    // Show the RESOLVED output file in the plan status — a typed bare name
+    // resolves against the output directory, which is otherwise invisible
+    // (the placeholder only shows the auto-derived path).
+    m_statusLabel->setText(tr("Plan ready: %1 + %2 samples | output %3 | %4.\nOutput file: %5")
         .arg(ulongStr(m_plan.start_samples),
              ulongStr(m_plan.length_samples),
              modeText,
-             bitsText));
+             bitsText,
+             QDir::toNativeSeparators(m_outPath)));
 }
 
 void MainWindow::process()
@@ -1203,6 +1247,13 @@ void MainWindow::process()
             return;
         }
     }
+    // A custom output path (typed in the Output File box) may name a
+    // directory that doesn't exist yet — make it too.
+    const QString outParent = QFileInfo(m_outPath).absolutePath();
+    if (!QDir().exists(outParent) && !QDir().mkpath(outParent)) {
+        m_statusLabel->setText(tr("Cannot create output directory: %1").arg(outParent));
+        return;
+    }
 
     if (QFile::exists(m_outPath)) {
         auto r = QMessageBox::question(this, tr("Overwrite?"),
@@ -1212,8 +1263,48 @@ void MainWindow::process()
             return;
     }
 
+    // Pre-conversion output metadata (the Metadata Editor tab rows authored
+    // while a convertible non-FLAC source was loaded): the rows are embedded
+    // into the output FLAC by the core's post-cut tag rewrite. For a FLAC
+    // source the pending set is cleared (its editor saves in place instead).
+    if (m_probe.format != 0) {
+        QVector<QByteArray> rows;
+        for (int i = 0; i < m_metaTable->rowCount(); ++i) {
+            const QTableWidgetItem* kIt = m_metaTable->item(i, 0);
+            const QTableWidgetItem* vIt = m_metaTable->item(i, 1);
+            const QString key = kIt ? kIt->text().trimmed() : QString();
+            const QString val = vIt ? vIt->text() : QString();
+            if (key.isEmpty() && val.isEmpty())
+                continue; // blank row — skip
+            if (key.isEmpty()) {
+                m_statusLabel->setText(tr("Metadata row %1: field name is empty — enter a name or clear the row (Metadata Editor tab).").arg(i + 1));
+                return;
+            }
+            static const QRegularExpression valid(QStringLiteral("^[A-Za-z0-9_]+$"));
+            if (!valid.match(key).hasMatch()) {
+                m_statusLabel->setText(tr("Metadata row %1: \"%2\" is not a valid field name (A-Z a-z 0-9 _).").arg(i + 1).arg(key));
+                return;
+            }
+            rows.append((key.toUpper() + QLatin1Char('=') + val).toUtf8());
+        }
+        QVector<const char*> ptrs;
+        ptrs.reserve(rows.size());
+        for (const QByteArray& b : rows)
+            ptrs.append(b.constData());
+        fc_set_output_comments(ptrs.constData(), uint32_t(ptrs.size()));
+    } else {
+        fc_set_output_comments(nullptr, 0); // nothing pending for a FLAC cut
+    }
+
     setControlsEnabled(false);
-    m_progress->setRange(0, 0); // busy indicator
+    // Wall-clock the run for the finished-time status.
+    m_cutStartMSecs = QDateTime::currentMSecsSinceEpoch();
+    // Start real progress polling: SoX -S "overall:X.XX%" → fc_chop_get_progress().
+    m_progress->setRange(0, 100);
+    m_progress->setValue(0);
+    m_progress->setFormat(tr("%p%"));
+    m_progress->setTextVisible(true);
+    m_progressTimer->start();
     m_cancelRequested = false;
     m_cancelBtn->setEnabled(true);
     const QString bitsText =
@@ -1254,10 +1345,14 @@ void MainWindow::cancelProcess()
 
 void MainWindow::onChopFinished()
 {
+    m_progressTimer->stop(); // SoX -S polling ends with the cut
     FcChopResult r = m_watcher->result();
-    m_progress->setRange(0, 1);
-    m_progress->setValue(1);
     m_cancelBtn->setEnabled(false);
+    m_progress->setRange(0, 100);
+    m_progress->setFormat(tr("%p%"));
+    // Total processing time of the finished cut (all outcomes report it).
+    const QString elapsed = formatElapsedMSecs(
+        QDateTime::currentMSecsSinceEpoch() - m_cutStartMSecs);
 
     if (m_cancelRequested) {
         // The sox child was killed mid-cut: remove the partial output file so
@@ -1265,14 +1360,46 @@ void MainWindow::onChopFinished()
         m_cancelRequested = false;
         if (!m_outPath.isEmpty() && QFile::exists(m_outPath))
             QFile::remove(m_outPath);
-        m_statusLabel->setText(tr("Cancelled."));
+        m_progress->setValue(0);
+        m_progress->setTextVisible(false);
+        m_statusLabel->setText(tr("Cancelled (after %1).").arg(elapsed));
     } else if (r.ok) {
-        m_statusLabel->setText(tr("Done. Output: %1").arg(m_outPath));
+        m_progress->setValue(100); // complete — leave 100% showing
+        // Surface the core's non-fatal notes/warnings on success (the .lds/Ogg
+        // window provenance notes, a tag-rewrite warning) — the old UI dropped
+        // r.stderr entirely on success, hiding real problems (a failed tag
+        // embed used to be invisible next to a dead .tmp-tagsplice file).
+        const QString notes = QString::fromUtf8(r.stderr_buf).trimmed();
+        if (notes.contains(QLatin1String("warning:")))
+            QMessageBox::warning(this, tr("Cut finished with a warning"),
+                tr("The cut itself succeeded:\n%1\n\n%2").arg(m_outPath, notes));
+        m_statusLabel->setText(notes.isEmpty()
+            ? tr("Done in %1. Output: %2").arg(elapsed, m_outPath)
+            : tr("Done in %1. Output: %2\n%3").arg(elapsed, m_outPath, notes));
+        // Non-FLAC input (WAV / raw PCM / packed .lds / Ogg .ldf): the cut
+        // output is a freshly converted native FLAC. Load it so the Metadata
+        // Editor can tag the output right away (the raw/packed source's tags
+        // are not editable) and the Chop tab reflects the produced file.
+        if (m_probe.format != 0) {
+            const QString out = m_outPath;
+            // The custom name (if any) was consumed by this cut — don't let
+            // it hijack (and overwrite) the next cut of the loaded output.
+            m_outPathCustom = false;
+            if (m_outPathEdit) {
+                QSignalBlocker b(m_outPathEdit);
+                m_outPathEdit->clear();
+            }
+            loadFile(out);
+            return; // startProbe owns the controls until the probe finishes
+        }
     } else {
+        m_progress->setValue(0);
+        m_progress->setTextVisible(false);
         QString err = QString::fromUtf8(r.stderr_buf).trimmed();
         if (err.isEmpty())
             err = tr("(no stderr) sox exit code %1").arg(r.exit_code);
-        m_statusLabel->setText(tr("FAILED (exit %1): %2").arg(r.exit_code).arg(err));
+        m_statusLabel->setText(tr("FAILED (exit %1, after %2): %3")
+            .arg(r.exit_code).arg(elapsed).arg(err));
         QMessageBox::warning(this, tr("Cut failed"),
             tr("sox failed (exit %1):\n%2").arg(r.exit_code).arg(err));
     }
@@ -1505,6 +1632,43 @@ static QVector<QPair<QString, QString>> parseCommentsBlob(const QByteArray& blob
     return out;
 }
 
+// Derive the capture date/time from the filename when it follows the
+// DdD/ld-decode naming convention (e.g. RF-Sample_2022-12-11_00-00-34.lds):
+// a YYYY-MM-DD token, optionally followed by _HH-MM-SS. Returns
+// "YYYY-MM-DD" / "YYYY-MM-DD HH:MM:SS", or an empty string when the name
+// carries no such context (or the values are not a real date/time).
+static QString dateRecordedFromFilename(const QString& path)
+{
+    static const QRegularExpression re(QStringLiteral(
+        "(\\d{4})-(\\d{2})-(\\d{2})(?:[_-](\\d{2})-(\\d{2})-(\\d{2}))?"));
+    const auto m = re.match(QFileInfo(path).fileName());
+    if (!m.hasMatch())
+        return QString();
+    const int y = m.captured(1).toInt();
+    const int mo = m.captured(2).toInt();
+    const int d = m.captured(3).toInt();
+    if (y < 1970 || mo < 1 || mo > 12 || d < 1 || d > 31)
+        return QString();
+    if (!m.captured(4).isNull()) {
+        const int h = m.captured(4).toInt();
+        const int mi = m.captured(5).toInt();
+        const int s = m.captured(6).toInt();
+        if (h > 23 || mi > 59 || s > 59)
+            return QString();
+        return QStringLiteral("%1-%2-%3 %4:%5:%6")
+            .arg(y, 4, 10, QLatin1Char('0'))
+            .arg(mo, 2, 10, QLatin1Char('0'))
+            .arg(d, 2, 10, QLatin1Char('0'))
+            .arg(h, 2, 10, QLatin1Char('0'))
+            .arg(mi, 2, 10, QLatin1Char('0'))
+            .arg(s, 2, 10, QLatin1Char('0'));
+    }
+    return QStringLiteral("%1-%2-%3")
+        .arg(y, 4, 10, QLatin1Char('0'))
+        .arg(mo, 2, 10, QLatin1Char('0'))
+        .arg(d, 2, 10, QLatin1Char('0'));
+}
+
 void MainWindow::setMetaStreamInfo()
 {
     // Read-only STREAMINFO summary at the top of the editor page.
@@ -1562,18 +1726,18 @@ void MainWindow::setMetaEnabled(bool on)
 void MainWindow::loadMetadata()
 {
     // Read every Vorbis comment from the source FLAC via the packed-blob FFI
-    // and fill the editor table. Non-FLAC / no-file → cleared + disabled.
+    // and fill the editor table. A convertible non-FLAC source (WAV / raw /
+    // packed .lds / Ogg .ldf) cannot carry comments, so the editor instead
+    // becomes the authoring surface for the OUTPUT's metadata. No file →
+    // cleared + disabled.
     if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0) {
         m_metaTable->setRowCount(0);
         setMetaEnabled(false);
-        if (m_probeOk && m_probe.format == 6)
-            m_metaStatusLabel->setText(tr("This is an Ogg FLAC file (.ldf): its metadata cannot be edited in place. "
-                                          "Cutting from it works normally, and the cut output is a native FLAC whose tags are editable."));
-        else if (m_probeOk && m_probe.format != 0)
-            m_metaStatusLabel->setText(tr("Metadata editing is only available for FLAC files (this file is %1).")
-                .arg(m_metaFormatLabel->text()));
-        else
-            m_metaStatusLabel->setText(tr("Load a FLAC file to edit its metadata."));
+        if (m_probeOk && !m_inPath.isEmpty()) {
+            populatePreConversionMetadata();
+            return;
+        }
+        m_metaStatusLabel->setText(tr("Load a FLAC file to edit its metadata."));
         return;
     }
 
@@ -1618,8 +1782,101 @@ void MainWindow::loadMetadata()
         m_metaTable->setItem(i, 0, new QTableWidgetItem(pairs[i].first));
         m_metaTable->setItem(i, 1, new QTableWidgetItem(pairs[i].second));
     }
-    m_metaStatusLabel->setText(tr("%1 comment(s) loaded. Edit fields, then Save to write in place.").arg(pairs.size()));
+    // Auto-populate the capture date/time from the filename context (the
+    // DdD/ld-decode naming convention embeds it: e.g.
+    // RF-Sample_2022-12-11_00-00-34.lds). Only when the tag is not already
+    // present (a re-load after Save must not duplicate it); the row lands
+    // in the table for review — Save writes it to the file.
+    QString autoNote;
+    const QString recorded = dateRecordedFromFilename(m_inPath);
+    if (!recorded.isEmpty() && !metaHasKey(QStringLiteral("DATE_RECORDED"))) {
+        const int row = m_metaTable->rowCount();
+        m_metaTable->insertRow(row);
+        m_metaTable->setItem(row, 0, new QTableWidgetItem(QStringLiteral("DATE_RECORDED")));
+        m_metaTable->setItem(row, 1, new QTableWidgetItem(recorded));
+        autoNote = tr(" Auto-populated DATE_RECORDED from the filename.");
+    }
+    m_metaStatusLabel->setText(tr("%1 comment(s) loaded. Edit fields, then Save to write in place.%2")
+        .arg(pairs.size())
+        .arg(autoNote));
     setMetaEnabled(true);
+}
+
+// A convertible non-FLAC source (WAV / raw PCM / packed .lds / Ogg .ldf)
+// cannot carry Vorbis comments, but its conversion output can: the editor
+// becomes the authoring surface for the OUTPUT's metadata — the RF template
+// tags from the probe, the capture date/time from the SOURCE's filename (so
+// the output carries the source's context even when it is renamed), and the
+// standard ingest fields to fill. Process embeds the rows into the output
+// (fc_set_output_comments); Save/Reload stay off (the tag-less source has
+// nothing to write or re-read).
+void MainWindow::populatePreConversionMetadata()
+{
+    // The rows are editable; Save/Reload target a real file, so they stay
+    // disabled for a tag-less source.
+    m_metaTable->setEnabled(true);
+    m_metaAddBtn->setEnabled(true);
+    m_metaRemoveBtn->setEnabled(true);
+    m_metaUpBtn->setEnabled(true);
+    m_metaDownBtn->setEnabled(true);
+    m_metaTemplateBtn->setEnabled(true);
+    m_metaFieldCombo->setEnabled(true);
+    m_metaAddFieldBtn->setEnabled(true);
+    m_metaReloadBtn->setEnabled(false);
+    m_metaSaveBtn->setEnabled(false);
+
+    int added = 0;
+    // 1. RF template tags from the probe (RF_TOTAL_SAMPLES, RF_SAMPLE_RATE,
+    //    ... for RF captures; none for plain audio) — same merge rules as
+    //    Apply Template (only missing keys; the core's post-cut rewrite
+    //    writes the authoritative numbers into the output anyway).
+    QByteArray blob(4096, '\0');
+    QByteArray err(256, '\0');
+    const uintptr_t n = fc_rf_template_from_probe(&m_probe, blob.data(), blob.size(),
+                                                  err.data(), err.size());
+    if (n == 0) {
+        m_metaStatusLabel->setText(tr("Preparing output metadata failed: %1")
+            .arg(QString::fromUtf8(err)));
+        return;
+    }
+    blob.resize(int(n));
+    for (const auto& kv : parseCommentsBlob(blob)) {
+        if (!metaHasKey(kv.first)) {
+            const int row = m_metaTable->rowCount();
+            m_metaTable->insertRow(row);
+            m_metaTable->setItem(row, 0, new QTableWidgetItem(kv.first));
+            m_metaTable->setItem(row, 1, new QTableWidgetItem(kv.second));
+            ++added;
+        }
+    }
+    // 2. The capture date/time from the SOURCE's filename (the DdD/ld-decode
+    //    naming convention, e.g. RF-Sample_2022-12-11_00-00-34.lds).
+    const QString recorded = dateRecordedFromFilename(m_inPath);
+    if (!recorded.isEmpty() && !metaHasKey(QStringLiteral("DATE_RECORDED"))) {
+        const int row = m_metaTable->rowCount();
+        m_metaTable->insertRow(row);
+        m_metaTable->setItem(row, 0, new QTableWidgetItem(QStringLiteral("DATE_RECORDED")));
+        m_metaTable->setItem(row, 1, new QTableWidgetItem(recorded));
+        ++added;
+    }
+    // 3. Blank ingest fields to fill (the same set as Apply Template).
+    static const char* kIngestFields[] = { "PROJECT", "TAPE_ID", "OPERATOR", "LOCATION", "NOTES" };
+    for (const char* k : kIngestFields) {
+        const QString key = QString::fromLatin1(k);
+        if (!metaHasKey(key)) {
+            const int row = m_metaTable->rowCount();
+            m_metaTable->insertRow(row);
+            m_metaTable->setItem(row, 0, new QTableWidgetItem(key));
+            m_metaTable->setItem(row, 1, new QTableWidgetItem(QString()));
+            ++added;
+        }
+    }
+    m_metaStatusLabel->setText(tr(
+        "Output metadata prepared: %1 row(s) — RF tags from the probe, DATE_RECORDED from the "
+        "source file name, plus ingest fields to fill. Edit them, then Process: they are embedded "
+        "into the output FLAC (this %2 source cannot carry tags, so Save is off).")
+        .arg(added)
+        .arg(m_metaFormatLabel->text()));
 }
 
 void MainWindow::reloadMetadata()
@@ -1655,6 +1912,7 @@ void MainWindow::saveMetadata()
 
     setMetaEnabled(false);
     m_progress->setRange(0, 0); // busy indicator (shared with the Chop page)
+    m_progress->setTextVisible(false);
     m_metaStatusLabel->setText(tr("Saving metadata…"));
     m_statusLabel->setText(tr("Saving metadata to %1…").arg(m_inPath));
 
@@ -1771,8 +2029,8 @@ void MainWindow::applyTemplate()
     // semantics: only keys that are NOT already present are added; existing
     // values are left untouched. The rows land in the table for review — the
     // user hits Save to write them.
-    if (!m_probeOk || m_inPath.isEmpty() || m_probe.format != 0) {
-        m_metaStatusLabel->setText(tr("Apply Template needs a loaded FLAC file."));
+    if (!m_probeOk || m_inPath.isEmpty()) {
+        m_metaStatusLabel->setText(tr("Apply Template needs a loaded file."));
         return;
     }
     if (m_metaWatcher && m_metaWatcher->isRunning())

@@ -10,7 +10,7 @@ fn main() {
         std::process::exit(2);
     }
     let is_rf = args[2] == "rf";
-    match flac_chop_core::tags::rewrite_cut_tags(Path::new(&args[1]), is_rf) {
+    match flac_chop_core::tags::rewrite_cut_tags(Path::new(&args[1]), is_rf, &[]) {
         Ok(()) => println!("rewrite ok"),
         Err(e) => {
             eprintln!("rewrite failed: {e}");
