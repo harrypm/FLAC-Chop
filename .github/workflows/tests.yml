@@ -50,7 +50,7 @@ jobs:
               brew install sox
               ;;
             Windows)
-              choco install sox --no-progress -y
+              choco install sox.portable --no-progress -y
               ;;
           esac
           sox --version

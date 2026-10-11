@@ -660,10 +660,15 @@ fn run_sox_child(
             return Err(ChopResult {
                 ok: false,
                 exit_code: -1,
+                // ALWAYS name the cancel (the GUI's batch worker and the
+                // tests classify on the word): a killed sox may have a -S
+                // progress dump buffered (observed on macOS — it replaced
+                // the message entirely), so keep that only as a diagnostic
+                // tail after the classification line.
                 stderr: if stderr.trim().is_empty() {
                     "cancelled by user".to_string()
                 } else {
-                    stderr
+                    format!("cancelled by user — sox stderr tail:\n{stderr}")
                 },
             });
         }

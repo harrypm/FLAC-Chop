@@ -170,3 +170,17 @@ GUI automation (the MISRC model):
   --config-missing 2, --smoke-test 0 (offscreen).
 - tests.yml Linux leg runs the parity gate as a CI step (offscreen,
   -DFLAC_CHOP_BUILD_LDC=OFF); readme documents the automation surface.
+
+### Phase 3/4 addendum — the 6517565 CI failure round (three causes, fixed)
+
+1. Windows Tests: choco has no "sox" package -> sox.portable is the real ID.
+2. Linux Tests + Build preflight: exit 126 — scripts committed from Windows
+   carry no executable bit. git update-index --chmod=+x on
+   scripts/ci_build_flac.sh + scripts/gui_cli_parity.sh.
+3. macOS Tests (parallel_cancel, first time it ever RAN there — sox was
+   never installed on mac CI before): cancel_mid_flight asserted on
+   "cancelled" in stderr, but the kill path replaced the message with the
+   killed sox's buffered -S progress dump (macOS timing; Windows kills
+   before any stderr). Core fix: the cancel result ALWAYS names the cancel,
+   keeping the child stderr only as a diagnostic tail. Local re-verified:
+   parallel_cancel 4/4.
