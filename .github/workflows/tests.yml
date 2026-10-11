@@ -37,7 +37,26 @@ jobs:
             core/target
           key: cargo-test-${{ matrix.os }}-${{ hashFiles('core/Cargo.lock') }}
 
-      - name: Install SoX (per-OS; the real-pipeline tests skip without it)
+      - name: Setup MSYS2 + SoX (Windows)
+        # MSYS2's MinGW64 SoX — the exact build the Windows artifacts bundle.
+        # choco's sox.portable shim proved unfit for the pipeline (the
+        # stdin-fed .lds cuts failed with no usable sox error text).
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-sox
+
+      - name: Export the MSYS2 SoX path (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          /mingw64/bin/sox --version
+          echo "FLAC_CHOP_SOX=$(cygpath -w /mingw64/bin/sox.exe)" >> "$GITHUB_ENV"
+
+      - name: Install SoX (Linux/macOS; the real-pipeline tests skip without it)
         shell: bash
         run: |
           set -eux
@@ -49,11 +68,8 @@ jobs:
             macOS)
               brew install sox
               ;;
-            Windows)
-              choco install sox.portable --no-progress -y
-              ;;
           esac
-          sox --version
+          if [ "${RUNNER_OS}" != "Windows" ]; then sox --version; fi
 
       - name: Build the copy-in ld-compress-ng CLI (Linux; GPU-less runner)
         # The CLI is built from the in-repo copy-in tree so the

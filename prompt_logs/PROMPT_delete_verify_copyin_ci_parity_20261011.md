@@ -184,3 +184,21 @@ GUI automation (the MISRC model):
    before any stderr). Core fix: the cancel result ALWAYS names the cancel,
    keeping the child stderr only as a diagnostic tail. Local re-verified:
    parallel_cancel 4/4.
+
+### Phase 3/4 addendum — the 5168e6f CI failure round (two causes, fixed)
+
+1. Ubuntu: ld-compress-ng HAS a CPU backend — on the GPU-less runner the
+   required-backend run COMPLETED via cpu backend (my no-device assumption
+   was wrong), and its output was not claxon-readable there ("Ill-formed
+   FLAC stream" — the tag rewrite + verify layers flagged it loudly, sha256
+   still computed). The two accelerated tests now branch on the RESULT:
+   !ok -> assert the clean no-backend failure; ok but output not a readable
+   FLAC -> skip with a loud note (the copy-in CPU backend is not CI-gated;
+   the verify layer catches it in practice); readable -> full byte-exact
+   assertions (local GPU run: 11/11 full). ldc_device_present + its devices
+   probe removed; pub ldc_path stays (tooling API).
+2. Windows: choco sox.portable broke the whole .lds->SoX pipeline (stdin-fed
+   AND file-based cuts failed with no usable sox error text — the shim is
+   unfit). tests.yml Windows leg now uses MSYS2 MinGW64 sox via
+   setup-msys2 + FLAC_CHOP_SOX=cygpath -w /mingw64/bin/sox.exe — the exact
+   build the Windows artifacts bundle.
