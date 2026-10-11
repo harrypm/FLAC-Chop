@@ -1995,13 +1995,6 @@ fn chop_lds_input(
         } else {
             ldcdet::resolve()
         };
-        if opts.lds_backend == LdsBackend::Ldc && ldc.is_none() {
-            return ChopResult {
-                ok: false,
-                exit_code: -1,
-                stderr: "packed .lds: GPU (ld-compress-ng) conversion requested but the executable was not found — place ld-compress-ng(.exe) beside the app or on PATH (FLAC_CHOP_LDC overrides)".to_string(),
-            };
-        }
         // ld-compress-ng writes a FIXED 40 kHz FLAC header (the .lds format
         // convention — `compress` has no rate option): only exactly-40-MSPS
         // captures can take the GPU path, or the output would be mislabeled
@@ -2025,6 +2018,20 @@ fn chop_lds_input(
             };
         }
         let whole_file = whole_file && rate_ok;
+        // The required-binary check follows the same rule as the rate guard:
+        // it applies only where the GPU path would actually engage
+        // (whole-file + plain + 40 MSPS). Partial cuts and processed
+        // conversions run SoX regardless of the preference — a missing
+        // binary must not error them out (CI's sox-only runner exposed the
+        // old unconditional ordering: a partial Ldc cut failed with the
+        // not-found error instead of just running SoX).
+        if whole_file && opts.lds_backend == LdsBackend::Ldc && ldc.is_none() {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: "packed .lds: GPU (ld-compress-ng) conversion requested but the executable was not found — place ld-compress-ng(.exe) beside the app or on PATH (FLAC_CHOP_LDC overrides)".to_string(),
+            };
+        }
         let mut ldc_result: Option<ChopResult> = None;
         let mut ldc_note = String::new();
         if whole_file {

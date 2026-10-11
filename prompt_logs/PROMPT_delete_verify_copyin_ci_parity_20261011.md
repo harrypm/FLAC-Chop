@@ -108,3 +108,20 @@ the checkbox + behaviour.
   rewritten (done 2026-10-11).
 - Phase-1 baseline CI on e39960e: Tests run 38120200011 SUCCESS; Build run
   38120226148 in progress at the time.
+
+### Phase 3 addendum — CI exposed a real core bug (fixed)
+
+The phase-1 baseline Build run (38120226148, e39960e) failed its
+"Real-world data tests" job (the sox-having runner in build.yml I had not
+mapped -- it also runs the .lds/FLAC/raw example-CLI probe/cut steps on
+synthetic real-format data): lds_gpu_rejected_for_non_40msps_lds +
+lds_partial_cut_stays_on_sox_even_with_ldc_backend FAILED. Root cause in
+chop_lds_input: the Ldc not-found error fired BEFORE the whole-file/rate
+guards, so (a) a partial cut with GPU selected failed "not found" instead
+of just running SoX, and (b) a non-40-MSPS whole-file cut reported
+not-found instead of the 40-MSPS constraint. Fix: the required-binary check
+now follows the rate guard's rule (whole-file + plain + 40 MSPS only).
+Verified locally BOTH ways: lds_integration 11/11 with sox only (the exact
+CI mode) and 11/11 with the GPU path. The 9cc7055 runs still carry the old
+code (their real-world job will fail; the packaging jobs still validate the
+copy-in per platform).
