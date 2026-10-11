@@ -159,7 +159,10 @@ A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
   proven bit-perfect replacement. A mismatch is a loud warning (do NOT
   delete the source). Processed conversions (rate/bit-depth changed)
   intentionally transform the samples and report a skip instead — keep the
-  source. FLAC-Chop itself never deletes sources. GUI checkbox in the
+  source. The core never deletes sources on its own; the Batch tab's opt-in
+  "Delete source after PASS verify" checkbox automates exactly that verdict —
+  a permanent delete only on a proven bit-perfect PASS (never on a skip,
+  failure, or cancel), and only while Verify output is on. GUI checkbox in the
   Output Processing box; the Batch and Sync Edit tabs carry their own verify
   checkboxes — each job's verdict shows under its "Done in …" row status
   (failed verdicts flagged) and the run summary appends

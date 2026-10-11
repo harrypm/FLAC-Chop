@@ -18,6 +18,9 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -29,6 +32,7 @@
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QThread>
+#include <QTimer>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -45,6 +49,7 @@ struct BatchResult {
     QString message; // Done: output path / Failed: reason
     qint64 elapsedMSecs = 0; // wall-clock processing time of the job
     QString verify; // the "verify: …" verdict line from the notes, if any
+    bool deletedSource = false; // opt-in delete-after-PASS removed the input
 };
 
 // Stamps the job's wall-clock processing time into `out` at EVERY exit
@@ -132,6 +137,8 @@ BatchTab::BatchTab(QWidget* parent)
     {
         QSettings s;
         m_verifyCheck->setChecked(s.value(QStringLiteral("batch/verify"), true).toBool());
+        m_deleteAfterVerifyCheck->setChecked(
+            s.value(QStringLiteral("batch/deleteAfterVerify"), false).toBool());
     }
     if (!fc_sox_available())
         m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — processing will fail."));
@@ -218,9 +225,25 @@ void BatchTab::buildUi()
     m_verifyCheck = new QCheckBox(tr("Verify output (bit-perfect, before deleting sources)"), optBox);
     m_verifyCheck->setChecked(true);
     m_verifyCheck->setToolTip(tr("After each PLAIN whole-file conversion, decode the output and compare every sample against the source. PASS proves the output is a bit-perfect replacement — safe to delete the source file. Processed conversions (rate/bit-depth changed) report a skip instead — keep the source."));
+    m_deleteAfterVerifyCheck = new QCheckBox(tr("Delete source after PASS verify"), optBox);
+    m_deleteAfterVerifyCheck->setChecked(false);
+    m_deleteAfterVerifyCheck->setToolTip(tr("After a PASS bit-perfect verdict, permanently delete that job's source file — the automated form of the \"safe to delete the source\" note. Only an exact PASS ever deletes: skipped (processed) conversions, failures, and cancels always keep the source. Requires Verify output; the delete is permanent (not the recycle bin)."));
+    // No proof → no delete: the option only exists while verify is on. Both
+    // preferences persist (batch/verify, batch/deleteAfterVerify).
+    m_deleteAfterVerifyCheck->setEnabled(m_verifyCheck->isChecked());
+    connect(m_verifyCheck, &QCheckBox::toggled, this, [this](bool on) {
+        QSettings s;
+        s.setValue(QStringLiteral("batch/verify"), on);
+        m_deleteAfterVerifyCheck->setEnabled(on);
+    });
+    connect(m_deleteAfterVerifyCheck, &QCheckBox::toggled, this, [this](bool on) {
+        QSettings s;
+        s.setValue(QStringLiteral("batch/deleteAfterVerify"), on);
+    });
     optLay->addRow(QString(), m_parallelCheck);
     optLay->addRow(QString(), m_overwriteCheck);
     optLay->addRow(QString(), m_verifyCheck);
+    optLay->addRow(QString(), m_deleteAfterVerifyCheck);
     lay->addWidget(optBox);
 
     // --- Process + progress + status ---
@@ -279,6 +302,29 @@ int BatchTab::addInputFiles(const QStringList& files)
         m_processBtn->setEnabled(true);
     }
     return added;
+}
+
+int BatchTab::automatedAddAndRun(const QStringList& files, bool autorun)
+{
+    // The CLI-->GUI load-test entry point (see MainWindow's
+    // FLAC_CHOP_GUI_BATCH_FILES hook): the exact add + process path a user
+    // drives by hand, callable from outside.
+    if (m_running)
+        return 0;
+    const int added = addInputFiles(files);
+    if (added > 0 && autorun && !m_running)
+        processQueue();
+    return added;
+}
+
+void BatchTab::setVerifyOutputOption(bool on)
+{
+    m_verifyCheck->setChecked(on);
+}
+
+void BatchTab::setDeleteAfterVerifyOption(bool on)
+{
+    m_deleteAfterVerifyCheck->setChecked(on);
 }
 
 void BatchTab::addFilesDialog()
@@ -421,6 +467,7 @@ void BatchTab::setControlsEnabled(bool enabled)
     m_parallelCheck->setEnabled(enabled);
     m_overwriteCheck->setEnabled(enabled);
     m_verifyCheck->setEnabled(enabled);
+    m_deleteAfterVerifyCheck->setEnabled(enabled && m_verifyCheck->isChecked());
     m_queue->setEnabled(enabled);
 }
 
@@ -451,6 +498,11 @@ void BatchTab::processQueue()
     const bool useFilter = (modeHz > 0) && m_filterCheck->isChecked();
     const bool overwrite = m_overwriteCheck->isChecked();
     const bool parallel = m_parallelCheck->isChecked();
+    // Delete-after-verify only exists with proof: require BOTH checkboxes
+    // (the delete box is disabled while verify is off, but a persisted
+    // stale state or a rapid toggle must never enable a proof-less delete).
+    const bool deleteAfterVerify = m_deleteAfterVerifyCheck->isChecked()
+        && m_verifyCheck->isChecked();
     const QString outDir = m_outDirEdit->text().trimmed();
 
     // Pre-resolve every job on the GUI thread: deterministic skip-existing
@@ -588,7 +640,8 @@ void BatchTab::processQueue()
             pending.push_back(PendingTask{
                 jobIndex,
                 std::async(std::launch::async,
-                           [this, job, jobIndex, mode, outBits, basic, doOverwrite, flag]() -> BatchResult {
+                           [this, job, jobIndex, mode, outBits, basic, doOverwrite,
+                            deleteAfterVerify, flag]() -> BatchResult {
                                BatchResult res;
                                const ElapsedStamp stamp{
                                    QDateTime::currentMSecsSinceEpoch(),
@@ -671,6 +724,26 @@ void BatchTab::processQueue()
                                        if (t.startsWith(QLatin1String("verify:")))
                                            res.verify = t;
                                    }
+                                   // Opt-in delete-after-PASS: only an exact
+                                   // PASS verdict (a proven bit-perfect
+                                   // replacement) ever removes the source —
+                                   // skips, failures, and cancels always keep
+                                   // it. Belt-and-braces: never remove the
+                                   // input itself (the pre-resolve already
+                                   // re-routes outputs that would be an
+                                   // input, but refuse regardless).
+                                   if (deleteAfterVerify
+                                       && res.verify.startsWith(QLatin1String("verify: PASS"))) {
+                                       const QString inCanon =
+                                           QFileInfo(job.input).absoluteFilePath();
+                                       const QString outCanon =
+                                           QFileInfo(job.output).absoluteFilePath();
+                                       if (QString::compare(inCanon, outCanon,
+                                                            Qt::CaseInsensitive) != 0
+                                           && QFile::remove(job.input)) {
+                                           res.deletedSource = true;
+                                       }
+                                   }
                                    return res;
                                }
                                const QString err = QString::fromUtf8(r.stderr_buf).trimmed();
@@ -739,7 +812,7 @@ void BatchTab::processQueue()
 
     // Final per-row statuses + summary (queue order).
     int done = 0, skipped = 0, cancelledCount = 0;
-    int verifiedPassed = 0, verifyFlagged = 0;
+    int verifiedPassed = 0, verifyFlagged = 0, deletedSources = 0;
     QStringList failed;
     for (int i = 0; i < jobs.size(); ++i) {
         const Job& job = jobs.at(i);
@@ -759,10 +832,14 @@ void BatchTab::processQueue()
                 ++verifiedPassed;
             else if (!res.verify.isEmpty())
                 ++verifyFlagged;
+            if (res.deletedSource)
+                ++deletedSources;
             QString text = tr("Done in %1 — %2")
                                .arg(formatElapsedMSecs(res.elapsedMSecs), res.message);
             if (!res.verify.isEmpty())
                 text += QLatin1Char('\n') + res.verify;
+            if (res.deletedSource)
+                text += tr("\nsource deleted (verify PASS)");
             setRowStatus(job.row, text,
                          res.verify.startsWith(QLatin1String("verify: FAILED"))
                              ? QStringLiteral("#e8a040")
@@ -793,8 +870,59 @@ void BatchTab::processQueue()
     if (verifiedPassed > 0 || verifyFlagged > 0)
         summary += tr(" Verified: %1 passed, %2 flagged.")
                        .arg(verifiedPassed).arg(verifyFlagged);
+    if (deletedSources > 0)
+        summary += tr(" Deleted %1 source(s) after PASS.").arg(deletedSources);
     m_statusLabel->setText(summary);
-    if (!failed.isEmpty())
+
+    // Automation report (CLI-->GUI load testing): a machine-readable record
+    // of this run for the parity harness. Written by ANY batch run (manual
+    // clicks included) when FLAC_CHOP_GUI_TEST_OUT is set; setting
+    // FLAC_CHOP_GUI_TEST_QUIT exits the app right after (automated runs
+    // must terminate themselves).
+    {
+        const QByteArray reportPath = qgetenv("FLAC_CHOP_GUI_TEST_OUT");
+        if (!reportPath.isEmpty()) {
+            QJsonArray arr;
+            for (int i = 0; i < jobs.size(); ++i) {
+                const Job& job = jobs.at(i);
+                QJsonObject o;
+                o.insert(QStringLiteral("input"), job.input);
+                o.insert(QStringLiteral("output"), job.output);
+                o.insert(QStringLiteral("source_exists"), QFile::exists(job.input));
+                if (job.skip) {
+                    o.insert(QStringLiteral("status"), QStringLiteral("skipped"));
+                    o.insert(QStringLiteral("skip_reason"), job.skipReason);
+                } else if (!resultReady[static_cast<size_t>(i)]) {
+                    o.insert(QStringLiteral("status"),
+                             QStringLiteral("cancelled_not_started"));
+                } else {
+                    const BatchResult& res = orderedResults[static_cast<size_t>(i)];
+                    o.insert(QStringLiteral("status"),
+                             res.cancelled ? QStringLiteral("cancelled")
+                                           : (res.ok ? QStringLiteral("ok")
+                                                     : QStringLiteral("failed")));
+                    o.insert(QStringLiteral("verify"), res.verify);
+                    o.insert(QStringLiteral("deleted_source"), res.deletedSource);
+                    o.insert(QStringLiteral("elapsed_ms"), double(res.elapsedMSecs));
+                    if (!res.ok && !res.cancelled)
+                        o.insert(QStringLiteral("error"), res.message);
+                }
+                arr.append(o);
+            }
+            QJsonObject root;
+            root.insert(QStringLiteral("jobs"), arr);
+            root.insert(QStringLiteral("summary"), summary);
+            root.insert(QStringLiteral("deleted_sources"), deletedSources);
+            QFile f(QString::fromLocal8Bit(reportPath));
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+            if (qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST_QUIT"))
+                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+        }
+    }
+    // The failure popup is interactive-only: an automated run (report set)
+    // must never block on a modal box.
+    if (!failed.isEmpty() && qgetenv("FLAC_CHOP_GUI_TEST_OUT").isEmpty())
         QMessageBox::warning(this, tr("Batch completed with errors"),
                              tr("Failed to process:\n%1")
                                  .arg(failed.join(QLatin1Char('\n'))));

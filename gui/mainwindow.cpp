@@ -600,6 +600,37 @@ MainWindow::MainWindow(QWidget* parent)
         }
     }
 
+    // CLI-->GUI load testing (the MISRC automated-GUI model): queue a batch
+    // from FLAC_CHOP_GUI_BATCH_FILES (";"-separated paths) and, with
+    // FLAC_CHOP_GUI_BATCH_RUN set, run it automatically. Any batch run
+    // writes a JSON report to FLAC_CHOP_GUI_TEST_OUT when that is set (see
+    // BatchTab::processQueue), and FLAC_CHOP_GUI_TEST_QUIT exits the app
+    // after the run — the parity harness drives the GUI end to end.
+    {
+        const QByteArray batchFiles = qgetenv("FLAC_CHOP_GUI_BATCH_FILES");
+        if (!batchFiles.isEmpty()) {
+            const QStringList files = QString::fromLocal8Bit(batchFiles)
+                .split(QLatin1Char(';'), Qt::SkipEmptyParts);
+            const bool autorun = qEnvironmentVariableIsSet("FLAC_CHOP_GUI_BATCH_RUN");
+            // Optional option overrides ("0"/"1"), applied exactly like a
+            // user click before the run: FLAC_CHOP_GUI_BATCH_VERIFY and
+            // FLAC_CHOP_GUI_BATCH_DELETE.
+            const QByteArray verifyOpt = qgetenv("FLAC_CHOP_GUI_BATCH_VERIFY");
+            const QByteArray deleteOpt = qgetenv("FLAC_CHOP_GUI_BATCH_DELETE");
+            QTimer::singleShot(1500, this, [this, files, autorun, verifyOpt, deleteOpt]() {
+                if (verifyOpt == QByteArrayLiteral("0"))
+                    m_batchTab->setVerifyOutputOption(false);
+                else if (verifyOpt == QByteArrayLiteral("1"))
+                    m_batchTab->setVerifyOutputOption(true);
+                if (deleteOpt == QByteArrayLiteral("0"))
+                    m_batchTab->setDeleteAfterVerifyOption(false);
+                else if (deleteOpt == QByteArrayLiteral("1"))
+                    m_batchTab->setDeleteAfterVerifyOption(true);
+                m_batchTab->automatedAddAndRun(files, autorun);
+            });
+        }
+    }
+
     maybeCheckForUpdates();
 }
 

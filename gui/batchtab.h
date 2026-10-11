@@ -57,6 +57,17 @@ public:
     // added. Refused while a batch run is in flight.
     int addInputFiles(const QStringList& files);
 
+    // Automation hook (CLI-->GUI load testing, the MISRC automated-GUI
+    // model): queue `files` and, when `autorun`, start the batch
+    // immediately. Returns how many were newly added. Refused while a
+    // batch run is in flight.
+    int automatedAddAndRun(const QStringList& files, bool autorun);
+
+    // Automation accessors: drive the option checkboxes exactly as a user
+    // click would (setChecked fires the same toggled persists + linkage).
+    void setVerifyOutputOption(bool on);
+    void setDeleteAfterVerifyOption(bool on);
+
     bool isBusy() const { return m_running; }
 
 private slots:
@@ -100,6 +111,7 @@ private:
     QCheckBox* m_parallelCheck = nullptr;
     QCheckBox* m_overwriteCheck = nullptr;
     QCheckBox* m_verifyCheck = nullptr;   // bit-perfect output verification
+    QCheckBox* m_deleteAfterVerifyCheck = nullptr; // opt-in source delete on PASS
     QPushButton* m_addBtn = nullptr;
     QPushButton* m_removeBtn = nullptr;
     QPushButton* m_clearBtn = nullptr;

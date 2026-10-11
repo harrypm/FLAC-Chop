@@ -72,8 +72,10 @@ verdict line in its row status, flag FAILED verdicts, and count
   the samples: they report an explicit skip (`verify: skipped — … keep the
   source`), NOT a pass. FLAC/Ogg-FLAC sources are lossless cuts by
   construction and get no note.
-- **FLAC-Chop never deletes sources itself.** The PASS note is the green
-  light for the user's own deletion workflow.
+- **The core never deletes sources itself.** The PASS note is the green light
+  for deletion — the user's own workflow, or the Batch tab's opt-in "Delete
+  source after PASS verify" checkbox (permanent delete, only on an exact PASS
+  verdict, requires Verify on; skip/FAIL/cancel always keep the source).
 
 ## Windows port of ld-compress-ng (in the local clone)
 
