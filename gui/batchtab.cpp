@@ -579,9 +579,65 @@ void BatchTab::processQueue()
     for (int i = 0; i < jobs.size(); ++i)
         if (!jobs.at(i).skip)
             launchOrder.append(i);
+
+    // Per-run automation report (CLI-->GUI load testing): a machine-readable
+    // record of this batch for the parity harness, written by ANY batch run
+    // (manual clicks included) when FLAC_CHOP_GUI_TEST_OUT is set; setting
+    // FLAC_CHOP_GUI_TEST_QUIT exits the app right after. Both exit paths
+    // write it — including the all-skipped early return below, or an
+    // automated run whose every job skips would hang forever.
+    std::vector<BatchResult> orderedResults(static_cast<size_t>(jobs.size()));
+    std::vector<bool> resultReady(static_cast<size_t>(jobs.size()), false);
+    auto writeAutomationReport =
+        [this, &jobs, &orderedResults, &resultReady](const QString& summaryIn,
+                                                     int deletedSourcesIn) {
+            const QByteArray reportPath = qgetenv("FLAC_CHOP_GUI_TEST_OUT");
+            if (reportPath.isEmpty())
+                return;
+            QJsonArray arr;
+            for (int i = 0; i < jobs.size(); ++i) {
+                const Job& job = jobs.at(i);
+                QJsonObject o;
+                o.insert(QStringLiteral("input"), job.input);
+                o.insert(QStringLiteral("output"), job.output);
+                o.insert(QStringLiteral("source_exists"), QFile::exists(job.input));
+                if (job.skip) {
+                    o.insert(QStringLiteral("status"), QStringLiteral("skipped"));
+                    o.insert(QStringLiteral("skip_reason"), job.skipReason);
+                } else if (!resultReady[static_cast<size_t>(i)]) {
+                    o.insert(QStringLiteral("status"),
+                             QStringLiteral("cancelled_not_started"));
+                } else {
+                    const BatchResult& res = orderedResults[static_cast<size_t>(i)];
+                    o.insert(QStringLiteral("status"),
+                             res.cancelled ? QStringLiteral("cancelled")
+                                           : (res.ok ? QStringLiteral("ok")
+                                                     : QStringLiteral("failed")));
+                    o.insert(QStringLiteral("verify"), res.verify);
+                    o.insert(QStringLiteral("deleted_source"), res.deletedSource);
+                    o.insert(QStringLiteral("elapsed_ms"), double(res.elapsedMSecs));
+                    if (!res.ok && !res.cancelled)
+                        o.insert(QStringLiteral("error"), res.message);
+                }
+                arr.append(o);
+            }
+            QJsonObject root;
+            root.insert(QStringLiteral("jobs"), arr);
+            root.insert(QStringLiteral("summary"), summaryIn);
+            root.insert(QStringLiteral("deleted_sources"), deletedSourcesIn);
+            QFile f(QString::fromLocal8Bit(reportPath));
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+            if (qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST_QUIT"))
+                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+        };
+
     const int total = launchOrder.size();
     if (total == 0) {
-        m_statusLabel->setText(tr("Nothing to process — every queued file was skipped."));
+        const QString skipSummary =
+            tr("Nothing to process — every queued file was skipped.");
+        m_statusLabel->setText(skipSummary);
+        writeAutomationReport(skipSummary, 0);
         return;
     }
 
@@ -615,8 +671,6 @@ void BatchTab::processQueue()
         std::future<BatchResult> future;
     };
     std::vector<PendingTask> pending;
-    std::vector<BatchResult> orderedResults(static_cast<size_t>(jobs.size()));
-    std::vector<bool> resultReady(static_cast<size_t>(jobs.size()), false);
     int launched = 0;
     int completed = 0;
 
@@ -874,52 +928,8 @@ void BatchTab::processQueue()
         summary += tr(" Deleted %1 source(s) after PASS.").arg(deletedSources);
     m_statusLabel->setText(summary);
 
-    // Automation report (CLI-->GUI load testing): a machine-readable record
-    // of this run for the parity harness. Written by ANY batch run (manual
-    // clicks included) when FLAC_CHOP_GUI_TEST_OUT is set; setting
-    // FLAC_CHOP_GUI_TEST_QUIT exits the app right after (automated runs
-    // must terminate themselves).
-    {
-        const QByteArray reportPath = qgetenv("FLAC_CHOP_GUI_TEST_OUT");
-        if (!reportPath.isEmpty()) {
-            QJsonArray arr;
-            for (int i = 0; i < jobs.size(); ++i) {
-                const Job& job = jobs.at(i);
-                QJsonObject o;
-                o.insert(QStringLiteral("input"), job.input);
-                o.insert(QStringLiteral("output"), job.output);
-                o.insert(QStringLiteral("source_exists"), QFile::exists(job.input));
-                if (job.skip) {
-                    o.insert(QStringLiteral("status"), QStringLiteral("skipped"));
-                    o.insert(QStringLiteral("skip_reason"), job.skipReason);
-                } else if (!resultReady[static_cast<size_t>(i)]) {
-                    o.insert(QStringLiteral("status"),
-                             QStringLiteral("cancelled_not_started"));
-                } else {
-                    const BatchResult& res = orderedResults[static_cast<size_t>(i)];
-                    o.insert(QStringLiteral("status"),
-                             res.cancelled ? QStringLiteral("cancelled")
-                                           : (res.ok ? QStringLiteral("ok")
-                                                     : QStringLiteral("failed")));
-                    o.insert(QStringLiteral("verify"), res.verify);
-                    o.insert(QStringLiteral("deleted_source"), res.deletedSource);
-                    o.insert(QStringLiteral("elapsed_ms"), double(res.elapsedMSecs));
-                    if (!res.ok && !res.cancelled)
-                        o.insert(QStringLiteral("error"), res.message);
-                }
-                arr.append(o);
-            }
-            QJsonObject root;
-            root.insert(QStringLiteral("jobs"), arr);
-            root.insert(QStringLiteral("summary"), summary);
-            root.insert(QStringLiteral("deleted_sources"), deletedSources);
-            QFile f(QString::fromLocal8Bit(reportPath));
-            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
-                f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-            if (qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST_QUIT"))
-                QTimer::singleShot(0, qApp, &QCoreApplication::quit);
-        }
-    }
+    writeAutomationReport(summary, deletedSources);
+
     // The failure popup is interactive-only: an automated run (report set)
     // must never block on a modal box.
     if (!failed.isEmpty() && qgetenv("FLAC_CHOP_GUI_TEST_OUT").isEmpty())

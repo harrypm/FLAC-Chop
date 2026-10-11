@@ -5,6 +5,9 @@
 # Rust / cargo build output
 /core/target/
 
+# In-tree builds of the copy-in ld-compress-ng subproject
+/ld-compress-ng/build*/
+
 # CI / AppImage packaging scratch (produced by .github/workflows/build.yml)
 /AppDir/
 /dist/

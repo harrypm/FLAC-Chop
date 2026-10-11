@@ -182,3 +182,14 @@ endif()
 
 # Make sure the Rust lib is (re)built before we link against it.
 add_dependencies(flac-chop flac_chop_core)
+
+# Copy the copy-in ld-compress-ng CLI beside the GUI exe (dev builds): the
+# Rust core's ldcdet resolves it beside the app exe, so the accelerated
+# whole-file path works straight from the build tree. Dist bundling copies
+# from here too. No-op when the subproject is disabled (-DFLAC_CHOP_BUILD_LDC=OFF).
+if(FLAC_CHOP_BUILD_LDC AND TARGET ld-compress-ng)
+    add_custom_command(TARGET flac-chop POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_FILE:ld-compress-ng>
+            $<TARGET_FILE_DIR:flac-chop>/$<TARGET_FILE_NAME:ld-compress-ng>)
+endif()

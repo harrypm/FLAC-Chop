@@ -37,6 +37,40 @@ jobs:
             core/target
           key: cargo-test-${{ matrix.os }}-${{ hashFiles('core/Cargo.lock') }}
 
+      - name: Install SoX (per-OS; the real-pipeline tests skip without it)
+        shell: bash
+        run: |
+          set -eux
+          case "${RUNNER_OS}" in
+            Linux)
+              sudo apt-get update
+              sudo apt-get install -y sox libsox-fmt-all
+              ;;
+            macOS)
+              brew install sox
+              ;;
+            Windows)
+              choco install sox --no-progress -y
+              ;;
+          esac
+          sox --version
+
+      - name: Build the copy-in ld-compress-ng CLI (Linux; GPU-less runner)
+        # The CLI is built from the in-repo copy-in tree so the
+        # accelerated-path tests exercise the real binary: the not-found
+        # errors and the Auto->SoX fallback. The runner has no GPU, so the
+        # required-backend tests assert the clean no-device failure and skip
+        # the byte-exact assertions (lds_integration.rs ldc_device_present).
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get install -y cmake ninja-build pkg-config libflac-dev \
+            libogg-dev glslang-tools libvulkan-dev ocl-icd-opencl-dev
+          cmake -S ld-compress-ng -B build-ldc -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build-ldc
+          ./build-ldc/ld-compress-ng --version
+          echo "FLAC_CHOP_LDC=$GITHUB_WORKSPACE/build-ldc/ld-compress-ng" >> "$GITHUB_ENV"
+
       - name: Run cargo test
         run: cargo test --release --manifest-path core/Cargo.toml
 

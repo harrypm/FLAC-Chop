@@ -1,0 +1,1906 @@
+/*
+ * Portions adapted from CUETools.FLACCL-compatible mono analysis kernels.
+ * Copyright (c) 2010-2022 Gregory S. Chudov
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * Local modifications for ld-compress-ng, 2026-07-07:
+ * - Ported the mono task ABI and analysis flow to Vulkan GLSL compute.
+ * - Uses workgroup reductions for generated LPC and exact Rice analysis.
+ * - Writes selected task and Rice-parameter sidecar data for the native writer.
+ * - Reuses exact Rice leaf-partition sums for low partition-order searches.
+ */
+
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+// The generated-LPC stages do not need the exact Rice analyzer's large
+// workgroup scratch. CMake builds a second SPIR-V module with this set so the
+// autocorrelation workgroups can run at normal occupancy.
+#ifndef LDCOMPRESS_VULKAN_LOW_SCRATCH
+#define LDCOMPRESS_VULKAN_LOW_SCRATCH 0
+#endif
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+const uint kWorkgroupSize = 64u;
+const uint kMaxLpcOrder = 32u;
+const uint kModeAnalyzeExact = 0u;
+const uint kModeChooseBest = 1u;
+const uint kModePrepareFrames = 2u;
+const uint kModeComputeAutocorrelation = 3u;
+const uint kModeComputeLpc = 4u;
+const uint kModeQuantizeLpc = 5u;
+const uint kModeWriteBestRiceParameters = 6u;
+const uint kModePruneFixedOrderGuess = 7u;
+const uint kAnalysisProfileExact = 0u;
+const uint kAnalysisProfileOrderGuessExactRice = 1u;
+const uint kAnalysisProfileOrderGuessMeanRice = 2u;
+const uint kAnalysisProfileSubdivideTukey3MeanRice = 3u;
+const uint kAnalysisProfileOrderGuessMeanEstimateRice = 4u;
+const uint kAnalysisProfileSubdivideTukey3MeanEstimateRice = 5u;
+const int kSubframeConstant = 0;
+const int kSubframeVerbatim = 1;
+const int kSubframeFixed = 8;
+const int kSubframeLpc = 32;
+const int kIntMax = 2147483647;
+const uint kMaxRiceParameter = 14u;
+const uint kRiceParameterCount = kMaxRiceParameter + 1u;
+const uint kMaxRicePartitionCount = 256u;
+const uint kExactLeafMaxRicePartitionOrder = 6u;
+const uint kExactLeafMaxPartitionCount = 1u << kExactLeafMaxRicePartitionOrder;
+
+struct FlacClSubframeData {
+    int residualOrder;
+    int samplesOffs;
+    int shift;
+    int cbits;
+    int size;
+    int type;
+    int obits;
+    int blocksize;
+    int coding_method;
+    int channel;
+    int residualOffs;
+    int wbits;
+    int abits;
+    int porder;
+    int headerLen;
+    int encodingOffset;
+};
+
+struct FlacClSubframeTask {
+    FlacClSubframeData data;
+    int coefs[32];
+};
+
+struct RicePartitionCost {
+    uint64_t bits;
+    uint parameter;
+};
+
+struct MeanRicePartitionCost {
+    uint64_t exact_bits;
+    uint64_t estimated_bits;
+    uint parameter;
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Samples {
+    int samples[];
+};
+
+layout(std430, set = 0, binding = 1) buffer Tasks {
+    FlacClSubframeTask tasks[];
+};
+
+layout(std430, set = 0, binding = 2) readonly buffer SelectedTasks {
+    int selected_tasks[];
+};
+
+layout(std430, set = 0, binding = 3) buffer BestTasks {
+    FlacClSubframeTask best_tasks[];
+};
+
+layout(std430, set = 0, binding = 4) readonly buffer Windows {
+    float windows[];
+};
+
+layout(std430, set = 0, binding = 5) buffer Autocorrelations {
+    float autocorrelations[];
+};
+
+layout(std430, set = 0, binding = 6) buffer Lpcs {
+    float lpcs[];
+};
+
+layout(std430, set = 0, binding = 7) buffer RiceParameters {
+    uint rice_parameters[];
+};
+
+layout(std430, set = 0, binding = 8) buffer ShiftedSamples {
+    int shifted_samples[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint mode;
+    uint task_count;
+    uint frame_count;
+    uint selected_tasks_per_frame;
+    uint residual_tasks_per_frame;
+    uint max_rice_partition_order;
+    uint lpc_coefficient_precision;
+    uint lpc_tasks_per_window;
+    uint total_lpc_tasks;
+    uint generated_window_count;
+    uint max_lpc_order;
+    uint analysis_profile;
+    uint use_shifted_samples;
+} pc;
+
+shared int shared_ints[64];
+shared uint shared_uints[64];
+#if !LDCOMPRESS_VULKAN_LOW_SCRATCH
+shared uint64_t shared_u64s[64];
+shared uint shared_rice_parameters[kMaxRicePartitionCount];
+shared uint64_t shared_leaf_abs_sums[kExactLeafMaxPartitionCount];
+shared uint64_t shared_leaf_rice_sums[kExactLeafMaxPartitionCount * kRiceParameterCount];
+#endif
+shared float shared_floats[64];
+
+uint bit_width_u32(uint value)
+{
+    uint bits = 0u;
+    while (value != 0u) {
+        value >>= 1u;
+        ++bits;
+    }
+    return bits;
+}
+
+int sample_trailing_zero_bits(int smp, int bits_per_sample)
+{
+    if (smp == 0) {
+        return bits_per_sample;
+    }
+
+    const uint mask = bits_per_sample >= 32
+        ? 0xffffffffu
+        : ((1u << uint(bits_per_sample)) - 1u);
+    uint raw = uint(smp) & mask;
+    int zeros = 0;
+    while (zeros < bits_per_sample && (raw & 1u) == 0u) {
+        raw >>= 1u;
+        ++zeros;
+    }
+    return zeros;
+}
+
+int common_wasted_bits(FlacClSubframeTask task)
+{
+    int wasted_bits = task.data.obits;
+    for (int i = 0; i < task.data.blocksize; ++i) {
+        wasted_bits = min(
+            wasted_bits,
+            sample_trailing_zero_bits(samples[task.data.samplesOffs + i], task.data.obits));
+        if (wasted_bits == 0) {
+            return 0;
+        }
+    }
+    return min(wasted_bits, task.data.obits - 1);
+}
+
+int reduce_min_i32(int value)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    shared_ints[lane] = value;
+    barrier();
+    for (uint stride = kWorkgroupSize >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            shared_ints[lane] = min(shared_ints[lane], shared_ints[lane + stride]);
+        }
+        barrier();
+    }
+    return shared_ints[0];
+}
+
+uint reduce_or_u32(uint value)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    shared_uints[lane] = value;
+    barrier();
+    for (uint stride = kWorkgroupSize >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            shared_uints[lane] |= shared_uints[lane + stride];
+        }
+        barrier();
+    }
+    return shared_uints[0];
+}
+
+#if !LDCOMPRESS_VULKAN_LOW_SCRATCH
+uint64_t reduce_sum_u64(uint64_t value)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    shared_u64s[lane] = value;
+    barrier();
+    for (uint stride = kWorkgroupSize >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            shared_u64s[lane] += shared_u64s[lane + stride];
+        }
+        barrier();
+    }
+    return shared_u64s[0];
+}
+#endif
+
+float reduce_sum_float(float value)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    shared_floats[lane] = value;
+    barrier();
+    for (uint stride = kWorkgroupSize >> 1u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            shared_floats[lane] += shared_floats[lane + stride];
+        }
+        barrier();
+    }
+    return shared_floats[0];
+}
+
+int cooperative_common_wasted_bits(FlacClSubframeTask task)
+{
+    int wasted_bits = task.data.obits;
+    for (uint i = gl_LocalInvocationID.x; i < uint(task.data.blocksize); i += kWorkgroupSize) {
+        wasted_bits = min(
+            wasted_bits,
+            sample_trailing_zero_bits(samples[task.data.samplesOffs + int(i)], task.data.obits));
+    }
+    return min(reduce_min_i32(wasted_bits), task.data.obits - 1);
+}
+
+int frame_amplitude_bits(FlacClSubframeTask task, int wasted_bits)
+{
+    uint amplitude_or = 0u;
+    for (int i = 0; i < task.data.blocksize; ++i) {
+        const int smp = samples[task.data.samplesOffs + i];
+        amplitude_or |= uint(smp ^ (smp >> 31));
+    }
+
+    if (amplitude_or == 0u) {
+        return 1;
+    }
+
+    const int bits = int(bit_width_u32(amplitude_or));
+    return max(1, bits - wasted_bits);
+}
+
+int cooperative_frame_amplitude_bits(FlacClSubframeTask task, int wasted_bits)
+{
+    uint amplitude_or = 0u;
+    for (uint i = gl_LocalInvocationID.x; i < uint(task.data.blocksize); i += kWorkgroupSize) {
+        const int smp = samples[task.data.samplesOffs + int(i)];
+        amplitude_or |= uint(smp ^ (smp >> 31));
+    }
+
+    const uint reduced_or = reduce_or_u32(amplitude_or);
+    if (reduced_or == 0u) {
+        return 1;
+    }
+
+    const int bits = int(bit_width_u32(reduced_or));
+    return max(1, bits - wasted_bits);
+}
+
+uint task_rice_parameter_base(uint task_index)
+{
+    return (pc.frame_count + task_index) * kMaxRicePartitionCount;
+}
+
+uint best_rice_parameter_base(uint frame)
+{
+    return frame * kMaxRicePartitionCount;
+}
+
+void clear_task_rice_parameters(uint task_index)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint output_base = task_rice_parameter_base(task_index);
+    for (uint i = lane; i < kMaxRicePartitionCount; i += kWorkgroupSize) {
+        rice_parameters[output_base + i] = 0u;
+    }
+    memoryBarrierBuffer();
+    barrier();
+}
+
+void prepare_frame(uint frame)
+{
+    const uint task_base = frame * pc.residual_tasks_per_frame;
+    FlacClSubframeTask first_task = tasks[task_base];
+    const int wasted_bits = cooperative_common_wasted_bits(first_task);
+    const int amplitude_bits = cooperative_frame_amplitude_bits(first_task, wasted_bits);
+
+    for (uint i = gl_LocalInvocationID.x; i < pc.residual_tasks_per_frame; i += kWorkgroupSize) {
+        FlacClSubframeTask task = tasks[task_base + i];
+        task.data.wbits = wasted_bits;
+        task.data.abits = amplitude_bits;
+        tasks[task_base + i] = task;
+    }
+    if (pc.use_shifted_samples != 0u) {
+        for (uint pos = gl_LocalInvocationID.x;
+             pos < uint(first_task.data.blocksize);
+             pos += kWorkgroupSize) {
+            const int smp = samples[first_task.data.samplesOffs + int(pos)];
+            shifted_samples[first_task.data.samplesOffs + int(pos)] =
+                wasted_bits == 0 ? smp : smp / (1 << wasted_bits);
+        }
+    }
+}
+
+bool all_frame_samples_equal(FlacClSubframeTask task)
+{
+    const int first = samples[task.data.samplesOffs];
+    for (int i = 1; i < task.data.blocksize; ++i) {
+        if (samples[task.data.samplesOffs + i] != first) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cooperative_all_frame_samples_equal(FlacClSubframeTask task)
+{
+    const int first = samples[task.data.samplesOffs];
+    uint mismatch = 0u;
+    for (uint i = gl_LocalInvocationID.x + 1u;
+         i < uint(task.data.blocksize);
+         i += kWorkgroupSize) {
+        if (samples[task.data.samplesOffs + int(i)] != first) {
+            mismatch = 1u;
+        }
+    }
+    return reduce_or_u32(mismatch) == 0u;
+}
+
+int shifted_sample(int samples_offset, int index, int wasted_bits)
+{
+    const int smp = samples[samples_offset + index];
+    if (wasted_bits == 0) {
+        return smp;
+    }
+    return smp / (1 << wasted_bits);
+}
+
+void compute_generated_autocorrelation(uint frame, uint window, uint lag)
+{
+    const uint task_base = frame * pc.residual_tasks_per_frame;
+    FlacClSubframeTask task = tasks[task_base];
+    const uint block_size = uint(task.data.blocksize);
+    const uint window_offset = window * block_size;
+    float sum = 0.0f;
+
+    if (pc.use_shifted_samples != 0u) {
+        for (uint pos = lag + gl_LocalInvocationID.x; pos < block_size; pos += kWorkgroupSize) {
+            const float sample0 =
+                float(shifted_samples[task.data.samplesOffs + int(pos)]) *
+                windows[window_offset + pos];
+            const float sample1 =
+                float(shifted_samples[task.data.samplesOffs + int(pos - lag)]) *
+                windows[window_offset + pos - lag];
+            sum += sample0 * sample1;
+        }
+    } else {
+        for (uint pos = lag + gl_LocalInvocationID.x; pos < block_size; pos += kWorkgroupSize) {
+            const float sample0 =
+                float(shifted_sample(task.data.samplesOffs, int(pos), task.data.wbits)) *
+                windows[window_offset + pos];
+            const float sample1 =
+                float(shifted_sample(task.data.samplesOffs, int(pos - lag), task.data.wbits)) *
+                windows[window_offset + pos - lag];
+            sum += sample0 * sample1;
+        }
+    }
+
+    const uint output_offset =
+        ((frame * pc.generated_window_count + window) * (kMaxLpcOrder + 1u)) + lag;
+    const float total = reduce_sum_float(sum);
+    if (gl_LocalInvocationID.x == 0u) {
+        autocorrelations[output_offset] = total;
+    }
+}
+
+#if !LDCOMPRESS_VULKAN_LOW_SCRATCH
+int64_t fixed_residual(FlacClSubframeTask task, int index, int wasted_bits)
+{
+    const int offset = task.data.samplesOffs;
+    switch (task.data.residualOrder) {
+    case 0:
+        return int64_t(shifted_sample(offset, index, wasted_bits));
+    case 1:
+        return int64_t(shifted_sample(offset, index, wasted_bits)) -
+            int64_t(shifted_sample(offset, index - 1, wasted_bits));
+    case 2:
+        return int64_t(shifted_sample(offset, index, wasted_bits)) -
+            (int64_t(2) * int64_t(shifted_sample(offset, index - 1, wasted_bits))) +
+            int64_t(shifted_sample(offset, index - 2, wasted_bits));
+    case 3:
+        return int64_t(shifted_sample(offset, index, wasted_bits)) -
+            (int64_t(3) * int64_t(shifted_sample(offset, index - 1, wasted_bits))) +
+            (int64_t(3) * int64_t(shifted_sample(offset, index - 2, wasted_bits))) -
+            int64_t(shifted_sample(offset, index - 3, wasted_bits));
+    default:
+        return int64_t(shifted_sample(offset, index, wasted_bits)) -
+            (int64_t(4) * int64_t(shifted_sample(offset, index - 1, wasted_bits))) +
+            (int64_t(6) * int64_t(shifted_sample(offset, index - 2, wasted_bits))) -
+            (int64_t(4) * int64_t(shifted_sample(offset, index - 3, wasted_bits))) +
+            int64_t(shifted_sample(offset, index - 4, wasted_bits));
+    }
+}
+
+int64_t arithmetic_shift_right(int64_t value, int shift)
+{
+    if (shift == 0) {
+        return value;
+    }
+    if (value >= int64_t(0)) {
+        return value >> shift;
+    }
+    const int64_t divisor = int64_t(1) << shift;
+    return -(((-value) + divisor - int64_t(1)) >> shift);
+}
+
+int64_t lpc_residual(FlacClSubframeTask task, int index, int wasted_bits)
+{
+    const int order = task.data.residualOrder;
+    int64_t sum = int64_t(0);
+    for (int i = 0; i < order; ++i) {
+        sum += int64_t(task.coefs[i]) *
+            int64_t(shifted_sample(task.data.samplesOffs, index - order + i, wasted_bits));
+    }
+    const int64_t predicted = arithmetic_shift_right(sum, task.data.shift);
+    return int64_t(shifted_sample(task.data.samplesOffs, index, wasted_bits)) - predicted;
+}
+
+int64_t fixed_residual_shifted(FlacClSubframeTask task, int index)
+{
+    const int offset = task.data.samplesOffs;
+    switch (task.data.residualOrder) {
+    case 0:
+        return int64_t(shifted_samples[offset + index]);
+    case 1:
+        return int64_t(shifted_samples[offset + index]) -
+            int64_t(shifted_samples[offset + index - 1]);
+    case 2:
+        return int64_t(shifted_samples[offset + index]) -
+            (int64_t(2) * int64_t(shifted_samples[offset + index - 1])) +
+            int64_t(shifted_samples[offset + index - 2]);
+    case 3:
+        return int64_t(shifted_samples[offset + index]) -
+            (int64_t(3) * int64_t(shifted_samples[offset + index - 1])) +
+            (int64_t(3) * int64_t(shifted_samples[offset + index - 2])) -
+            int64_t(shifted_samples[offset + index - 3]);
+    default:
+        return int64_t(shifted_samples[offset + index]) -
+            (int64_t(4) * int64_t(shifted_samples[offset + index - 1])) +
+            (int64_t(6) * int64_t(shifted_samples[offset + index - 2])) -
+            (int64_t(4) * int64_t(shifted_samples[offset + index - 3])) +
+            int64_t(shifted_samples[offset + index - 4]);
+    }
+}
+
+int64_t lpc_residual_shifted_i64(FlacClSubframeTask task, int index)
+{
+    const int order = task.data.residualOrder;
+    int64_t sum = int64_t(0);
+    for (int i = 0; i < order; ++i) {
+        sum += int64_t(task.coefs[i]) *
+            int64_t(shifted_samples[task.data.samplesOffs + index - order + i]);
+    }
+    const int64_t predicted = arithmetic_shift_right(sum, task.data.shift);
+    return int64_t(shifted_samples[task.data.samplesOffs + index]) - predicted;
+}
+
+bool shifted_lpc_residual_fits_i32(FlacClSubframeTask task)
+{
+    if (task.data.type != kSubframeLpc || task.data.abits <= 0 || task.data.abits >= 31) {
+        return false;
+    }
+    uint64_t coefficient_abs_sum = uint64_t(0);
+    for (int i = 0; i < task.data.residualOrder; ++i) {
+        const int coefficient = task.coefs[i];
+        coefficient_abs_sum += coefficient >= 0
+            ? uint64_t(coefficient)
+            : uint64_t(-(coefficient + 1)) + uint64_t(1);
+    }
+    const uint64_t max_sample = uint64_t(1) << uint(task.data.abits);
+    return coefficient_abs_sum <=
+        (uint64_t(kIntMax) - max_sample) / max_sample;
+}
+
+int lpc_residual_shifted_i32(FlacClSubframeTask task, int index)
+{
+    const int offset = task.data.samplesOffs;
+    const int order = task.data.residualOrder;
+    if (order == 12) {
+        int sum = task.coefs[0] * shifted_samples[offset + index - 12];
+        sum += task.coefs[1] * shifted_samples[offset + index - 11];
+        sum += task.coefs[2] * shifted_samples[offset + index - 10];
+        sum += task.coefs[3] * shifted_samples[offset + index - 9];
+        sum += task.coefs[4] * shifted_samples[offset + index - 8];
+        sum += task.coefs[5] * shifted_samples[offset + index - 7];
+        sum += task.coefs[6] * shifted_samples[offset + index - 6];
+        sum += task.coefs[7] * shifted_samples[offset + index - 5];
+        sum += task.coefs[8] * shifted_samples[offset + index - 4];
+        sum += task.coefs[9] * shifted_samples[offset + index - 3];
+        sum += task.coefs[10] * shifted_samples[offset + index - 2];
+        sum += task.coefs[11] * shifted_samples[offset + index - 1];
+        return shifted_samples[offset + index] -
+            int(arithmetic_shift_right(int64_t(sum), task.data.shift));
+    }
+    if (order == 11) {
+        int sum = task.coefs[0] * shifted_samples[offset + index - 11];
+        sum += task.coefs[1] * shifted_samples[offset + index - 10];
+        sum += task.coefs[2] * shifted_samples[offset + index - 9];
+        sum += task.coefs[3] * shifted_samples[offset + index - 8];
+        sum += task.coefs[4] * shifted_samples[offset + index - 7];
+        sum += task.coefs[5] * shifted_samples[offset + index - 6];
+        sum += task.coefs[6] * shifted_samples[offset + index - 5];
+        sum += task.coefs[7] * shifted_samples[offset + index - 4];
+        sum += task.coefs[8] * shifted_samples[offset + index - 3];
+        sum += task.coefs[9] * shifted_samples[offset + index - 2];
+        sum += task.coefs[10] * shifted_samples[offset + index - 1];
+        return shifted_samples[offset + index] -
+            int(arithmetic_shift_right(int64_t(sum), task.data.shift));
+    }
+    if (order == 10) {
+        int sum = task.coefs[0] * shifted_samples[offset + index - 10];
+        sum += task.coefs[1] * shifted_samples[offset + index - 9];
+        sum += task.coefs[2] * shifted_samples[offset + index - 8];
+        sum += task.coefs[3] * shifted_samples[offset + index - 7];
+        sum += task.coefs[4] * shifted_samples[offset + index - 6];
+        sum += task.coefs[5] * shifted_samples[offset + index - 5];
+        sum += task.coefs[6] * shifted_samples[offset + index - 4];
+        sum += task.coefs[7] * shifted_samples[offset + index - 3];
+        sum += task.coefs[8] * shifted_samples[offset + index - 2];
+        sum += task.coefs[9] * shifted_samples[offset + index - 1];
+        return shifted_samples[offset + index] -
+            int(arithmetic_shift_right(int64_t(sum), task.data.shift));
+    }
+
+    int sum = 0;
+    for (int i = 0; i < order; ++i) {
+        sum += task.coefs[i] * shifted_samples[offset + index - order + i];
+    }
+    return shifted_samples[offset + index] -
+        int(arithmetic_shift_right(int64_t(sum), task.data.shift));
+}
+
+int64_t shifted_leaf_mean_residual(
+    FlacClSubframeTask task,
+    int index,
+    bool use_i32_lpc)
+{
+    if (task.data.type != kSubframeLpc) {
+        return fixed_residual_shifted(task, index);
+    }
+    return use_i32_lpc
+        ? int64_t(lpc_residual_shifted_i32(task, index))
+        : lpc_residual_shifted_i64(task, index);
+}
+
+int64_t residual(FlacClSubframeTask task, int index, int wasted_bits)
+{
+    if (task.data.type == kSubframeLpc) {
+        return lpc_residual(task, index, wasted_bits);
+    }
+    return fixed_residual(task, index, wasted_bits);
+}
+
+uint64_t fold_signed_residual(int64_t residual)
+{
+    if (residual >= int64_t(0)) {
+        return uint64_t(residual) << 1u;
+    }
+    return (uint64_t(-(residual + int64_t(1))) << 1u) + uint64_t(1);
+}
+
+uint64_t absolute_i64(int64_t value)
+{
+    if (value >= int64_t(0)) {
+        return uint64_t(value);
+    }
+    return uint64_t(-(value + int64_t(1))) + uint64_t(1);
+}
+
+uint partition_residual_count(uint block_size, uint predictor_order, uint partition_order, uint part)
+{
+    const uint partition_samples = block_size >> partition_order;
+    return part == 0u
+        ? partition_samples - predictor_order
+        : partition_samples;
+}
+
+bool valid_partition_order(uint block_size, uint predictor_order, uint partition_order)
+{
+    const uint partition_count = 1u << partition_order;
+    if ((block_size % partition_count) != 0u) {
+        return false;
+    }
+    const uint partition_samples = block_size / partition_count;
+    return partition_samples > predictor_order;
+}
+
+uint64_t rice_bits(FlacClSubframeTask task, uint residual_offset, uint count, uint parameter, int wasted_bits)
+{
+    uint64_t bits = uint64_t(0);
+    const uint order = uint(task.data.residualOrder);
+    for (uint i = 0u; i < count; ++i) {
+        const int sample_index = int(order + residual_offset + i);
+        const uint64_t folded =
+            fold_signed_residual(residual(task, sample_index, wasted_bits));
+        bits += (folded >> parameter) + uint64_t(1u + parameter);
+    }
+    return bits;
+}
+
+uint64_t cooperative_rice_bits(
+    FlacClSubframeTask task,
+    uint residual_offset,
+    uint count,
+    uint parameter,
+    int wasted_bits)
+{
+    uint64_t bits = uint64_t(0);
+    const uint order = uint(task.data.residualOrder);
+    for (uint i = gl_LocalInvocationID.x; i < count; i += kWorkgroupSize) {
+        const int sample_index = int(order + residual_offset + i);
+        const uint64_t folded =
+            fold_signed_residual(residual(task, sample_index, wasted_bits));
+        bits += (folded >> parameter) + uint64_t(1u + parameter);
+    }
+    return reduce_sum_u64(bits);
+}
+
+uint choose_rice_parameter(FlacClSubframeTask task, uint residual_offset, uint count, int wasted_bits)
+{
+    uint best_parameter = 0u;
+    uint64_t best_bits = ~uint64_t(0);
+    for (uint parameter = 0u; parameter <= kMaxRiceParameter; ++parameter) {
+        const uint64_t bits = rice_bits(task, residual_offset, count, parameter, wasted_bits);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_parameter = parameter;
+        }
+    }
+    return best_parameter;
+}
+
+uint cooperative_choose_rice_parameter(
+    FlacClSubframeTask task,
+    uint residual_offset,
+    uint count,
+    int wasted_bits)
+{
+    uint best_parameter = 0u;
+    uint64_t best_bits = ~uint64_t(0);
+    for (uint parameter = 0u; parameter <= kMaxRiceParameter; ++parameter) {
+        const uint64_t bits =
+            cooperative_rice_bits(task, residual_offset, count, parameter, wasted_bits);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_parameter = parameter;
+        }
+    }
+    return best_parameter;
+}
+
+RicePartitionCost cooperative_choose_rice_partition_cost(
+    FlacClSubframeTask task,
+    uint residual_offset,
+    uint count,
+    int wasted_bits)
+{
+    uint64_t bits0 = uint64_t(0);
+    uint64_t bits1 = uint64_t(0);
+    uint64_t bits2 = uint64_t(0);
+    uint64_t bits3 = uint64_t(0);
+    uint64_t bits4 = uint64_t(0);
+    uint64_t bits5 = uint64_t(0);
+    uint64_t bits6 = uint64_t(0);
+    uint64_t bits7 = uint64_t(0);
+    uint64_t bits8 = uint64_t(0);
+    uint64_t bits9 = uint64_t(0);
+    uint64_t bits10 = uint64_t(0);
+    uint64_t bits11 = uint64_t(0);
+    uint64_t bits12 = uint64_t(0);
+    uint64_t bits13 = uint64_t(0);
+    uint64_t bits14 = uint64_t(0);
+
+    const uint order = uint(task.data.residualOrder);
+    for (uint i = gl_LocalInvocationID.x; i < count; i += kWorkgroupSize) {
+        const int sample_index = int(order + residual_offset + i);
+        const uint64_t folded =
+            fold_signed_residual(residual(task, sample_index, wasted_bits));
+        bits0 += folded + uint64_t(1);
+        bits1 += (folded >> 1u) + uint64_t(2);
+        bits2 += (folded >> 2u) + uint64_t(3);
+        bits3 += (folded >> 3u) + uint64_t(4);
+        bits4 += (folded >> 4u) + uint64_t(5);
+        bits5 += (folded >> 5u) + uint64_t(6);
+        bits6 += (folded >> 6u) + uint64_t(7);
+        bits7 += (folded >> 7u) + uint64_t(8);
+        bits8 += (folded >> 8u) + uint64_t(9);
+        bits9 += (folded >> 9u) + uint64_t(10);
+        bits10 += (folded >> 10u) + uint64_t(11);
+        bits11 += (folded >> 11u) + uint64_t(12);
+        bits12 += (folded >> 12u) + uint64_t(13);
+        bits13 += (folded >> 13u) + uint64_t(14);
+        bits14 += (folded >> 14u) + uint64_t(15);
+    }
+
+    RicePartitionCost best;
+    best.bits = ~uint64_t(0);
+    best.parameter = 0u;
+
+    for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+        uint64_t local_bits = bits0;
+        if (parameter == 1u) {
+            local_bits = bits1;
+        } else if (parameter == 2u) {
+            local_bits = bits2;
+        } else if (parameter == 3u) {
+            local_bits = bits3;
+        } else if (parameter == 4u) {
+            local_bits = bits4;
+        } else if (parameter == 5u) {
+            local_bits = bits5;
+        } else if (parameter == 6u) {
+            local_bits = bits6;
+        } else if (parameter == 7u) {
+            local_bits = bits7;
+        } else if (parameter == 8u) {
+            local_bits = bits8;
+        } else if (parameter == 9u) {
+            local_bits = bits9;
+        } else if (parameter == 10u) {
+            local_bits = bits10;
+        } else if (parameter == 11u) {
+            local_bits = bits11;
+        } else if (parameter == 12u) {
+            local_bits = bits12;
+        } else if (parameter == 13u) {
+            local_bits = bits13;
+        } else if (parameter == 14u) {
+            local_bits = bits14;
+        }
+        const uint64_t bits = reduce_sum_u64(local_bits);
+        if (bits < best.bits) {
+            best.bits = bits;
+            best.parameter = parameter;
+        }
+    }
+    return best;
+}
+
+uint ilog2_u64(uint64_t value)
+{
+    uint result = 0u;
+    while (value > uint64_t(1u)) {
+        value >>= 1u;
+        ++result;
+    }
+    return result;
+}
+
+uint mean_rice_parameter(uint64_t abs_sum, uint sample_count)
+{
+    if (sample_count == 0u) {
+        return 0u;
+    }
+    const uint64_t divisor = uint64_t(0x40000u) / uint64_t(sample_count);
+    const uint64_t scaled_mean =
+        abs_sum < uint64_t(2u) || divisor == uint64_t(0u)
+            ? uint64_t(0u)
+            : (((abs_sum - uint64_t(1u)) * divisor) >> 18u);
+    if (scaled_mean == uint64_t(0u)) {
+        return 0u;
+    }
+    return min(kMaxRiceParameter, ilog2_u64(scaled_mean) + 1u);
+}
+
+uint64_t mean_rice_partition_bits(uint rice_parameter, uint sample_count, uint64_t abs_sum)
+{
+    uint64_t bits =
+        uint64_t(4u) + (uint64_t(1u + rice_parameter) * uint64_t(sample_count));
+    bits += rice_parameter == 0u
+        ? (abs_sum << 1u)
+        : (abs_sum >> (rice_parameter - 1u));
+    const uint64_t correction = uint64_t(sample_count >> 1u);
+    return bits > correction ? bits - correction : uint64_t(0u);
+}
+
+MeanRicePartitionCost cooperative_choose_mean_rice_partition_cost(
+    FlacClSubframeTask task,
+    uint residual_offset,
+    uint count,
+    int wasted_bits,
+    bool include_exact_bits)
+{
+    uint64_t local_abs_sum = uint64_t(0u);
+    const uint order = uint(task.data.residualOrder);
+    for (uint i = gl_LocalInvocationID.x; i < count; i += kWorkgroupSize) {
+        const int sample_index = int(order + residual_offset + i);
+        local_abs_sum += absolute_i64(residual(task, sample_index, wasted_bits));
+    }
+
+    const uint64_t abs_sum = reduce_sum_u64(local_abs_sum);
+    const uint parameter = mean_rice_parameter(abs_sum, count);
+
+    uint64_t local_exact_bits = uint64_t(0u);
+    if (include_exact_bits) {
+        for (uint i = gl_LocalInvocationID.x; i < count; i += kWorkgroupSize) {
+            const int sample_index = int(order + residual_offset + i);
+            const uint64_t folded =
+                fold_signed_residual(residual(task, sample_index, wasted_bits));
+            local_exact_bits += (folded >> parameter) + uint64_t(1u + parameter);
+        }
+    }
+
+    MeanRicePartitionCost choice;
+    choice.exact_bits = include_exact_bits
+        ? reduce_sum_u64(local_exact_bits)
+        : uint64_t(0u);
+    choice.estimated_bits = mean_rice_partition_bits(parameter, count, abs_sum);
+    choice.parameter = parameter;
+    return choice;
+}
+
+uint64_t rice_subframe_bits(
+    FlacClSubframeTask task,
+    uint partition_order,
+    int wasted_bits,
+    uint effective_bits_per_sample)
+{
+    const uint order = uint(task.data.residualOrder);
+    const uint block_size = uint(task.data.blocksize);
+    uint64_t bits = uint64_t(8u) + uint64_t(wasted_bits == 0 ? 0 : wasted_bits);
+    if (task.data.type == kSubframeLpc) {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(4u + 5u) +
+            (uint64_t(order) * uint64_t(task.data.cbits)) +
+            uint64_t(2u + 4u);
+    } else {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(2u + 4u);
+    }
+
+    const uint partition_count = 1u << partition_order;
+    uint residual_offset = 0u;
+    for (uint part = 0u; part < partition_count; ++part) {
+        const uint residual_count =
+            partition_residual_count(block_size, order, partition_order, part);
+        const uint rice_parameter =
+            choose_rice_parameter(task, residual_offset, residual_count, wasted_bits);
+        bits += uint64_t(4u);
+        bits += rice_bits(task, residual_offset, residual_count, rice_parameter, wasted_bits);
+        residual_offset += residual_count;
+    }
+    return bits;
+}
+
+uint64_t cooperative_rice_subframe_bits(
+    FlacClSubframeTask task,
+    uint partition_order,
+    int wasted_bits,
+    uint effective_bits_per_sample)
+{
+    const uint order = uint(task.data.residualOrder);
+    const uint block_size = uint(task.data.blocksize);
+    uint64_t bits = uint64_t(8u) + uint64_t(wasted_bits == 0 ? 0 : wasted_bits);
+    if (task.data.type == kSubframeLpc) {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(4u + 5u) +
+            (uint64_t(order) * uint64_t(task.data.cbits)) +
+            uint64_t(2u + 4u);
+    } else {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(2u + 4u);
+    }
+
+    const uint partition_count = 1u << partition_order;
+    uint residual_offset = 0u;
+    for (uint part = 0u; part < partition_count; ++part) {
+        const uint residual_count =
+            partition_residual_count(block_size, order, partition_order, part);
+        const RicePartitionCost partition_cost =
+            cooperative_choose_rice_partition_cost(
+                task, residual_offset, residual_count, wasted_bits);
+        bits += uint64_t(4u);
+        bits += partition_cost.bits;
+        if (gl_LocalInvocationID.x == 0u) {
+            shared_rice_parameters[part] = partition_cost.parameter;
+        }
+        residual_offset += residual_count;
+    }
+    return bits;
+}
+
+bool analysis_profile_uses_mean_rice()
+{
+    return pc.analysis_profile == kAnalysisProfileOrderGuessMeanRice ||
+        pc.analysis_profile == kAnalysisProfileOrderGuessMeanEstimateRice ||
+        pc.analysis_profile == kAnalysisProfileSubdivideTukey3MeanRice ||
+        pc.analysis_profile == kAnalysisProfileSubdivideTukey3MeanEstimateRice;
+}
+
+bool analysis_profile_uses_mean_estimated_size()
+{
+    return pc.analysis_profile == kAnalysisProfileOrderGuessMeanEstimateRice ||
+        pc.analysis_profile == kAnalysisProfileSubdivideTukey3MeanEstimateRice;
+}
+
+uint64_t rice_subframe_base_bits(
+    FlacClSubframeTask task,
+    int wasted_bits,
+    uint effective_bits_per_sample)
+{
+    const uint order = uint(task.data.residualOrder);
+    uint64_t bits = uint64_t(8u) + uint64_t(wasted_bits == 0 ? 0 : wasted_bits);
+    if (task.data.type == kSubframeLpc) {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(4u + 5u) +
+            (uint64_t(order) * uint64_t(task.data.cbits)) +
+            uint64_t(2u + 4u);
+    } else {
+        bits +=
+            (uint64_t(order) * uint64_t(effective_bits_per_sample)) +
+            uint64_t(2u + 4u);
+    }
+    return bits;
+}
+
+void cooperative_leaf_rice_search(
+    FlacClSubframeTask task,
+    uint task_index,
+    uint leaf_partition_order,
+    int wasted_bits,
+    uint effective_bits_per_sample,
+    out uint best_partition_order,
+    out uint64_t best_bits)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint order = uint(task.data.residualOrder);
+    const uint block_size = uint(task.data.blocksize);
+    const uint leaf_count = 1u << leaf_partition_order;
+    const uint leaf_samples = block_size >> leaf_partition_order;
+
+    for (uint leaf = lane; leaf < leaf_count; leaf += kWorkgroupSize) {
+        uint64_t sums[kRiceParameterCount];
+        for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+            sums[parameter] = uint64_t(0);
+        }
+
+        const uint start = leaf == 0u ? order : leaf * leaf_samples;
+        const uint end = (leaf + 1u) * leaf_samples;
+        for (uint pos = start; pos < end; ++pos) {
+            const uint64_t folded =
+                fold_signed_residual(residual(task, int(pos), wasted_bits));
+            for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+                sums[parameter] += folded >> parameter;
+            }
+        }
+
+        const uint output_base = leaf * kRiceParameterCount;
+        for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+            shared_leaf_rice_sums[output_base + parameter] = sums[parameter];
+        }
+    }
+    barrier();
+
+    if (lane == 0u) {
+        best_bits = ~uint64_t(0);
+        best_partition_order = 0u;
+        const uint64_t base_bits =
+            rice_subframe_base_bits(task, wasted_bits, effective_bits_per_sample);
+        for (uint partition_order = 0u;
+             partition_order <= leaf_partition_order;
+             ++partition_order) {
+            if (!valid_partition_order(block_size, order, partition_order)) {
+                continue;
+            }
+
+            const uint partition_count = 1u << partition_order;
+            const uint partition_samples = block_size >> partition_order;
+            const uint leaf_group_size = 1u << (leaf_partition_order - partition_order);
+            uint64_t bits = base_bits;
+            for (uint part = 0u; part < partition_count; ++part) {
+                const uint residual_count = part == 0u
+                    ? partition_samples - order
+                    : partition_samples;
+                const uint leaf_start = part * leaf_group_size;
+                uint64_t best_parameter_bits = ~uint64_t(0);
+                uint best_parameter = 0u;
+                for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+                    uint64_t sum = uint64_t(0);
+                    for (uint leaf = 0u; leaf < leaf_group_size; ++leaf) {
+                        const uint index =
+                            ((leaf_start + leaf) * kRiceParameterCount) + parameter;
+                        sum += shared_leaf_rice_sums[index];
+                    }
+                    const uint64_t parameter_bits =
+                        sum + (uint64_t(residual_count) * uint64_t(1u + parameter));
+                    if (parameter_bits < best_parameter_bits) {
+                        best_parameter_bits = parameter_bits;
+                        best_parameter = parameter;
+                    }
+                }
+                bits += uint64_t(4u) + best_parameter_bits;
+                shared_rice_parameters[part] = best_parameter;
+            }
+
+            if (bits < best_bits) {
+                best_bits = bits;
+                best_partition_order = partition_order;
+                const uint output_base = task_rice_parameter_base(task_index);
+                for (uint part = 0u; part < partition_count; ++part) {
+                    rice_parameters[output_base + part] = shared_rice_parameters[part];
+                }
+            }
+        }
+    }
+}
+
+void cooperative_leaf_mean_rice_search(
+    FlacClSubframeTask task,
+    uint task_index,
+    uint leaf_partition_order,
+    int wasted_bits,
+    uint effective_bits_per_sample,
+    bool use_estimated_size,
+    out uint best_partition_order,
+    out uint64_t best_bits)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint order = uint(task.data.residualOrder);
+    const uint block_size = uint(task.data.blocksize);
+    const uint leaf_count = 1u << leaf_partition_order;
+    const uint leaf_samples = block_size >> leaf_partition_order;
+    const bool use_i32_lpc =
+        pc.use_shifted_samples != 0u && shifted_lpc_residual_fits_i32(task);
+
+    for (uint leaf = lane; leaf < leaf_count; leaf += kWorkgroupSize) {
+        uint64_t abs_sum = uint64_t(0u);
+        uint64_t sums[kRiceParameterCount];
+        if (!use_estimated_size) {
+            for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+                sums[parameter] = uint64_t(0u);
+            }
+        }
+
+        const uint start = leaf == 0u ? order : leaf * leaf_samples;
+        const uint end = (leaf + 1u) * leaf_samples;
+        for (uint pos = start; pos < end; ++pos) {
+            const int64_t sample_residual = pc.use_shifted_samples != 0u
+                ? shifted_leaf_mean_residual(task, int(pos), use_i32_lpc)
+                : residual(task, int(pos), wasted_bits);
+            abs_sum += absolute_i64(sample_residual);
+            if (!use_estimated_size) {
+                const uint64_t folded = fold_signed_residual(sample_residual);
+                for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+                    sums[parameter] += folded >> parameter;
+                }
+            }
+        }
+
+        shared_leaf_abs_sums[leaf] = abs_sum;
+        if (!use_estimated_size) {
+            const uint output_base = leaf * kRiceParameterCount;
+            for (uint parameter = 0u; parameter < kRiceParameterCount; ++parameter) {
+                shared_leaf_rice_sums[output_base + parameter] = sums[parameter];
+            }
+        }
+    }
+    barrier();
+
+    if (lane == 0u) {
+        uint64_t best_estimated_bits = ~uint64_t(0);
+        best_bits = ~uint64_t(0);
+        best_partition_order = 0u;
+        const uint64_t base_bits =
+            rice_subframe_base_bits(task, wasted_bits, effective_bits_per_sample);
+        for (uint partition_order_plus_one = leaf_partition_order + 1u;
+             partition_order_plus_one > 0u;
+             --partition_order_plus_one) {
+            const uint partition_order = partition_order_plus_one - 1u;
+            if (!valid_partition_order(block_size, order, partition_order)) {
+                continue;
+            }
+
+            const uint partition_count = 1u << partition_order;
+            const uint partition_samples = block_size >> partition_order;
+            const uint leaf_group_size = 1u << (leaf_partition_order - partition_order);
+            uint64_t estimated_bits = uint64_t(2u + 4u);
+            uint64_t exact_bits = base_bits;
+            for (uint part = 0u; part < partition_count; ++part) {
+                const uint residual_count = part == 0u
+                    ? partition_samples - order
+                    : partition_samples;
+                const uint leaf_start = part * leaf_group_size;
+                uint64_t abs_sum = uint64_t(0u);
+                for (uint leaf = 0u; leaf < leaf_group_size; ++leaf) {
+                    abs_sum += shared_leaf_abs_sums[leaf_start + leaf];
+                }
+
+                const uint parameter = mean_rice_parameter(abs_sum, residual_count);
+                estimated_bits += mean_rice_partition_bits(parameter, residual_count, abs_sum);
+                shared_rice_parameters[part] = parameter;
+
+                if (!use_estimated_size) {
+                    uint64_t folded_sum = uint64_t(0u);
+                    for (uint leaf = 0u; leaf < leaf_group_size; ++leaf) {
+                        const uint index =
+                            ((leaf_start + leaf) * kRiceParameterCount) + parameter;
+                        folded_sum += shared_leaf_rice_sums[index];
+                    }
+                    exact_bits += uint64_t(4u) +
+                        folded_sum +
+                        (uint64_t(residual_count) * uint64_t(1u + parameter));
+                }
+            }
+
+                if (estimated_bits < best_estimated_bits) {
+                    best_estimated_bits = estimated_bits;
+                    const uint64_t estimate_base_bits =
+                        base_bits - uint64_t(2u + 4u);
+                    best_bits = use_estimated_size
+                        ? estimate_base_bits + estimated_bits
+                        : exact_bits;
+                    best_partition_order = partition_order;
+                const uint output_base = task_rice_parameter_base(task_index);
+                for (uint part = 0u; part < partition_count; ++part) {
+                    rice_parameters[output_base + part] = shared_rice_parameters[part];
+                }
+            }
+        }
+    }
+}
+
+bool signed_value_fits_bits(int value, int bits)
+{
+    if (bits <= 0 || bits > 31) {
+        return false;
+    }
+    const int min_value = -(1 << (bits - 1));
+    const int max_value = (1 << (bits - 1)) - 1;
+    return value >= min_value && value <= max_value;
+}
+
+int clamp_size_bits(uint64_t bits)
+{
+    return bits > uint64_t(kIntMax) ? kIntMax : int(bits);
+}
+
+void analyze_task(uint task_index)
+{
+    FlacClSubframeTask task = tasks[task_index];
+    const int wasted_bits = common_wasted_bits(task);
+    task.data.wbits = wasted_bits;
+    task.data.abits = frame_amplitude_bits(task, wasted_bits);
+    if (task.data.size == kIntMax) {
+        tasks[task_index] = task;
+        return;
+    }
+    task.data.porder = 0;
+
+    if (task.data.type == kSubframeConstant) {
+        if (!all_frame_samples_equal(task)) {
+            task.data.size = kIntMax;
+        } else {
+            const uint64_t bits =
+                uint64_t(8u) +
+                uint64_t(task.data.obits - wasted_bits) +
+                uint64_t(wasted_bits == 0 ? 0 : wasted_bits);
+            task.data.size = clamp_size_bits(bits);
+        }
+        tasks[task_index] = task;
+        return;
+    }
+
+    if (task.data.type != kSubframeFixed && task.data.type != kSubframeLpc) {
+        task.data.size = kIntMax;
+        tasks[task_index] = task;
+        return;
+    }
+
+    if (task.data.residualOrder < 0 ||
+        task.data.residualOrder >= task.data.blocksize ||
+        (task.data.type == kSubframeFixed && task.data.residualOrder > 4) ||
+        (task.data.type == kSubframeLpc &&
+            (task.data.residualOrder == 0 ||
+             task.data.residualOrder > 32 ||
+             task.data.shift < 0 ||
+             task.data.shift > 15 ||
+             task.data.cbits <= 0 ||
+             task.data.cbits > 15))) {
+        task.data.size = kIntMax;
+        tasks[task_index] = task;
+        return;
+    }
+
+    if (task.data.type == kSubframeLpc) {
+        bool coefficients_valid = true;
+        for (int i = 0; i < task.data.residualOrder; ++i) {
+            if (!signed_value_fits_bits(task.coefs[i], task.data.cbits)) {
+                coefficients_valid = false;
+            }
+        }
+        if (!coefficients_valid) {
+            task.data.size = kIntMax;
+            tasks[task_index] = task;
+            return;
+        }
+    }
+
+    const uint block_size = uint(task.data.blocksize);
+    const uint order = uint(task.data.residualOrder);
+    const uint effective_bits_per_sample = uint(task.data.obits - wasted_bits);
+    uint64_t best_bits = ~uint64_t(0);
+    uint best_partition_order = 0u;
+    const bool use_leaf_rice =
+        !analysis_profile_uses_mean_rice() &&
+        pc.max_rice_partition_order <= kExactLeafMaxRicePartitionOrder &&
+        valid_partition_order(block_size, order, pc.max_rice_partition_order);
+    if (use_leaf_rice) {
+        cooperative_leaf_rice_search(
+            task,
+            task_index,
+            pc.max_rice_partition_order,
+            wasted_bits,
+            effective_bits_per_sample,
+            best_partition_order,
+            best_bits);
+        if (gl_LocalInvocationID.x == 0u) {
+            task.data.porder = int(best_partition_order);
+            task.data.size = clamp_size_bits(best_bits);
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    for (uint partition_order = 0u;
+         partition_order <= pc.max_rice_partition_order;
+         ++partition_order) {
+        if (!valid_partition_order(block_size, order, partition_order)) {
+            continue;
+        }
+        const uint64_t bits =
+            rice_subframe_bits(task, partition_order, wasted_bits, effective_bits_per_sample);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_partition_order = partition_order;
+        }
+    }
+
+    task.data.porder = int(best_partition_order);
+    task.data.size = clamp_size_bits(best_bits);
+    tasks[task_index] = task;
+}
+
+void cooperative_analyze_task(uint task_index)
+{
+    FlacClSubframeTask task = tasks[task_index];
+    clear_task_rice_parameters(task_index);
+    const int wasted_bits = task.data.wbits;
+    if (task.data.size == kIntMax) {
+        if (gl_LocalInvocationID.x == 0u) {
+            tasks[task_index] = task;
+        }
+        return;
+    }
+    task.data.porder = 0;
+
+    if (task.data.type == kSubframeConstant) {
+        if (!cooperative_all_frame_samples_equal(task)) {
+            task.data.size = kIntMax;
+        } else {
+            const uint64_t bits =
+                uint64_t(8u) +
+                uint64_t(task.data.obits - wasted_bits) +
+                uint64_t(wasted_bits == 0 ? 0 : wasted_bits);
+            task.data.size = clamp_size_bits(bits);
+        }
+        if (gl_LocalInvocationID.x == 0u) {
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    if (task.data.type != kSubframeFixed && task.data.type != kSubframeLpc) {
+        task.data.size = kIntMax;
+        if (gl_LocalInvocationID.x == 0u) {
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    if (task.data.residualOrder < 0 ||
+        task.data.residualOrder >= task.data.blocksize ||
+        (task.data.type == kSubframeFixed && task.data.residualOrder > 4) ||
+        (task.data.type == kSubframeLpc &&
+            (task.data.residualOrder == 0 ||
+             task.data.residualOrder > 32 ||
+             task.data.shift < 0 ||
+             task.data.shift > 15 ||
+             task.data.cbits <= 0 ||
+             task.data.cbits > 15))) {
+        task.data.size = kIntMax;
+        if (gl_LocalInvocationID.x == 0u) {
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    if (task.data.type == kSubframeLpc) {
+        bool coefficients_valid = true;
+        for (int i = 0; i < task.data.residualOrder; ++i) {
+            if (!signed_value_fits_bits(task.coefs[i], task.data.cbits)) {
+                coefficients_valid = false;
+            }
+        }
+        if (!coefficients_valid) {
+            task.data.size = kIntMax;
+            if (gl_LocalInvocationID.x == 0u) {
+                tasks[task_index] = task;
+            }
+            return;
+        }
+    }
+
+    const uint block_size = uint(task.data.blocksize);
+    const uint order = uint(task.data.residualOrder);
+    const uint effective_bits_per_sample = uint(task.data.obits - wasted_bits);
+    uint64_t best_bits = ~uint64_t(0);
+    uint best_partition_order = 0u;
+    const bool use_leaf_rice =
+        !analysis_profile_uses_mean_rice() &&
+        pc.max_rice_partition_order <= kExactLeafMaxRicePartitionOrder &&
+        valid_partition_order(block_size, order, pc.max_rice_partition_order);
+    const bool use_leaf_mean_rice =
+        analysis_profile_uses_mean_rice() &&
+        pc.max_rice_partition_order <= kExactLeafMaxRicePartitionOrder &&
+        valid_partition_order(block_size, order, pc.max_rice_partition_order);
+    const bool use_mean_estimated_size =
+        analysis_profile_uses_mean_estimated_size();
+    if (use_leaf_rice) {
+        cooperative_leaf_rice_search(
+            task,
+            task_index,
+            pc.max_rice_partition_order,
+            wasted_bits,
+            effective_bits_per_sample,
+            best_partition_order,
+            best_bits);
+        if (gl_LocalInvocationID.x == 0u) {
+            task.data.porder = int(best_partition_order);
+            task.data.size = clamp_size_bits(best_bits);
+            tasks[task_index] = task;
+        }
+        return;
+    }
+    if (use_leaf_mean_rice) {
+        cooperative_leaf_mean_rice_search(
+            task,
+            task_index,
+            pc.max_rice_partition_order,
+            wasted_bits,
+            effective_bits_per_sample,
+            use_mean_estimated_size,
+            best_partition_order,
+            best_bits);
+        if (gl_LocalInvocationID.x == 0u) {
+            task.data.porder = int(best_partition_order);
+            task.data.size = clamp_size_bits(best_bits);
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    const uint rice_output_base = task_rice_parameter_base(task_index);
+    if (analysis_profile_uses_mean_rice()) {
+        uint64_t best_estimated_bits = ~uint64_t(0);
+        const uint max_partition_order = min(pc.max_rice_partition_order, 8u);
+        for (uint partition_order_plus_one = max_partition_order + 1u;
+             partition_order_plus_one > 0u;
+             --partition_order_plus_one) {
+            const uint partition_order = partition_order_plus_one - 1u;
+            if (!valid_partition_order(block_size, order, partition_order)) {
+                continue;
+            }
+
+            const uint partition_count = 1u << partition_order;
+            uint64_t estimated_bits = uint64_t(2u + 4u);
+            uint residual_offset = 0u;
+            for (uint part = 0u; part < partition_count; ++part) {
+                const uint residual_count =
+                    partition_residual_count(block_size, order, partition_order, part);
+                const MeanRicePartitionCost partition_cost =
+                    cooperative_choose_mean_rice_partition_cost(
+                        task, residual_offset, residual_count, wasted_bits, false);
+                estimated_bits += partition_cost.estimated_bits;
+                if (gl_LocalInvocationID.x == 0u) {
+                    shared_rice_parameters[part] = partition_cost.parameter;
+                }
+                residual_offset += residual_count;
+            }
+
+            if (estimated_bits < best_estimated_bits) {
+                best_estimated_bits = estimated_bits;
+                best_partition_order = partition_order;
+                if (gl_LocalInvocationID.x == 0u) {
+                    for (uint part = 0u; part < partition_count; ++part) {
+                        rice_parameters[rice_output_base + part] =
+                            shared_rice_parameters[part];
+                    }
+                }
+            }
+        }
+
+        if (use_mean_estimated_size) {
+            const uint64_t base_bits =
+                rice_subframe_base_bits(task, wasted_bits, effective_bits_per_sample);
+            const uint64_t estimate_base_bits = base_bits - uint64_t(2u + 4u);
+            best_bits = estimate_base_bits + best_estimated_bits;
+        } else {
+            best_bits = rice_subframe_base_bits(task, wasted_bits, effective_bits_per_sample);
+            const uint partition_count = 1u << best_partition_order;
+            uint residual_offset = 0u;
+            for (uint part = 0u; part < partition_count; ++part) {
+                const uint residual_count =
+                    partition_residual_count(block_size, order, best_partition_order, part);
+                const MeanRicePartitionCost partition_cost =
+                    cooperative_choose_mean_rice_partition_cost(
+                        task, residual_offset, residual_count, wasted_bits, true);
+                best_bits += uint64_t(4u) + partition_cost.exact_bits;
+                residual_offset += residual_count;
+            }
+        }
+
+        task.data.porder = int(best_partition_order);
+        task.data.size = clamp_size_bits(best_bits);
+        if (gl_LocalInvocationID.x == 0u) {
+            tasks[task_index] = task;
+        }
+        return;
+    }
+
+    for (uint partition_order = 0u;
+         partition_order <= pc.max_rice_partition_order;
+         ++partition_order) {
+        if (!valid_partition_order(block_size, order, partition_order)) {
+            continue;
+        }
+        const uint64_t bits =
+            cooperative_rice_subframe_bits(
+                task, partition_order, wasted_bits, effective_bits_per_sample);
+        if (bits < best_bits) {
+            best_bits = bits;
+            best_partition_order = partition_order;
+            if (gl_LocalInvocationID.x == 0u) {
+                const uint partition_count = 1u << partition_order;
+                for (uint part = 0u; part < partition_count; ++part) {
+                    rice_parameters[rice_output_base + part] = shared_rice_parameters[part];
+                }
+            }
+        }
+    }
+
+    task.data.porder = int(best_partition_order);
+    task.data.size = clamp_size_bits(best_bits);
+    if (gl_LocalInvocationID.x == 0u) {
+        tasks[task_index] = task;
+    }
+}
+
+#endif
+
+bool finite_float(float value)
+{
+    return !isnan(value) && !isinf(value);
+}
+
+int leading_zero_count(uint value)
+{
+    return value == 0u ? 32 : 31 - findMSB(value);
+}
+
+void compute_generated_lpc(uint frame, uint window)
+{
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+
+    const uint lpc_offset =
+        (frame * pc.generated_window_count + window) * (kMaxLpcOrder + 1u) * kMaxLpcOrder;
+    const uint autocor_offset =
+        (frame * pc.generated_window_count + window) * (kMaxLpcOrder + 1u);
+
+    float ldr[32];
+    float gen0[32];
+    float gen1[32];
+    float err[32];
+
+    for (int i = 0; i < 32; ++i) {
+        gen0[i] = autocorrelations[autocor_offset + uint(i + 1)];
+        gen1[i] = autocorrelations[autocor_offset + uint(i + 1)];
+        ldr[i] = 0.0f;
+        err[i] = 0.0f;
+    }
+
+    float error = autocorrelations[autocor_offset];
+    for (int order = 0; order < 32; ++order) {
+        float reflection = 0.0f;
+        if (error > 0.0f) {
+            reflection = -gen1[0] / error;
+        }
+        if (!finite_float(reflection)) {
+            reflection = 0.0f;
+        }
+
+        error *= 1.0f - (reflection * reflection);
+        if (!finite_float(error) || error < 0.0f) {
+            error = 0.0f;
+        }
+
+        for (int j = 0; j < 32 - 1 - order; ++j) {
+            const float next_gen1 = gen1[j + 1] + (reflection * gen0[j]);
+            gen0[j] = (gen1[j + 1] * reflection) + gen0[j];
+            gen1[j] = next_gen1;
+        }
+
+        err[order] = error;
+
+        ldr[order] = reflection;
+        for (int j = 0; j < order / 2; ++j) {
+            const float tmp = ldr[j];
+            ldr[j] += reflection * ldr[order - 1 - j];
+            ldr[order - 1 - j] += reflection * tmp;
+        }
+        if ((order & 1) != 0) {
+            ldr[order / 2] += ldr[order / 2] * reflection;
+        }
+
+        for (int j = 0; j <= order; ++j) {
+            lpcs[lpc_offset + uint(order * 32 + j)] = -ldr[order - j];
+        }
+    }
+
+    for (int j = 0; j < 32; ++j) {
+        lpcs[lpc_offset + (kMaxLpcOrder * kMaxLpcOrder) + uint(j)] = err[j];
+    }
+}
+
+void quantize_generated_lpc(uint frame, uint window)
+{
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+
+    const uint window_task_offset = window * pc.lpc_tasks_per_window;
+    if (window_task_offset >= pc.total_lpc_tasks) {
+        return;
+    }
+
+    const uint slots_this_window =
+        min(pc.lpc_tasks_per_window, pc.total_lpc_tasks - window_task_offset);
+    const uint lpc_offset =
+        (frame * pc.generated_window_count + window) * (kMaxLpcOrder + 1u) * kMaxLpcOrder;
+
+    int guessed_order = 1;
+    if (pc.analysis_profile != kAnalysisProfileExact) {
+        const int max_order = clamp(int(pc.max_lpc_order), 1, int(kMaxLpcOrder));
+        const FlacClSubframeTask first_task = tasks[frame * pc.residual_tasks_per_frame];
+        const float error_scale = 0.5 / float(first_task.data.blocksize);
+        const int overhead_bits_per_order =
+            max(1, first_task.data.obits - first_task.data.wbits) +
+            clamp(int(pc.lpc_coefficient_precision), 1, 15);
+        float best_bits = 3.402823466e+38;
+        for (int order = 1; order <= max_order; ++order) {
+            const float error =
+                lpcs[lpc_offset + (kMaxLpcOrder * kMaxLpcOrder) + uint(order - 1)];
+            float bits_per_residual = 0.0;
+            if (error > 0.0) {
+                bits_per_residual = max(0.0, 0.5 * log2(error_scale * error));
+            } else if (error < 0.0) {
+                bits_per_residual = 8.507058665e+37;
+            }
+            const float residual_samples =
+                max(0.0, float(first_task.data.blocksize - order));
+            const float bits =
+                (bits_per_residual * residual_samples) +
+                float(order * overhead_bits_per_order);
+            if (bits < best_bits) {
+                best_bits = bits;
+                guessed_order = order;
+            }
+        }
+    }
+
+    for (uint slot = 0u; slot < slots_this_window; ++slot) {
+        const uint task_index =
+            (frame * pc.residual_tasks_per_frame) + window_task_offset + slot;
+        FlacClSubframeTask task = tasks[task_index];
+        int order = task.data.residualOrder;
+        if (pc.analysis_profile != kAnalysisProfileExact) {
+            if (pc.lpc_tasks_per_window == 1u) {
+                order = guessed_order;
+                task.data.residualOrder = guessed_order;
+            } else if (order != guessed_order) {
+                task.data.size = kIntMax;
+                tasks[task_index] = task;
+                continue;
+            }
+        }
+
+        int max_coefficient = 0;
+        for (int i = 0; i < order; ++i) {
+            const float lpc = lpcs[lpc_offset + uint((order - 1) * 32 + i)];
+            const int coefficient = int(roundEven(lpc * float(1 << 15)));
+            max_coefficient |= coefficient ^ (coefficient >> 31);
+        }
+
+        const int desired_bits = clamp(int(pc.lpc_coefficient_precision), 1, 15);
+        int shift = 0;
+        if (max_coefficient != 0) {
+            shift = clamp(
+                leading_zero_count(uint(max_coefficient)) - 18 + desired_bits,
+                0,
+                15);
+        }
+        const int limit = (1 << (desired_bits - 1)) - 1;
+
+        int actual_max_coefficient = 0;
+        for (int i = 0; i < 32; ++i) {
+            task.coefs[i] = 0;
+        }
+        for (int i = 0; i < order; ++i) {
+            const float lpc = lpcs[lpc_offset + uint((order - 1) * 32 + i)];
+            const int coefficient = clamp(
+                int(roundEven(lpc * float(1 << shift))), -limit, limit);
+            actual_max_coefficient |= coefficient ^ (coefficient >> 31);
+            task.coefs[i] = coefficient;
+        }
+
+        task.data.residualOrder = order;
+        task.data.shift = shift;
+        task.data.cbits = actual_max_coefficient == 0
+            ? 1
+            : 1 + 32 - leading_zero_count(uint(actual_max_coefficient));
+        tasks[task_index] = task;
+    }
+}
+
+#if !LDCOMPRESS_VULKAN_LOW_SCRATCH
+void prune_fixed_order_guess(uint frame)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint selected_base = frame * pc.selected_tasks_per_frame;
+
+    int fixed_task_no[5];
+    for (int order = 0; order <= 4; ++order) {
+        fixed_task_no[order] = -1;
+    }
+
+    for (uint i = 0u; i < pc.selected_tasks_per_frame; ++i) {
+        const int task_index = selected_tasks[selected_base + i];
+        const FlacClSubframeTask task = tasks[task_index];
+        const int order = task.data.residualOrder;
+        if (task.data.type == kSubframeFixed && order >= 0 && order <= 4) {
+            fixed_task_no[order] = task_index;
+        }
+    }
+
+    const FlacClSubframeTask first_task = tasks[selected_tasks[selected_base]];
+    const int block_size = first_task.data.blocksize;
+    const int wasted_bits = first_task.data.wbits;
+
+    uint64_t local_sums[5];
+    for (int order = 0; order <= 4; ++order) {
+        local_sums[order] = uint64_t(0u);
+    }
+
+    if (pc.use_shifted_samples != 0u) {
+        const int offset = first_task.data.samplesOffs;
+        for (uint pos = lane; pos < uint(block_size); pos += kWorkgroupSize) {
+            const int sample0 = shifted_samples[offset + int(pos)];
+            const int sample1 = pos >= 1u ? shifted_samples[offset + int(pos) - 1] : 0;
+            const int sample2 = pos >= 2u ? shifted_samples[offset + int(pos) - 2] : 0;
+            const int sample3 = pos >= 3u ? shifted_samples[offset + int(pos) - 3] : 0;
+            const int sample4 = pos >= 4u ? shifted_samples[offset + int(pos) - 4] : 0;
+            if (fixed_task_no[0] >= 0) {
+                local_sums[0] += absolute_i64(int64_t(sample0));
+            }
+            if (fixed_task_no[1] >= 0 && pos >= 1u) {
+                local_sums[1] += absolute_i64(int64_t(sample0) - int64_t(sample1));
+            }
+            if (fixed_task_no[2] >= 0 && pos >= 2u) {
+                local_sums[2] += absolute_i64(
+                    int64_t(sample0) - (int64_t(2) * int64_t(sample1)) + int64_t(sample2));
+            }
+            if (fixed_task_no[3] >= 0 && pos >= 3u) {
+                local_sums[3] += absolute_i64(
+                    int64_t(sample0) - (int64_t(3) * int64_t(sample1)) +
+                    (int64_t(3) * int64_t(sample2)) - int64_t(sample3));
+            }
+            if (fixed_task_no[4] >= 0 && pos >= 4u) {
+                local_sums[4] += absolute_i64(
+                    int64_t(sample0) - (int64_t(4) * int64_t(sample1)) +
+                    (int64_t(6) * int64_t(sample2)) -
+                    (int64_t(4) * int64_t(sample3)) + int64_t(sample4));
+            }
+        }
+    } else {
+        for (uint pos = lane; pos < uint(block_size); pos += kWorkgroupSize) {
+            for (int order = 0; order <= 4; ++order) {
+                if (fixed_task_no[order] >= 0 && pos >= uint(order)) {
+                    local_sums[order] += absolute_i64(
+                        fixed_residual(tasks[fixed_task_no[order]], int(pos), wasted_bits));
+                }
+            }
+        }
+    }
+
+    uint64_t sums[5];
+    for (int order = 0; order <= 4; ++order) {
+        sums[order] = reduce_sum_u64(local_sums[order]);
+    }
+
+    if (lane != 0u) {
+        return;
+    }
+
+    int best_order = -1;
+    uint64_t best_sum = ~uint64_t(0);
+    for (int order = 0; order <= 4; ++order) {
+        if (fixed_task_no[order] >= 0 && sums[order] < best_sum) {
+            best_order = order;
+            best_sum = sums[order];
+        }
+    }
+    if (best_order < 0) {
+        return;
+    }
+
+    for (int order = 0; order <= 4; ++order) {
+        if (fixed_task_no[order] >= 0 && order != best_order) {
+            FlacClSubframeTask task = tasks[fixed_task_no[order]];
+            task.data.size = kIntMax;
+            tasks[fixed_task_no[order]] = task;
+        }
+    }
+}
+
+void choose_best(uint frame)
+{
+    const uint selected_base = frame * pc.selected_tasks_per_frame;
+    int best_index = selected_tasks[selected_base];
+    int best_size = tasks[best_index].data.size;
+    for (uint i = 1u; i < pc.selected_tasks_per_frame; ++i) {
+        const int task_index = selected_tasks[selected_base + i];
+        const int task_size = tasks[task_index].data.size;
+        if (task_size < best_size) {
+            best_index = task_index;
+            best_size = task_size;
+        }
+    }
+    best_tasks[frame] = tasks[best_index];
+}
+
+void write_best_rice_parameters(uint frame)
+{
+    const uint lane = gl_LocalInvocationID.x;
+    const uint selected_base = frame * pc.selected_tasks_per_frame;
+    int best_index = selected_tasks[selected_base];
+    int best_size = tasks[best_index].data.size;
+    for (uint i = 1u; i < pc.selected_tasks_per_frame; ++i) {
+        const int task_index = selected_tasks[selected_base + i];
+        const int task_size = tasks[task_index].data.size;
+        if (task_size < best_size) {
+            best_index = task_index;
+            best_size = task_size;
+        }
+    }
+
+    const uint input_base = task_rice_parameter_base(uint(best_index));
+    const uint output_base = best_rice_parameter_base(frame);
+    for (uint i = lane; i < kMaxRicePartitionCount; i += kWorkgroupSize) {
+        rice_parameters[output_base + i] = rice_parameters[input_base + i];
+    }
+}
+
+#endif
+
+void main()
+{
+    const uint id = gl_GlobalInvocationID.x;
+#if LDCOMPRESS_VULKAN_LOW_SCRATCH
+    if (pc.mode == kModePrepareFrames) {
+        const uint frame = gl_WorkGroupID.x;
+        if (frame < pc.frame_count) {
+            prepare_frame(frame);
+        }
+    } else if (pc.mode == kModeComputeAutocorrelation) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        const uint lag = gl_WorkGroupID.z;
+        if (frame < pc.frame_count &&
+            window < pc.generated_window_count &&
+            lag <= kMaxLpcOrder) {
+            compute_generated_autocorrelation(frame, window, lag);
+        }
+    } else if (pc.mode == kModeComputeLpc) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        if (frame < pc.frame_count && window < pc.generated_window_count) {
+            compute_generated_lpc(frame, window);
+        }
+    } else if (pc.mode == kModeQuantizeLpc) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        if (frame < pc.frame_count && window < pc.generated_window_count) {
+            quantize_generated_lpc(frame, window);
+        }
+    }
+#else
+    if (pc.mode == kModeAnalyzeExact) {
+        const uint task_index = gl_WorkGroupID.x;
+        if (task_index < pc.task_count) {
+            cooperative_analyze_task(task_index);
+        }
+    } else if (pc.mode == kModeChooseBest && id < pc.frame_count) {
+        choose_best(id);
+    } else if (pc.mode == kModeWriteBestRiceParameters) {
+        const uint frame = gl_WorkGroupID.x;
+        if (frame < pc.frame_count) {
+            write_best_rice_parameters(frame);
+        }
+    } else if (pc.mode == kModePrepareFrames) {
+        const uint frame = gl_WorkGroupID.x;
+        if (frame < pc.frame_count) {
+            prepare_frame(frame);
+        }
+    } else if (pc.mode == kModeComputeAutocorrelation) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        const uint lag = gl_WorkGroupID.z;
+        if (frame < pc.frame_count &&
+            window < pc.generated_window_count &&
+            lag <= kMaxLpcOrder) {
+            compute_generated_autocorrelation(frame, window, lag);
+        }
+    } else if (pc.mode == kModeComputeLpc) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        if (frame < pc.frame_count && window < pc.generated_window_count) {
+            compute_generated_lpc(frame, window);
+        }
+    } else if (pc.mode == kModeQuantizeLpc) {
+        const uint frame = gl_WorkGroupID.x;
+        const uint window = gl_WorkGroupID.y;
+        if (frame < pc.frame_count && window < pc.generated_window_count) {
+            quantize_generated_lpc(frame, window);
+        }
+    } else if (pc.mode == kModePruneFixedOrderGuess) {
+        const uint frame = gl_WorkGroupID.x;
+        if (frame < pc.frame_count) {
+            prune_fixed_order_guess(frame);
+        }
+    }
+#endif
+}

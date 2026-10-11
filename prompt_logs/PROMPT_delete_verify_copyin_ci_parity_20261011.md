@@ -52,3 +52,59 @@ GUI relaunched (dev-20261010-vfy build) for the user's on-screen check of
 the checkbox + behaviour.
 
 ## Phase 2..4 — in progress (see later sections)
+
+## Phase 2 — ld-compress-ng copy-in — DONE, verified
+
+- flac-chop/ld-compress-ng/ = direct copy-in of the ld-compress-ng working
+  tree (WITH the uncommitted Windows port): src/, shaders/, cmake/, tests/,
+  tools/, docs/, LICENSES/, CMakeLists.txt, LICENSE, THIRD_PARTY_NOTICES.md,
+  README.md, CHANGELOG.md (86 files, 1.7 MB). Upstream base 7a60555 + the
+  port deltas recorded in ld-compress-ng/COPIED_FROM.md. No submodule, no
+  build-time clone.
+- Top-level CMakeLists.txt: FLAC_CHOP_BUILD_LDC (default ON) ->
+  add_subdirectory(ld-compress-ng) with BUILD_TESTING forced OFF (cargo owns
+  testing); gui/CMakeLists.txt POST_BUILD-copies ld-compress-ng(.exe) beside
+  flac-chop so ldcdet finds it in dev trees. .gitignore covers
+  /ld-compress-ng/build*/.
+- Local build (MSYS2 MINGW64, OpenCL + Vulkan both enabled): 41 targets,
+  clean. Verified from the build tree: `devices` lists the GTX 1080 Ti
+  (OpenCL 3.0 CUDA); real 4 MB 40-MSPS .lds whole-file conversion 0.97 s,
+  verify: PASS, sha256 note. NOTE: running the un-bundled build-tree exe
+  from pwsh fails 0xC0000139 (foreign Qt on PATH) — dev-tree runs belong in
+  the MSYS2 env; end-user runs come from the bundle.
+- dist-vfix re-bundled with the in-repo-built exes; cleaner pass clean
+  (0 system DLLs; zlib1.dll is the MSYS2 one). Automated GUI batch from the
+  bundle: verify PASS in 689 ms, self-exit 0 (report2.json).
+- Harness bug found + fixed while verifying: an all-skipped batch returned
+  BEFORE the automation report/quit (a parity run would hang forever). The
+  report is now a shared lambda covering BOTH exit paths (all-skipped gets
+  status "skipped" + quit).
+- Cosmetic CLI issue logged for phase 4: runCli prints "note: note: ..."
+  (doubled prefix from the notes already starting with "note: ").
+
+## Phase 3 — CI real tests + ldc everywhere — DONE (pending CI green)
+
+- Core: pub ldc_path() (both cfg variants) + lds_integration
+  ldc_device_present() (the CLI `devices` report lists "[N] name" rows);
+  the two required-backend tests now assert the clean no-device failure and
+  SKIP the byte-exact assertions on GPU-less runners (rate-guard/partial/
+  fallback tests are device-independent, unchanged). Local suite with the
+  copy-in binary + GPU: lds_integration 11 + parallel_cancel 4 + roundtrip12
+  11 + ffi_plan + lib all green, 0 failed.
+- tests.yml: per-OS SoX install (apt/brew/choco — every cut test ran
+  skipped before); Linux job builds the copy-in CLI (cmake standalone
+  configure of ld-compress-ng, BUILD_TESTING=OFF) + FLAC_CHOP_LDC via
+  GITHUB_ENV.
+- build.yml: cargo-tests preflight gets SoX + the CLI build + env. Every
+  packaging job builds the subproject in-tree and bundles the CLI beside
+  flac-chop: AppImage usr/bin + linuxdeploy -e; Windows x86_64 (full
+  Vulkan/OpenCL/glslang/flac/libogg MSYS2 packages; the existing ldd
+  fixpoint bundles its DLLs); Windows arm64 (CLANGARM64 flac+libogg,
+  Vulkan/OpenCL OFF -> CPU-libFLAC backend); macOS (Metal; brew flac+libogg;
+  the .app staging bundles it with the same otool/install_name_tool pattern
+  as sox). Artifact assertions require ld-compress-ng beside flac-chop in
+  the portable ZIPs, installers, and the staged .app (--version check).
+- docs/DEV_NOTE_ldc_acceleration.md: copy-in policy section + CI section
+  rewritten (done 2026-10-11).
+- Phase-1 baseline CI on e39960e: Tests run 38120200011 SUCCESS; Build run
+  38120226148 in progress at the time.

@@ -47,6 +47,23 @@ fn opts_rf() -> ChopOptions {
     }
 }
 
+/// True when the resolvable ld-compress-ng CLI lists at least one compute
+/// device (its `devices` report prints "[N] <name>" rows). CI runners have
+/// no GPU — the required-backend tests skip there instead of failing (the
+/// required backend cannot engage without a device, which the tests still
+/// assert as a clean failure first).
+fn ldc_device_present() -> bool {
+    match flac_chop_core::chop::ldc_path() {
+        Some(p) => match std::process::Command::new(p).arg("devices").output() {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.starts_with('[')),
+            Err(_) => false,
+        },
+        None => false,
+    }
+}
+
 /// Run a cut with the output in its OWN per-test directory, so the leftover
 /// temp scan in a test never sees another (concurrently running) test's
 /// in-flight window temp — the temp s16 lands beside the output file.
@@ -235,6 +252,16 @@ fn lds_whole_file_cut_can_use_accelerated_ldc_backend() {
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
+    if !ldc_device_present() {
+        // No usable device (CI runners): the REQUIRED backend must surface a
+        // clean failure — never a silent SoX fallback — and leave no output.
+        assert!(!r.ok, "the required GPU backend must fail without a device: {}", r.stderr);
+        assert!(!out.exists(), "no partial output on a failed run");
+        eprintln!("skipping the accelerated assertions: ld-compress-ng present but no usable device");
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
     assert!(r.ok, "{}", r.stderr);
     // Byte-exact decode (the same guarantee as the SoX path).
     let (_, got) = read_flac(&out);
@@ -306,6 +333,16 @@ fn raw_u8_whole_file_cut_can_use_accelerated_ldc_backend() {
         );
         assert!(!out.exists(), "no partial output on a failed run");
         eprintln!("skipping the accelerated assertions: ld-compress-ng not available");
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    if !ldc_device_present() {
+        // No usable device (CI runners): the REQUIRED backend must fail
+        // cleanly (never a silent SoX fallback) and leave no output.
+        assert!(!r.ok, "the required GPU backend must fail without a device: {}", r.stderr);
+        assert!(!out.exists(), "no partial output on a failed run");
+        eprintln!("skipping the accelerated assertions: ld-compress-ng present but no usable device");
         let _ = std::fs::remove_file(&in_path);
         let _ = std::fs::remove_dir_all(&dir);
         return;

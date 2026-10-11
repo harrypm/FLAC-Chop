@@ -56,6 +56,23 @@ jobs:
             core/target
           key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock') }}
 
+      - name: Install SoX + build the copy-in ld-compress-ng CLI
+        # Real-pipeline coverage: without SoX every cut/convert/verify test
+        # silently skips. The ld-compress-ng CLI (built from the in-repo
+        # copy-in tree; this runner has no GPU) exercises the not-found and
+        # Auto->SoX fallback paths; the required-backend tests assert the
+        # clean no-device failure and skip the byte-exact assertions
+        # (lds_integration.rs ldc_device_present).
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y sox libsox-fmt-all cmake ninja-build pkg-config \
+            libflac-dev libogg-dev glslang-tools libvulkan-dev ocl-icd-opencl-dev
+          cmake -S ld-compress-ng -B build-ldc -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build-ldc
+          ./build-ldc/ld-compress-ng --version
+          echo "FLAC_CHOP_LDC=$GITHUB_WORKSPACE/build-ldc/ld-compress-ng" >> "$GITHUB_ENV"
+
       - name: Run cargo test
         run: cargo test --release --manifest-path core/Cargo.toml
 
@@ -120,6 +137,11 @@ jobs:
             patchelf \
             sox \
             libsox-fmt-all \
+            libflac-dev \
+            libogg-dev \
+            glslang-tools \
+            libvulkan-dev \
+            ocl-icd-opencl-dev \
             zip \
             unzip
 
@@ -168,6 +190,11 @@ jobs:
           cp "$BUILD_DIR/gui/flac-chop" AppDir/usr/bin/
           cp "$(command -v sox)" AppDir/usr/bin/sox
           chmod +x AppDir/usr/bin/sox
+          # The copy-in ld-compress-ng CLI lands beside flac-chop in the
+          # build tree (gui/CMakeLists.txt POST_BUILD copy) — bundle it the
+          # same way; linuxdeploy -e below walks its library deps too.
+          cp "$BUILD_DIR/gui/ld-compress-ng" AppDir/usr/bin/
+          test -x AppDir/usr/bin/ld-compress-ng
 
           # Desktop entry (StartupWMClass must match the Qt window class set in
           # gui/main.cpp) and AppRun (installs the user-level launcher + icon on
@@ -191,6 +218,7 @@ jobs:
             --appdir AppDir \
             -e AppDir/usr/bin/flac-chop \
             -e AppDir/usr/bin/sox \
+            -e AppDir/usr/bin/ld-compress-ng \
             -d AppDir/flac-chop.desktop \
             -i AppDir/flac-chop.png \
             --plugin qt \
@@ -246,6 +274,13 @@ jobs:
             mingw-w64-x86_64-qt6-base
             mingw-w64-x86_64-qt6-tools
             mingw-w64-x86_64-sox
+            mingw-w64-x86_64-flac
+            mingw-w64-x86_64-libogg
+            mingw-w64-x86_64-glslang
+            mingw-w64-x86_64-opencl-headers
+            mingw-w64-x86_64-opencl-icd
+            mingw-w64-x86_64-vulkan-headers
+            mingw-w64-x86_64-vulkan-loader
 
       - name: Resolve build version
         id: version
@@ -322,6 +357,11 @@ jobs:
           # Bundle SoX so users do not need a separate SoX install on PATH.
           cp "/mingw64/bin/sox.exe" dist/
           test -x dist/sox.exe
+          # The copy-in ld-compress-ng CLI (built beside flac-chop by the
+          # same cmake build) — its MinGW DLL deps are bundled by the ldd
+          # fixpoint step below, exactly like sox's.
+          cp "$BUILD_DIR/gui/ld-compress-ng.exe" dist/
+          test -x dist/ld-compress-ng.exe
 
       - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
         shell: msys2 {0}
@@ -458,7 +498,7 @@ jobs:
             throw "portable ZIP: version mismatch — '$version' not found in the inner exe"
           }
           Write-Host "PASS: version literal '$version' found in the portable ZIP's inner exe"
-          foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
+          foreach ($f in @("sox.exe", "ld-compress-ng.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $portTest $f))) {
               throw "portable ZIP: missing $f"
             }
@@ -476,7 +516,7 @@ jobs:
             throw "installer: version mismatch — '$version' not found in the installed exe"
           }
           Write-Host "PASS: version literal '$version' found in the installed exe"
-          foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
+          foreach ($f in @("sox.exe", "ld-compress-ng.exe", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $instDir $f))) {
               throw "installer: missing $f"
             }
@@ -520,6 +560,8 @@ jobs:
             mingw-w64-clang-aarch64-qt6-base
             mingw-w64-clang-aarch64-qt6-tools
             mingw-w64-clang-aarch64-sox
+            mingw-w64-clang-aarch64-flac
+            mingw-w64-clang-aarch64-libogg
 
       - name: Resolve build version
         id: version
@@ -565,10 +607,16 @@ jobs:
           # version (title bar, --version, update check) can never fall back
           # to "dev-<sha>" on a release build (this shipped v1.0.8 as
           # "dev-e744de2": the tagless shallow checkout broke git describe).
+          # The copy-in ld-compress-ng CLI builds with the CPU-libFLAC
+          # backend only here (the CLANGARM64 repo has no glslang / OpenCL /
+          # Vulkan packages): Auto uses it when usable and otherwise falls
+          # back to SoX — the same in-app semantics everywhere.
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}" \
+            -DLDCOMPRESS_ENABLE_VULKAN=OFF -DLDCOMPRESS_ENABLE_OPENCL=OFF
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop.exe"
+          test -x "$BUILD_DIR/gui/ld-compress-ng.exe"
 
       - name: Verify built exe contains the release version
         # Binary string search for the VERSION LITERAL (same rationale as the
@@ -601,6 +649,10 @@ jobs:
           # SoX install on PATH.
           cp "/clangarm64/bin/sox.exe" dist/
           test -x dist/sox.exe
+          # The copy-in ld-compress-ng CLI (CPU-libFLAC backend on arm64);
+          # the ldd fixpoint step below bundles its runtime DLLs.
+          cp "$BUILD_DIR/gui/ld-compress-ng.exe" dist/
+          test -x dist/ld-compress-ng.exe
 
       - name: Bundle compiler-runtime + third-party DLLs (windeployqt misses these)
         shell: msys2 {0}
@@ -737,7 +789,7 @@ jobs:
             throw "portable ZIP: version mismatch — '$version' not found in the inner exe"
           }
           Write-Host "PASS: version literal '$version' found in the portable ZIP's inner exe"
-          foreach ($f in @("sox.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
+          foreach ($f in @("sox.exe", "ld-compress-ng.exe", "Qt6Widgets.dll", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $portTest $f))) {
               throw "portable ZIP: missing $f"
             }
@@ -755,7 +807,7 @@ jobs:
             throw "installer: version mismatch — '$version' not found in the installed exe"
           }
           Write-Host "PASS: version literal '$version' found in the installed exe"
-          foreach ($f in @("sox.exe", "platforms\qwindows.dll")) {
+          foreach ($f in @("sox.exe", "ld-compress-ng.exe", "platforms\qwindows.dll")) {
             if (-not (Test-Path (Join-Path $instDir $f))) {
               throw "installer: missing $f"
             }
@@ -816,7 +868,7 @@ jobs:
           # every brew command print a tap-trust warning. We don't use it —
           # untap it (best-effort) so brew runs clean.
           brew untap aws/tap 2>/dev/null || true
-          brew install cmake ninja qt@6 pkg-config sox
+          brew install cmake ninja qt@6 pkg-config sox flac libogg
           # qt@6 is keg-only; force-link it so cmake finds qmake6 on the brew
           # prefix. The runner image now ships qt@6 already force-linked, so
           # guard the link to avoid the "Already linked" warning — only link
@@ -846,10 +898,14 @@ jobs:
           # version (title bar, --version, update check) can never fall back
           # to "dev-<sha>" on a release build (this shipped v1.0.8 as
           # "dev-e744de2": the tagless shallow checkout broke git describe).
+          # The copy-in ld-compress-ng CLI builds with its native Metal
+          # backend here; Vulkan/OpenCL stay deterministically off.
           cmake -S . -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}"
+            -DFLAC_CHOP_VERSION="${{ steps.version.outputs.version }}" \
+            -DLDCOMPRESS_ENABLE_VULKAN=OFF -DLDCOMPRESS_ENABLE_OPENCL=OFF
           cmake --build "$BUILD_DIR"
           test -x "$BUILD_DIR/gui/flac-chop"
+          test -x "$BUILD_DIR/gui/ld-compress-ng"
 
       - name: Verify built binary reports the release version
         run: |
@@ -953,6 +1009,43 @@ jobs:
           done
           "$APP_ROOT/MacOS/sox" --version
 
+          # Bundle the copy-in ld-compress-ng CLI (Metal backend) the same
+          # way as sox: into MacOS/, brew dylib deps into Frameworks/ with
+          # @executable_path rewrites. The core's ldcdet finds it beside the
+          # app exe (it also probes Contents/Resources/bin).
+          LDC_BIN="$BUILD_DIR/gui/ld-compress-ng"
+          cp "$LDC_BIN" "$APP_ROOT/MacOS/ld-compress-ng"
+          chmod +x "$APP_ROOT/MacOS/ld-compress-ng"
+          LDC_DEPS=()
+          while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            LDC_DEPS+=("$dep")
+          done < <(otool -L "$LDC_BIN" \
+            | awk 'NR>1 {print $1}' \
+            | grep -E '^/opt/homebrew/|^/usr/local/' || true)
+          for dep in "${LDC_DEPS[@]}"; do
+            [ -n "$dep" ] || continue
+            cp -f "$dep" "$APP_ROOT/Frameworks/$(basename "$dep")"
+          done
+          for lib in "$APP_ROOT/Frameworks/"*.dylib; do
+            [ -e "$lib" ] || continue
+            base="$(basename "$lib")"
+            install_name_tool -id "@executable_path/../Frameworks/$base" "$lib"
+          done
+          for bin in "$APP_ROOT/MacOS/ld-compress-ng" "$APP_ROOT/Frameworks/"*.dylib; do
+            [ -e "$bin" ] || continue
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              base="$(basename "$dep")"
+              if [ -f "$APP_ROOT/Frameworks/$base" ]; then
+                install_name_tool -change "$dep" "@executable_path/../Frameworks/$base" "$bin"
+              fi
+            done < <(otool -L "$bin" \
+                     | awk 'NR>1 {print $1}' \
+                     | grep -E '^/opt/homebrew/|^/usr/local/' || true)
+          done
+          "$APP_ROOT/MacOS/ld-compress-ng" --version
+
           echo "$BUILD_VERSION" > dist/BUILD_VERSION.txt
 
       - name: Verify staged .app reports the release version
@@ -964,6 +1057,10 @@ jobs:
           OUT="$(./dist/FLAC-Chop.app/Contents/MacOS/FLAC-Chop --version)"
           echo "staged .app reports: $OUT (expected: $EXPECTED)"
           [ "$OUT" = "$EXPECTED" ]
+          # The staged copy-in ld-compress-ng CLI must run from the bundle.
+          LDC_OUT="$(./dist/FLAC-Chop.app/Contents/MacOS/ld-compress-ng --version)"
+          echo "staged ld-compress-ng reports: $LDC_OUT"
+          case "$LDC_OUT" in ld-compress-ng*) ;; *) exit 1 ;; esac
 
       - name: Upload macOS architecture stage
         uses: actions/upload-artifact@v6

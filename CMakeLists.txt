@@ -60,4 +60,19 @@ find_package(Qt6Widgets REQUIRED)
 find_package(Qt6Concurrent REQUIRED)
 find_package(Qt6Network REQUIRED)
 
+# --- ld-compress-ng (direct copy-in; see ld-compress-ng/COPIED_FROM.md) ---
+# The whole ld-compress-ng source tree lives in-repo at ld-compress-ng/ —
+# no submodule, no build-time clone. It builds the CLI that the Rust core's
+# accelerated whole-file conversion path spawns (core/src/chop.rs ldcdet
+# finds it beside the app exe; gui/CMakeLists.txt copies it there in dev
+# builds). Turn off with -DFLAC_CHOP_BUILD_LDC=OFF to build FLAC-Chop alone
+# (Auto then falls back to SoX when the CLI is absent).
+option(FLAC_CHOP_BUILD_LDC "Build the copy-in ld-compress-ng CLI (GPU whole-file conversions)" ON)
+if(FLAC_CHOP_BUILD_LDC)
+    # The subproject includes(CTest); cargo owns FLAC-Chop's testing, so its
+    # test binaries are not built inside this tree.
+    set(BUILD_TESTING OFF CACHE BOOL "ld-compress-ng tests are not built inside the FLAC-Chop tree" FORCE)
+    add_subdirectory(ld-compress-ng)
+endif()
+
 add_subdirectory(gui)

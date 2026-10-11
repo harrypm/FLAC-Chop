@@ -476,11 +476,26 @@ pub fn ldc_available() -> bool {
     ldcdet::resolve().is_some()
 }
 
+#[cfg(not(feature = "static-sox"))]
+/// The resolved ld-compress-ng CLI path (None when not found) — for tests
+/// and tooling that need to run the CLI directly (e.g. probing for a usable
+/// compute device before asserting GPU-path behaviour; CI runners have
+/// none, so the required-backend tests must skip there, not fail).
+pub fn ldc_path() -> Option<std::path::PathBuf> {
+    ldcdet::resolve()
+}
+
 #[cfg(feature = "static-sox")]
 /// The static-sox single-binary backend runs everything in-process (no
 /// subprocesses), so the ld-compress-ng CLI is never used there.
 pub fn ldc_available() -> bool {
     false
+}
+
+#[cfg(feature = "static-sox")]
+/// The static-sox backend never uses the ld-compress-ng CLI.
+pub fn ldc_path() -> Option<std::path::PathBuf> {
+    None
 }
 
 #[cfg(not(feature = "static-sox"))]

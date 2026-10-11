@@ -77,11 +77,22 @@ verdict line in its row status, flag FAILED verdicts, and count
   source after PASS verify" checkbox (permanent delete, only on an exact PASS
   verdict, requires Verify on; skip/FAIL/cancel always keep the source).
 
-## Windows port of ld-compress-ng (in the local clone)
+## Copy-in policy (2026-10-11)
+
+ld-compress-ng lives IN THIS REPO at `ld-compress-ng/` — a direct copy-in
+(no submodule, no build-time clone, no vendoring), per the project decision.
+`ld-compress-ng/COPIED_FROM.md` records the upstream base commit and the
+carried deltas. The subproject builds with the main configure:
+`FLAC_CHOP_BUILD_LDC` (default ON) → `add_subdirectory(ld-compress-ng)`;
+`gui/CMakeLists.txt` POST_BUILD-copies the CLI beside `flac-chop(.exe)` so
+`ldcdet` finds it in dev trees, and dist bundling copies from there.
+`-DFLAC_CHOP_BUILD_LDC=OFF` builds FLAC-Chop alone (Auto falls back to SoX).
+
+## Windows port of ld-compress-ng (carried in the copy-in tree)
 
 The `ldcompress_core` library builds clean on MSYS2/MinGW64 as-is; only the
-CLI layer is POSIX-bound. The port (in `C:\Users\Harry\ld-compress-ng`,
-uncommitted upstream):
+CLI layer is POSIX-bound. The port (in the copy-in tree, uncommitted
+upstream):
 - `src/main.cpp`: `BlockTerminationSignals` no-op on Windows (no
   `sigprocmask`; the staging-name randomness + best-effort cleanup is
   accepted), ANSI `signal()` + `raise()` termination cleanup
@@ -91,19 +102,22 @@ uncommitted upstream):
   POSIX `link()` fallback which is now gated non-Windows.
 - `CMakeLists.txt`: `test_cli` (fork/wait supervision) gated to non-Windows.
 
-Build (MSYS2 MinGW64): install `mingw-w64-x86_64-{glslang,opencl-headers,
-opencl-icd}` (flac/ogg/vulkan-headers/vulkan-loader already present), then
-`cmake -S . -B build-mingw -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && cmake
---build build-mingw`. `devices` enumerates both backends on the GTX 1080 Ti
-(Vulkan: `shaderInt64: yes`, "vulkan backend usable: yes"; OpenCL 3.0 CUDA).
+Build (MSYS2 MinGW64): the copy-in builds with the main tree (`cmake -S .
+-B build-vfix -G Ninja && cmake --build build-vfix`); MSYS2 packages:
+`mingw-w64-x86_64-{glslang,opencl-headers,opencl-icd,vulkan-headers,
+vulkan-loader,flac,libogg}`. `devices` enumerates both backends on the
+GTX 1080 Ti (Vulkan: `shaderInt64: yes`, "vulkan backend usable: yes";
+OpenCL 3.0 CUDA). Verified locally: the copy-in build converts a real
+4 MB 40-MSPS `.lds` in 0.97 s with `verify: PASS`.
 
 ## Bundling (portable testing)
 
-Copy beside `flac-chop.exe`:
-- `build-mingw/ld-compress-ng.exe`
-- Its MinGW runtime DLLs (`libstdc++-6.dll`, `libgcc_s_seh-1.dll`,
-  `libwinpthread-1.dll`, `libFLAC.dll`, `libogg.dll`) — from
-  `/mingw64/bin`; `vulkan-1.dll` comes with the GPU driver (System32).
+The CLI lands beside the exe automatically in build trees (POST_BUILD copy)
+— for a portable bundle copy `build-*/gui/ld-compress-ng(.exe)` beside
+`flac-chop(.exe)` and let an ldd/otool walk bundle its toolchain libraries
+(CI's existing fixpoint steps do exactly this; keep them anchored to the
+toolchain BINDIR only).
+- `vulkan-1.dll` comes with the GPU driver (System32).
 - NEVER copy Windows system DLLs (anything in C:\Windows\System32) into
   the bundle — app-local UxTheme/DWrite/d3d*/… copies break the native file
   dialog's dark mode (see docs/DEV_NOTE_native_file_dialogs.md, the
@@ -122,10 +136,18 @@ Copy beside `flac-chop.exe`:
   the SoX path under the Ldc preference.
 - `verify.rs` unit tests + the whole lds suite (engine-pinned per test).
 
-## CI note (NOT yet done — follow-up)
+## CI (done 2026-10-11)
 
-CI packaging does not yet build/bundle ld-compress-ng on any platform; the
-accelerated path simply falls back to SoX there (Auto). A follow-up plan
-should add per-platform ld-compress-ng builds (Linux Vulkan/OpenCL, macOS
-Metal, Windows glslang+Vulkan) to `build.yml` and bundle the CLI beside the
-exe in the portable/installer artifacts.
+`tests.yml` (every push/PR, Linux+macOS+Windows) installs SoX per-OS so the
+real-pipeline tests run instead of skipping, and the Linux job builds the
+copy-in CLI + exports `FLAC_CHOP_LDC` (GPU-less: the required-backend tests
+assert the clean no-device failure via `ldc_device_present()` and skip the
+byte-exact assertions). `build.yml` builds the subproject in every packaging
+job and bundles the CLI beside flac-chop: Linux AppImage (linuxdeploy -e),
+Windows x86_64 (full Vulkan/OpenCL toolchain; the ldd fixpoint bundles its
+DLLs), Windows arm64 (CPU-libFLAC backend — CLANGARM64 has no
+Vulkan/OpenCL/glslang packages), macOS (Metal; brew flac/libogg dylibs into
+Frameworks/). Artifact layout assertions require `ld-compress-ng` beside
+`flac-chop` in every packaged artifact. GPU-device compression itself is
+still not CI-testable (hosted runners have no GPU) — that stays on real
+machines.
