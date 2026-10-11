@@ -1144,6 +1144,11 @@ jobs:
           if [ -f "dist/FLAC-Chop.app/Contents/MacOS/sox" ]; then
             codesign --force --sign - "dist/FLAC-Chop.app/Contents/MacOS/sox"
           fi
+          # Same rationale for the copy-in ld-compress-ng CLI (observed:
+          # "In subcomponent: ld-compress-ng" without this).
+          if [ -f "dist/FLAC-Chop.app/Contents/MacOS/ld-compress-ng" ]; then
+            codesign --force --sign - "dist/FLAC-Chop.app/Contents/MacOS/ld-compress-ng"
+          fi
           find "dist/FLAC-Chop.app/Contents/MacOS" -type f -print0 \
             | while IFS= read -r -d "" bin; do
                 if file "$bin" | grep -q "Mach-O"; then

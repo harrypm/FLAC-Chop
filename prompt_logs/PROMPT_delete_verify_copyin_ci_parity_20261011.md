@@ -216,3 +216,15 @@ every platform). Two failures:
 2. macOS universal DMG: the documented transient hdiutil "Resource busy"
    flake — three fast retries were not enough this time. Fix: pre-detach +
    5 attempts 15 s apart.
+
+### Phase 3/4 addendum — fa52a6b Build run (macOS universal codesign)
+
+Everything green on fa52a6b (Tests all 3 OS + the whole packaging matrix:
+preflight, both AppImages, Windows x86_64 + arm64 (the <algorithm> fix
+landed), both macOS arch builds, real-world tests) EXCEPT the macOS
+universal merge: codesign of the main exe failed "In subcomponent:
+ld-compress-ng" — signing an executable validates sibling Mach-Os, and the
+step pre-signs sox for exactly that reason but not the newly-bundled
+ld-compress-ng. Fix: the explicit pre-sign now covers ld-compress-ng too.
+(The e20d520 universal failure was the genuine hdiutil "Resource busy"
+flake; the 5x15s retry hardening got this run past it.)
