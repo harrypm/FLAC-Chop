@@ -82,3 +82,22 @@ jobs:
         run: |
           cargo build --release --manifest-path core/Cargo.toml --example probe_cli
           cargo build --release --manifest-path core/Cargo.toml --example chop_cli
+
+      - name: CLI<->GUI 1:1 parity test (offscreen)
+        # The MISRC-model parity gate: the SAME binary driven through the
+        # headless CLI and the real GUI event loop (FLAC_CHOP_GUI_TEST*
+        # hooks) on one fixture, asserting equal probe fields, verify
+        # verdicts, and byte-identical decoded audio. Linux only (the GUI
+        # build needs Qt; ldc is off — the 20 MSPS fixture takes the SoX
+        # path deterministically).
+        if: runner.os == 'Linux'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          set -eux
+          sudo apt-get install -y qt6-base-dev qt6-base-dev-tools libgl1-mesa-dev
+          cmake -S . -B build-parity -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFLAC_CHOP_BUILD_LDC=OFF
+          cmake --build build-parity
+          test -x build-parity/gui/flac-chop
+          scripts/gui_cli_parity.sh build-parity/gui/flac-chop

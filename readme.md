@@ -256,6 +256,42 @@ The CLIs run the exact same probe → plan → SoX path as the GUI and accept th
 same input formats. Headerless raw inputs must carry the rate in their name
 (e.g. `..._8-bit_20msps.u8`).
 
+## Automated GUI testing (CLI → GUI parity)
+
+The binary doubles as the CLI and the GUI, and the GUI is drivable from
+outside for automated feature testing (the MISRC GUI model) — 1:1 parity
+with the CLI is asserted by `scripts/gui_cli_parity.sh` (also a CI step):
+
+```bash
+# GUI smoke test: the full app + window + optional file preload, then
+# exit 0. Headless-safe with QT_QPA_PLATFORM=offscreen.
+QT_QPA_PLATFORM=offscreen flac-chop --smoke-test
+
+# Drive the Chop tab on a file through the real event loop: the probe +
+# plan state is dumped, then (with _RUN) the exact Process click path runs
+# and the run report (verify verdict, checksum, output) is dumped before
+# the app self-exits.
+FLAC_CHOP_GUI_TEST=1 FLAC_CHOP_GUI_TEST_RUN=1 \
+FLAC_CHOP_GUI_TEST_OUT=gui_report.json FLAC_CHOP_GUI_TEST_QUIT=1 \
+  flac-chop --gui capture.lds
+
+# Drive a Batch run: queue files, set the option checkboxes, process, and
+# get the per-job report (status / verify verdict / deleted_source /
+# source_exists per job).
+FLAC_CHOP_GUI_BATCH_FILES='a.lds;b.lds' FLAC_CHOP_GUI_BATCH_RUN=1 \
+FLAC_CHOP_GUI_BATCH_VERIFY=1 FLAC_CHOP_GUI_BATCH_DELETE=0 \
+FLAC_CHOP_GUI_TEST_OUT=batch_report.json FLAC_CHOP_GUI_TEST_QUIT=1 \
+  flac-chop --gui
+
+# The parity gate: one fixture through BOTH surfaces, asserting equal
+# probe fields, verify verdicts, and byte-identical decoded audio.
+scripts/gui_cli_parity.sh build/gui/flac-chop
+```
+
+`--config <dir>` launches the GUI with settings from a chosen directory
+(INI format) instead of the platform default, so automated runs launch
+with a pre-written config and never touch the user's real preferences.
+
 ## Command-line usage
 
 The main binary doubles as a full headless CLI (no window opens for any

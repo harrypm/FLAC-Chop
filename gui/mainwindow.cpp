@@ -111,6 +111,54 @@ static QVersionNumber parseReleaseVersion(const QString& raw)
     return QVersionNumber::fromString(s);
 }
 
+// --- CLI-->GUI load-test support (FLAC_CHOP_GUI_TEST*) --------------------
+// The parity harness (scripts/gui_cli_parity.sh) drives the GUI through the
+// real event loop and reads the state dumped here. Inert unless
+// FLAC_CHOP_GUI_TEST is set; FLAC_CHOP_GUI_TEST_OUT names the report file,
+// and FLAC_CHOP_GUI_TEST_QUIT exits the app right after a dump (automated
+// runs must terminate themselves; failure popups are suppressed while a
+// report is active so automation never blocks on a modal box).
+namespace {
+bool guiTestActive()
+{
+    static const bool on = qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST");
+    return on;
+}
+
+QJsonObject& guiTestState()
+{
+    static QJsonObject state;
+    return state;
+}
+
+void guiTestWrite()
+{
+    const QString path = QString::fromLocal8Bit(qgetenv("FLAC_CHOP_GUI_TEST_OUT"));
+    if (path.isEmpty())
+        return;
+    QFile f(path);
+    if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        f.write(QJsonDocument(guiTestState()).toJson(QJsonDocument::Indented));
+}
+
+void guiTestMaybeQuit()
+{
+    if (qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST_QUIT"))
+        QTimer::singleShot(0, qApp, &QCoreApplication::quit);
+}
+
+// The auto-run trigger fires exactly ONCE: a converted non-FLAC output
+// re-probes (the Chop tab auto-load) and must never start a second cut.
+bool guiTestTakeRun()
+{
+    static bool taken = false;
+    if (taken)
+        return false;
+    taken = true;
+    return true;
+}
+} // namespace
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -911,6 +959,13 @@ void MainWindow::onProbeFinished()
         m_probeIsRefresh = false;
         setMetaStreamInfo();
         loadMetadata();
+        if (guiTestActive()) {
+            guiTestState()[QStringLiteral("probe_ok")] = false;
+            guiTestState()[QStringLiteral("probe_error")] =
+                QString::fromUtf8(m_probe.error);
+            guiTestWrite();
+            guiTestMaybeQuit();
+        }
         return;
     }
 
@@ -1027,6 +1082,49 @@ void MainWindow::onProbeFinished()
     setControlsEnabled(true);
     setMetaStreamInfo();
     loadMetadata();
+
+    // CLI-->GUI load test: dump the probe + plan state, and with
+    // FLAC_CHOP_GUI_TEST_RUN drive the cut through the exact Process path a
+    // user clicks (the run state lands in onChopFinished). The dump records
+    // the FIRST probe only — a converted output's auto-load re-probe must
+    // not overwrite the input's report (and never re-triggers the run).
+    if (guiTestActive()) {
+        if (!guiTestState().contains(QStringLiteral("probe"))) {
+            QJsonObject pr;
+            pr.insert(QStringLiteral("ok"), true);
+            pr.insert(QStringLiteral("format"), int(m_probe.format));
+            pr.insert(QStringLiteral("real_rate_hz"), m_probe.real_rate_hz);
+            pr.insert(QStringLiteral("total_samples"), double(m_probe.total_samples));
+            pr.insert(QStringLiteral("total_known"), m_probe.total_samples_known != 0);
+            pr.insert(QStringLiteral("is_rf"), m_probe.is_rf != 0);
+            pr.insert(QStringLiteral("bits"), int(m_probe.bits_per_sample));
+            pr.insert(QStringLiteral("channels"), int(m_probe.channels));
+            pr.insert(QStringLiteral("warnings"), QString::fromUtf8(m_probe.warnings));
+            guiTestState()[QStringLiteral("probe")] = pr;
+            QJsonObject pl;
+            pl.insert(QStringLiteral("ok"), m_plan.ok != 0);
+            pl.insert(QStringLiteral("start_samples"), double(m_plan.start_samples));
+            pl.insert(QStringLiteral("length_samples"), double(m_plan.length_samples));
+            guiTestState()[QStringLiteral("plan")] = pl;
+            guiTestState()[QStringLiteral("ldc_available")] = fc_ldc_available() != 0;
+            guiTestWrite();
+        }
+        if (qEnvironmentVariableIsSet("FLAC_CHOP_GUI_TEST_RUN")) {
+            if (guiTestTakeRun()) {
+                if (m_plan.ok && m_processBtn->isEnabled()) {
+                    QTimer::singleShot(300, this, [this]() { process(); });
+                } else {
+                    // The first probe cannot start a run (probe/plan not
+                    // usable): end the automated launch instead of hanging.
+                    guiTestMaybeQuit();
+                }
+            }
+            // A later probe (refresh/auto-load) never re-triggers; the quit
+            // was already scheduled by the run report in onChopFinished.
+        } else {
+            guiTestMaybeQuit();
+        }
+    }
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent* e)
@@ -1621,11 +1719,29 @@ void MainWindow::onChopFinished()
         m_statusLabel->setToolTip(notes.isEmpty()
             ? m_outPath
             : tr("%1\n\n%2").arg(m_outPath, notes));
+        // CLI-->GUI load test: the run report (the same events a user sees,
+        // through the real event loop). Written before the auto-load below
+        // (a converted output re-probes into the Chop tab).
+        if (guiTestActive()) {
+            QJsonObject run;
+            run.insert(QStringLiteral("ok"), true);
+            run.insert(QStringLiteral("output"), m_outPath);
+            run.insert(QStringLiteral("elapsed"), elapsed);
+            run.insert(QStringLiteral("verify"), verifyBrief);
+            run.insert(QStringLiteral("sha256_brief"), shaBrief);
+            run.insert(QStringLiteral("notes"), notes);
+            guiTestState()[QStringLiteral("run")] = run;
+            guiTestWrite();
+            guiTestMaybeQuit();
+        }
         // Non-FLAC input (WAV / raw PCM / packed .lds / Ogg .ldf): the cut
         // output is a freshly converted native FLAC. Load it so the Metadata
         // Editor can tag the output right away (the raw/packed source's tags
         // are not editable) and the Chop tab reflects the produced file.
-        if (m_probe.format != 0) {
+        // Skipped during a CLI-->GUI load test: the report is complete and
+        // the harness quits the app right away (a re-probe in flight at exit
+        // would both overwrite the report's input probe and race shutdown).
+        if (m_probe.format != 0 && !guiTestActive()) {
             const QString out = m_outPath;
             // The custom name (if any) was consumed by this cut — don't let
             // it hijack (and overwrite) the next cut of the loaded output.
@@ -1645,8 +1761,20 @@ void MainWindow::onChopFinished()
             err = tr("(no stderr) sox exit code %1").arg(r.exit_code);
         m_statusLabel->setText(tr("FAILED (exit %1, after %2): %3")
             .arg(r.exit_code).arg(elapsed).arg(err));
-        QMessageBox::warning(this, tr("Cut failed"),
-            tr("sox failed (exit %1):\n%2").arg(r.exit_code).arg(err));
+        if (guiTestActive()) {
+            QJsonObject run;
+            run.insert(QStringLiteral("ok"), false);
+            run.insert(QStringLiteral("exit_code"), int(r.exit_code));
+            run.insert(QStringLiteral("error"), err);
+            guiTestState()[QStringLiteral("run")] = run;
+            guiTestWrite();
+            guiTestMaybeQuit();
+        }
+        // The failure popup is interactive-only: an automated run (report
+        // active) must never block on a modal box.
+        if (!guiTestActive())
+            QMessageBox::warning(this, tr("Cut failed"),
+                tr("sox failed (exit %1):\n%2").arg(r.exit_code).arg(err));
     }
 
     setControlsEnabled(true);

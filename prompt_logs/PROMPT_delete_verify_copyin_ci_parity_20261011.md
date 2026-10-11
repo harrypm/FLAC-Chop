@@ -137,3 +137,36 @@ builds libFLAC 1.5.0 into /usr/local (cmake + ldconfig + PKG_CONFIG_PATH via
 GITHUB_ENV); the three Linux CI locations call it instead of libflac-dev.
 In-flight 3507935 runs cancelled (they carry the old yml); re-pushed +
 re-dispatched.
+
+## Phase 4 — CLI cleanup + CLI-->GUI load testing — DONE, verified
+
+CLI (gui/main.cpp):
+- --help / -h exit 0 (was 2); --probe without a file prints a clear usage
+  error (exit 2); --rate validated to the five RF output modes; usage text
+  documents the --lds-backend alias; chop success notes print once-indented
+  (the old form doubled the prefix: "note: note:") with blank lines skipped.
+
+GUI automation (the MISRC model):
+- --smoke-test: full GUI startup then exit 0; headless-safe with
+  QT_QPA_PLATFORM=offscreen (verified). --config <dir>: QSettings INI
+  override applied before any settings use (missing dir = clear exit 2).
+- FLAC_CHOP_GUI_TEST=1 + _OUT (+ _QUIT / _RUN) on a --gui launch: the Chop
+  tab dumps probe + plan + ldc_available state; with _RUN it drives the
+  exact Process click path and onChopFinished dumps the run report
+  (ok / verify / sha brief / full notes / output / elapsed). Guards:
+  first-only probe dump, once-only auto-run trigger, auto-load skipped
+  during test runs (no re-probe in flight at exit), popups suppressed.
+- scripts/gui_cli_parity.sh (the 1:1 gate): a 20 MSPS .lds fixture (GPU
+  never engages -> deterministic SoX on both sides) through the CLI
+  (probe --json + chop) and the GUI (TEST hooks), asserting probe-field
+  parity, verify-PASS-with-count parity, identical STREAMINFO (sox --i),
+  and byte-identical decoded audio (sox -> raw -> sha256; containers
+  legitimately differ — the GUI embeds the pre-conversion editor rows).
+  Script fixes along the way: the GUI output name drops the .lds extension
+  (completeBaseName semantics), and sox/soxi resolve from FLAC_CHOP_SOX's
+  directory when not on PATH (sox --i replaces a separate soxi).
+- Verified locally: parity gate ALL CHECKS PASSED (decoded audio sha
+  4606d35f...755272); --help 0, --probe-no-file 2, --rate-validation 2,
+  --config-missing 2, --smoke-test 0 (offscreen).
+- tests.yml Linux leg runs the parity gate as a CI step (offscreen,
+  -DFLAC_CHOP_BUILD_LDC=OFF); readme documents the automation surface.

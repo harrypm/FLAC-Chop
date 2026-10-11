@@ -4,6 +4,8 @@
 #include <QIcon>
 #include <QPalette>
 #include <QSettings>
+#include <QDir>
+#include <QTimer>
 #include <QSize>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -66,6 +68,8 @@ struct GuiLaunch {
     double inPos = std::numeric_limits<double>::quiet_NaN();  // --in  (NaN = not given)
     double outPos = std::numeric_limits<double>::quiet_NaN(); // --out (NaN = not given)
     bool unitsSamples = false;  // --units samples|seconds (default seconds)
+    bool smokeTest = false;     // --smoke-test (full GUI startup, then exit 0)
+    QString configPath;         // --config <dir> (QSettings override for automation)
 };
 
 // Parse the --gui argument list (args[1] == "--gui", scan from args[2]).
@@ -98,6 +102,10 @@ static bool parseGuiArgs(const QStringList& args, GuiLaunch& gl)
                 std::fprintf(stderr, "--units must be 'samples' or 'seconds'\n");
                 return false;
             }
+        } else if (a == QStringLiteral("--smoke-test")) {
+            gl.smokeTest = true;
+        } else if (a == QStringLiteral("--config") && i + 1 < args.size()) {
+            gl.configPath = args[++i];
         } else if (!a.startsWith(QLatin1String("--")) && gl.file.isEmpty()) {
             gl.file = a;
         } else {
@@ -114,12 +122,20 @@ static bool parseGuiArgs(const QStringList& args, GuiLaunch& gl)
 //   2 = usage error (message already printed)
 // activateGui is set when the caller must pass the launch to MainWindow::
 // loadFileAndMarkers (an empty file = plain GUI).
-static int detectLaunchMode(const QStringList& args, GuiLaunch& gl, bool& activateGui)
+static int detectLaunchMode(QStringList& args, GuiLaunch& gl, bool& activateGui)
 {
     activateGui = false;
     if (args.size() == 1)
         return 1; // no args: the GUI as today
+    // GUI-only launch flags imply --gui (the MISRC automated-GUI-testing
+    // form: `flac-chop --smoke-test` or `flac-chop --config <dir>` stand
+    // alone). Normalize by inserting --gui so the one parser handles them.
+    if (args[1] == QStringLiteral("--smoke-test")
+        || args[1] == QStringLiteral("--config")) {
+        args.insert(1, QStringLiteral("--gui"));
+    }
     // --gui [<file>] [--in <pos>] [--out <pos>] [--units samples|seconds]
+    //       [--smoke-test] [--config <dir>]
     if (args[1] == QStringLiteral("--gui")) {
         if (!parseGuiArgs(args, gl))
             return 2;
@@ -246,6 +262,11 @@ static int runCli(int argc, char* argv[])
         std::printf("warnings           : %s\n", p.warnings[0] ? p.warnings : "(none)");
         return 0;
     }
+    // --probe without a file: a clear usage error, not the generic help.
+    if (args.size() == 2 && args[1] == QStringLiteral("--probe")) {
+        std::fprintf(stderr, "--probe needs a file: flac-chop --probe <in> [--json]\n");
+        return 2;
+    }
     // chop: <in> <out|dir> <start> <len> [opts]
     if (args.size() >= 5 && args[1] != QStringLiteral("--help") && args[1] != QStringLiteral("-h")) {
         const QString inPath = args[1];
@@ -257,8 +278,17 @@ static int runCli(int argc, char* argv[])
         uint ldsBackend = 0;      // 0=auto (GPU ld-compress-ng when available)
         bool verifyOutput = true; // bit-perfect conversion verify, default ON
         for (int i = 5; i < args.size(); ++i) {
-            if (args[i] == QStringLiteral("--rate") && i + 1 < args.size())
+            if (args[i] == QStringLiteral("--rate") && i + 1 < args.size()) {
                 outRateHz = args[++i].toULongLong();
+                // The GUI restricts output modes to the known RF set; hold the
+                // CLI to the same list (free-form rates were silently accepted
+                // before, and a typo'd rate would mislabel the output).
+                if (outRateHz != 10000 && outRateHz != 16000 && outRateHz != 20000
+                    && outRateHz != 24000 && outRateHz != 28600) {
+                    std::fprintf(stderr, "--rate must be one of 10000, 16000, 20000, 24000, 28600 (the RF output modes, kHz-style header rates)\n");
+                    return 2;
+                }
+            }
             else if ((args[i] == QStringLiteral("--encoder") || args[i] == QStringLiteral("--lds-backend"))
                      && i + 1 < args.size()) {
                 const QString b = args[++i];
@@ -389,7 +419,16 @@ static int runCli(int argc, char* argv[])
                 outRateHz, outBits, basic, isRf, &r);
         if (r.ok) {
             std::printf("ok: wrote %s\n", qPrintable(outPath));
-            if (r.stderr_buf[0]) std::printf("  note: %s\n", r.stderr_buf);
+            // The notes carry their own prefixes (note:/warning:) — print
+            // each line indented once instead of prefixing them all again
+            // (the old form printed "note: note: …").
+            if (r.stderr_buf[0]) {
+                const QString notes = QString::fromUtf8(r.stderr_buf).trimmed();
+                for (const QString& line : notes.split(QLatin1Char('\n'))) {
+                    if (!line.trimmed().isEmpty())
+                        std::printf("  %s\n", qPrintable(line));
+                }
+            }
             return 0;
         }
         std::fprintf(stderr, "sox failed (exit %d): %s\n", r.exit_code, r.stderr_buf);
@@ -408,6 +447,8 @@ static int runCli(int argc, char* argv[])
         "          [--units samples|seconds] [--rate 10000|16000|20000|24000|28600]\n"
         "          [--bits 8|12|6] [--no-filter]\n"
         "          [--encoder auto|gpu|sox] [--verify|--no-verify]\n"
+        "          (--encoder also answers to the older --lds-backend\n"
+        "           auto|gpu|ldc|sox spelling)\n"
         "  flac-chop --probe <in.flac> [--json]\n"
         "  flac-chop --version\n\n"
         "Units: --units seconds (default) takes start/len as real seconds;\n"
@@ -424,6 +465,11 @@ static int runCli(int argc, char* argv[])
         "       default; --no-verify skips it.\n\n"
         "Exit codes: 0 = ok, 1 = pipeline error (reason on stderr), 2 = usage error.\n",
         FLAC_CHOP_VERSION);
+    // --help / -h is a help request, not a usage error: exit 0. Anything
+    // else that falls through to here IS a usage error (exit 2).
+    if (args.size() >= 2
+        && (args[1] == QStringLiteral("--help") || args[1] == QStringLiteral("-h")))
+        return 0;
     return args.size() == 1 ? 0 : 2;
 }
 
@@ -467,6 +513,23 @@ int main(int argc, char* argv[])
     if (!qEnvironmentVariableIsSet("RESOURCE_NAME"))
         qputenv("RESOURCE_NAME", "flac-chop");
 #endif
+
+    // --config <dir> (the MISRC automated-GUI-testing model): load/store
+    // settings from that directory instead of the platform default, so
+    // automated runs launch with a pre-written config and never touch the
+    // user's real settings. Applied before any QSettings is constructed.
+    if (!gui.configPath.isEmpty()) {
+        const QDir cfgDir(gui.configPath);
+        if (cfgDir.exists()) {
+            QSettings::setDefaultFormat(QSettings::IniFormat);
+            QSettings::setPath(QSettings::IniFormat, QSettings::UserScope,
+                               cfgDir.absolutePath());
+        } else {
+            std::fprintf(stderr, "--config directory not found: %s\n",
+                         qPrintable(gui.configPath));
+            return 2;
+        }
+    }
 
     // Stock theme environment (the tbc-tools model): stop the desktop
     // palette tracking BEFORE construction, or Qt re-reads the OS palette
@@ -534,6 +597,13 @@ int main(int argc, char* argv[])
     w.show();
     if (activateGui && !gui.file.isEmpty())
         w.loadFileAndMarkers(gui.file, gui.inPos, gui.outPos, gui.unitsSamples);
+
+    // --smoke-test: the full startup path ran (app + theme + window + the
+    // optional file preload) — exit 0. Works under
+    // QT_QPA_PLATFORM=offscreen on headless CI (the window is constructed
+    // and shown, never interacted with).
+    if (gui.smokeTest)
+        QTimer::singleShot(750, qApp, &QCoreApplication::quit);
 
     return app.exec();
 }
