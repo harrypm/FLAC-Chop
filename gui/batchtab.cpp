@@ -25,6 +25,7 @@
 #include <QPushButton>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QSettings>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QThread>
@@ -43,6 +44,7 @@ struct BatchResult {
     bool cancelled = false;
     QString message; // Done: output path / Failed: reason
     qint64 elapsedMSecs = 0; // wall-clock processing time of the job
+    QString verify; // the "verify: …" verdict line from the notes, if any
 };
 
 // Stamps the job's wall-clock processing time into `out` at EVERY exit
@@ -125,6 +127,12 @@ BatchTab::BatchTab(QWidget* parent)
 {
     buildUi();
     refreshOutDirPlaceholder();
+    // Restore the persisted verify preference (default on — data-handling
+    // safety net for the whole-file batch workflow).
+    {
+        QSettings s;
+        m_verifyCheck->setChecked(s.value(QStringLiteral("batch/verify"), true).toBool());
+    }
     if (!fc_sox_available())
         m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — processing will fail."));
 }
@@ -207,8 +215,12 @@ void BatchTab::buildUi()
         .arg(std::max(1, QThread::idealThreadCount())));
     m_overwriteCheck = new QCheckBox(tr("Overwrite existing outputs"), optBox);
     m_overwriteCheck->setToolTip(tr("Unchecked: a file whose output already exists is skipped. Checked: the existing output is replaced."));
+    m_verifyCheck = new QCheckBox(tr("Verify output (bit-perfect, before deleting sources)"), optBox);
+    m_verifyCheck->setChecked(true);
+    m_verifyCheck->setToolTip(tr("After each PLAIN whole-file conversion, decode the output and compare every sample against the source. PASS proves the output is a bit-perfect replacement — safe to delete the source file. Processed conversions (rate/bit-depth changed) report a skip instead — keep the source."));
     optLay->addRow(QString(), m_parallelCheck);
     optLay->addRow(QString(), m_overwriteCheck);
+    optLay->addRow(QString(), m_verifyCheck);
     lay->addWidget(optBox);
 
     // --- Process + progress + status ---
@@ -408,6 +420,7 @@ void BatchTab::setControlsEnabled(bool enabled)
     m_filterCheck->setEnabled(enabled && m_modeCombo->currentData().toULongLong() > 0);
     m_parallelCheck->setEnabled(enabled);
     m_overwriteCheck->setEnabled(enabled);
+    m_verifyCheck->setEnabled(enabled);
     m_queue->setEnabled(enabled);
 }
 
@@ -527,6 +540,10 @@ void BatchTab::processQueue()
     for (int i = 0; i < total; ++i)
         m_cancelFlags.emplace_back(std::make_unique<std::atomic<int>>(0));
 
+    // Apply the bit-perfect verify preference before any job launches (the
+    // core reads the global flag per chop).
+    fc_set_verify_output(m_verifyCheck->isChecked() ? 1 : 0);
+
     m_running = true;
     const qint64 runStartMSecs = QDateTime::currentMSecsSinceEpoch();
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -645,6 +662,15 @@ void BatchTab::processQueue()
                                if (r.ok) {
                                    res.ok = true;
                                    res.message = job.output;
+                                   // Surface the bit-perfect verify verdict
+                                   // (data-handling safety, the same note
+                                   // the Chop tab shows).
+                                   for (const QString& line :
+                                        QString::fromUtf8(r.stderr_buf).split('\n')) {
+                                       const QString t = line.trimmed();
+                                       if (t.startsWith(QLatin1String("verify:")))
+                                           res.verify = t;
+                                   }
                                    return res;
                                }
                                const QString err = QString::fromUtf8(r.stderr_buf).trimmed();
@@ -713,6 +739,7 @@ void BatchTab::processQueue()
 
     // Final per-row statuses + summary (queue order).
     int done = 0, skipped = 0, cancelledCount = 0;
+    int verifiedPassed = 0, verifyFlagged = 0;
     QStringList failed;
     for (int i = 0; i < jobs.size(); ++i) {
         const Job& job = jobs.at(i);
@@ -728,9 +755,18 @@ void BatchTab::processQueue()
         const BatchResult& res = orderedResults[static_cast<size_t>(i)];
         if (res.ok) {
             ++done;
-            setRowStatus(job.row, tr("Done in %1 — %2")
-                             .arg(formatElapsedMSecs(res.elapsedMSecs), res.message),
-                         QStringLiteral("#6fbf73"));
+            if (res.verify.startsWith(QLatin1String("verify: PASS")))
+                ++verifiedPassed;
+            else if (!res.verify.isEmpty())
+                ++verifyFlagged;
+            QString text = tr("Done in %1 — %2")
+                               .arg(formatElapsedMSecs(res.elapsedMSecs), res.message);
+            if (!res.verify.isEmpty())
+                text += QLatin1Char('\n') + res.verify;
+            setRowStatus(job.row, text,
+                         res.verify.startsWith(QLatin1String("verify: FAILED"))
+                             ? QStringLiteral("#e8a040")
+                             : QStringLiteral("#6fbf73"));
         } else if (res.cancelled) {
             ++cancelledCount;
             setRowStatus(job.row, tr("Cancelled (after %1)")
@@ -754,6 +790,9 @@ void BatchTab::processQueue()
         summary = tr("Batch stopped: %1 done, %2 skipped, %3 failed, %4 cancelled. Total time: %5.")
                       .arg(done).arg(skipped).arg(failed.size()).arg(cancelledCount)
                       .arg(totalTime);
+    if (verifiedPassed > 0 || verifyFlagged > 0)
+        summary += tr(" Verified: %1 passed, %2 flagged.")
+                       .arg(verifiedPassed).arg(verifyFlagged);
     m_statusLabel->setText(summary);
     if (!failed.isEmpty())
         QMessageBox::warning(this, tr("Batch completed with errors"),

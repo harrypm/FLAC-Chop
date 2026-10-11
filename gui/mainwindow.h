@@ -53,6 +53,7 @@ protected:
 private slots:
     void browse();
     void process();
+    void showAboutDialog();
     void onProbeFinished();
     void onChopFinished();
     void onSliderInChanged(int v);
@@ -117,6 +118,11 @@ private:
     // Wall-clock start of the in-flight single cut (for the finished-time
     // status in onChopFinished).
     qint64 m_cutStartMSecs = 0;
+    // The finished cut's "Done in …" summary (incl. the notes/verify verdict).
+    // Set in onChopFinished; a non-FLAC conversion immediately auto-loads its
+    // output, whose probe would otherwise clobber the status before it is
+    // ever seen — onProbeFinished re-displays it above the probe status.
+    QString m_lastCutSummary;
     int m_sliderMaxDs = 0;    // slider range in deciseconds (0.1 s)
     double m_totalSec = 0.0;  // real total duration (s), 0 if unknown
 
@@ -149,6 +155,10 @@ private:
     QComboBox* m_outputBitsCombo = nullptr;
     QCheckBox* m_basicFilterCheck = nullptr;
     QLabel* m_filterProfileLabel = nullptr;
+    // LDS conversion engine (Auto/GPU/SoX) + bit-perfect verify toggle — both
+    // in the Output Processing box, persisted, applied in process().
+    QComboBox* m_ldsEngineCombo = nullptr;
+    QCheckBox* m_verifyCheck = nullptr;
     QPushButton* m_processBtn = nullptr;
     QPushButton* m_cancelBtn = nullptr;   // stops an in-flight cut
     QProgressBar* m_progress = nullptr;

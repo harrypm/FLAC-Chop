@@ -78,12 +78,58 @@ pub fn set_pending_output_comments(comments: Vec<String>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = comments;
 }
 
+// Bit-perfect output verification (the pre-deletion safety net — see the
+// `verify` module and `verify_after_conversion`): after a successful PLAIN
+// non-FLAC conversion, decode the output and compare every sample of the
+// cut window against the native source read. Enabled by default; the
+// GUI/CLI toggle it via `set_verify_output()` / `fc_set_verify_output()`.
+static VERIFY_OUTPUT: AtomicBool = AtomicBool::new(true);
+
+/// Enable/disable the bit-perfect output verification (default: enabled).
+pub fn set_verify_output(on: bool) {
+    VERIFY_OUTPUT.store(on, Ordering::Relaxed);
+}
+
+/// Collapse terminal-style `\r` overwrites: within each `\n`-delimited
+/// line, keep only the text AFTER the last `\r` — exactly what a terminal
+/// would display. SoX `-S` and ld-compress-ng `--progress` both repaint one
+/// stderr line with `\r`; the raw byte stream accumulates every intermediate
+/// repaint, which alone can overflow the 1024-byte FFI stderr buffer and
+/// push the final notes (the compressed summary, the verify verdict) out.
+fn collapse_cr_lines(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for (i, line) in raw.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        match line.rfind('\r') {
+            Some(pos) => out.push_str(&line[pos + 1..]),
+            None => out.push_str(line),
+        }
+    }
+    out
+}
+
 /// Parse SoX's `-S` "overall:X.XX%" from a chunk of stderr output.
 /// SoX writes progress with `\r` (carriage return), not newlines, so the
 /// reader feeds raw chunks and we search the last occurrence of "overall:".
 fn parse_sox_overall_progress(chunk: &str) -> Option<u32> {
     let pos = chunk.rfind("overall:")?;
     let after = chunk[pos + 8..].trim_start();
+    let pct_pos = after.find('%')?;
+    let num_str = &after[..pct_pos];
+    let pct: f64 = num_str.parse().ok()?;
+    Some((pct as u32).min(100))
+}
+
+/// Parse ld-compress-ng's `--progress` stderr line — `compressing: 42% (100
+/// MiB/240 MiB, ...)` — updating one line with `\r`. Same contract as
+/// [`parse_sox_overall_progress`]: fed raw chunks, returns the last percentage.
+#[cfg(not(feature = "static-sox"))]
+fn parse_ldc_progress(chunk: &str) -> Option<u32> {
+    let marker = "compressing:";
+    let pos = chunk.rfind(marker)?;
+    let after = chunk[pos + marker.len()..].trim_start();
     let pct_pos = after.find('%')?;
     let num_str = &after[..pct_pos];
     let pct: f64 = num_str.parse().ok()?;
@@ -127,6 +173,20 @@ fn temp_tag() -> String {
     )
 }
 
+/// Engine for whole-file `.lds` → FLAC conversions (partial cuts always use
+/// the SoX path — `ld-compress-ng compress` is whole-file only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LdsBackend {
+    /// ld-compress-ng (GPU) when resolvable; fall back to the SoX streaming
+    /// path when it is not or when it fails.
+    #[default]
+    Auto,
+    /// Require ld-compress-ng: fail when it is not found (no fallback).
+    Ldc,
+    /// Always the SoX streaming path.
+    Sox,
+}
+
 /// Optional post-cut processing controls for SoX.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ChopOptions {
@@ -164,6 +224,10 @@ pub struct ChopOptions {
     /// Channel count for headerless raw PCM (no header to sniff it from).
     /// `None` = 1 (cxadc/DdD RF captures are mono).
     pub input_channels: Option<u32>,
+    /// Engine for whole-file `.lds` → FLAC conversions (see [`LdsBackend`]).
+    /// The default (Auto) uses the GPU-accelerated ld-compress-ng when it is
+    /// resolvable beside the app or on PATH.
+    pub lds_backend: LdsBackend,
 }
 
 /// SoX CLI args that must precede the input path for the sniffed input
@@ -357,6 +421,116 @@ mod shelldet {
 }
 
 #[cfg(not(feature = "static-sox"))]
+mod ldcdet {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    fn binary_name() -> &'static str {
+        if cfg!(windows) {
+            "ld-compress-ng.exe"
+        } else {
+            "ld-compress-ng"
+        }
+    }
+
+    pub(super) fn candidates() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        if let Ok(raw) = env::var("FLAC_CHOP_LDC") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                out.push(PathBuf::from(trimmed));
+            }
+        }
+        if let Ok(exe) = env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                out.push(dir.join(binary_name()));
+                #[cfg(target_os = "macos")]
+                if let Some(contents_dir) = dir.parent() {
+                    out.push(contents_dir.join("Resources").join("bin").join("ld-compress-ng"));
+                }
+            }
+        }
+        out.push(PathBuf::from("ld-compress-ng"));
+        out
+    }
+
+    fn can_run(program: &Path) -> bool {
+        Command::new(program)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    pub(super) fn resolve() -> Option<PathBuf> {
+        candidates().into_iter().find(|p| can_run(p))
+    }
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// True when the GPU-accelerated ld-compress-ng CLI is resolvable (beside
+/// the app exe, then PATH; FLAC_CHOP_LDC overrides) and responds to
+/// `--version`. The GUI surfaces this via `fc_ldc_available()`.
+pub fn ldc_available() -> bool {
+    ldcdet::resolve().is_some()
+}
+
+#[cfg(feature = "static-sox")]
+/// The static-sox single-binary backend runs everything in-process (no
+/// subprocesses), so the ld-compress-ng CLI is never used there.
+pub fn ldc_available() -> bool {
+    false
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Run the whole-file accelerated conversion through ld-compress-ng:
+/// `compress --backend auto --overwrite --progress IN OUT`. The GPU does the
+/// FLAC frame analysis (Metal/Vulkan/OpenCL); a frame-threaded writer encodes
+/// the selected decisions; the output is native FLAC. Progress parses from
+/// the `--progress` stderr line (see [`parse_ldc_progress`]); cancel kills
+/// the child (it publishes transactionally from a private staging dir, so a
+/// killed or failed run never leaves a partial output). The child's stderr —
+/// which ends with the `compressed N bytes (X%, backend, threads)` summary —
+/// becomes the result's stderr (surfaced as notes).
+fn run_ldc_compress(
+    program: &Path,
+    in_path: &str,
+    out_path: &str,
+    cancel: Cancel<'_>,
+) -> Result<ChopResult, ChopResult> {
+    let mut cmd = Command::new(program);
+    cmd.arg("compress");
+    // No --backend flag: the default selection is already auto (the first
+    // usable of Metal / Vulkan / OpenCL / CPU-libFLAC), and it reports the
+    // chosen backend in the summary instead of silently rerunning CPU.
+    // The caller's overwrite check already ran (the GUI prompts); the
+    // ld-compress-ng staging publication then atomically replaces.
+    cmd.arg("--overwrite");
+    cmd.arg("--progress");
+    cmd.arg(in_path);
+    cmd.arg(out_path);
+    let (status, stderr) = match run_sox_child(cmd, None, cancel, parse_ldc_progress) {
+        Ok(v) => v,
+        Err(cancelled) => {
+            // A killed run stages privately and never publishes; remove any
+            // partial output defensively anyway (the SoX cancel contract).
+            let _ = std::fs::remove_file(out_path);
+            return Err(cancelled);
+        }
+    };
+    let ok = status.success();
+    if !ok {
+        let _ = std::fs::remove_file(out_path);
+    }
+    Ok(ChopResult {
+        ok,
+        exit_code: status.code().unwrap_or(-1),
+        stderr,
+    })
+}
+
+#[cfg(not(feature = "static-sox"))]
 /// Spawn a sox command and poll it until exit (supporting cancellation).
 /// `feed` (when Some) is moved to a writer thread that pumps the child's
 /// stdin — used for true 12-bit FLAC sources, which SoX cannot read as files
@@ -365,6 +539,7 @@ fn run_sox_child(
     mut cmd: Command,
     feed: Option<Box<dyn FnMut(&mut std::process::ChildStdin) -> Result<(), String> + Send>>,
     cancel: Cancel<'_>,
+    progress: fn(&str) -> Option<u32>,
 ) -> Result<(std::process::ExitStatus, String), ChopResult> {
     if feed.is_some() {
         // SoX stops reading (and closes the pipe) once it has the full trim
@@ -415,10 +590,12 @@ fn run_sox_child(
         slot
     });
 
-    // stderr reader thread: reads stderr continuously, parses SoX's -S
-    // "overall:X.XX%" progress into PROGRESS, and accumulates the text for
-    // the error/notes message after exit. EOF is seen when the child exits
-    // (or is killed), and the channel delivers the accumulated stderr.
+    // stderr reader thread: reads stderr continuously, parses the child's
+    // progress line into PROGRESS via the caller-supplied parser (SoX's -S
+    // "overall:X.XX%" or ld-compress-ng's "compressing: NN%"), and accumulates
+    // the text for the error/notes message after exit. EOF is seen when the
+    // child exits (or is killed), and the channel delivers the accumulated
+    // stderr.
     let mut stderr_handle = child.stderr.take().expect("stderr was piped");
     let (stderr_tx, stderr_rx) = std::sync::mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -433,7 +610,7 @@ fn run_sox_child(
                     let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
                     acc.push_str(&chunk);
                     partial.push_str(&chunk);
-                    if let Some(pct) = parse_sox_overall_progress(&partial) {
+                    if let Some(pct) = progress(&partial) {
                         PROGRESS.store(pct, Ordering::Relaxed);
                     }
                     // Keep only the tail: SoX overwrites progress with \r,
@@ -445,7 +622,7 @@ fn run_sox_child(
                 Err(_) => break,
             }
         }
-        let _ = stderr_tx.send(acc);
+        let _ = stderr_tx.send(collapse_cr_lines(&acc));
     });
 
     // Poll try_wait (non-blocking) so a cancel request can kill sox without
@@ -776,6 +953,133 @@ fn chop_native_input_ex(
     // 16-bit FLAC. The rest of the pipeline (trim/sinc/rate/6-bit/12-bit
     // passes) is unchanged; the stream rate is the FLAC header rate (the
     // /1000-convention value for RF, same stream SoX sees for the FLAC).
+    // 16-bit raw (u16/s16) can NEVER take the GPU path (16-bit samples do
+    // not fit the .lds 10-bit grid): a whole-file Ldc-required conversion
+    // gets a clear error instead of a silent SoX run; Auto uses SoX.
+    if matches!(in_fmt, InputFormat::U16 | InputFormat::S16)
+        && opts.lds_backend == LdsBackend::Ldc
+        && opts.input_channels.unwrap_or(1) == 1
+        && opts.output_rate_hz.is_none()
+        && opts.output_bits.is_none()
+        && start_samples == 0
+    {
+        let file_size = std::fs::metadata(in_path).map(|m| m.len()).unwrap_or(0);
+        let total = file_size / 2;
+        if file_size > 0 && length_samples >= total {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: "raw 16-bit: the GPU (ld-compress-ng) path packs onto the .lds 10-bit grid, which cannot represent 16-bit samples — use SoX".to_string(),
+            };
+        }
+    }
+    // (2) GPU whole-file path for RAW 8-bit captures (u8/s8) — the encoder
+    // preference is GLOBAL, not .lds-only: the raw stream packs exactly onto
+    // the .lds 10-bit grid ((b-128)*256 / s*256 are multiples of 256, hence
+    // always on the 64-grid) and runs through the accelerated ld-compress-ng
+    // conversion as a 16-bit native FLAC (ld-compress-ng's wasted-bits
+    // support compresses the 8 low zero bits away). Guards: whole-file,
+    // PLAIN (no rate/bit-depth/filter processing), MONO (the .lds form is
+    // mono), group-aligned size, and exactly 40 MSPS (ld-compress-ng writes
+    // the fixed 40 kHz header). 16-bit raw (u16/s16 cannot fit the 10-bit
+    // grid) and any other rate always use SoX; Ldc-required gets a clear
+    // error instead of a silent SoX run.
+    let mut gpu_fallback_note = String::new();
+    if matches!(in_fmt, InputFormat::U8 | InputFormat::S8)
+        && opts.lds_backend != LdsBackend::Sox
+        && opts.input_channels.unwrap_or(1) == 1
+        && opts.output_rate_hz.is_none()
+        && opts.output_bits.is_none()
+        && start_samples == 0
+    {
+        let file_size = std::fs::metadata(in_path).map(|m| m.len()).unwrap_or(0);
+        let rate_ok = file_size > 0
+            && file_size % crate::lds::GROUP_SAMPLES == 0
+            && length_samples >= file_size
+            && input_real_rate_hz(in_path, &opts)
+                .map(|r| (r - 40_000_000.0).abs() < 1.0)
+                .unwrap_or(false);
+        if opts.lds_backend == LdsBackend::Ldc && !rate_ok {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: "raw 8-bit: the GPU (ld-compress-ng) path needs a whole, exactly-40-MSPS, group-aligned mono capture (it packs onto the .lds 10-bit grid and writes the fixed 40 kHz header); this capture does not qualify (use SoX)".to_string(),
+            };
+        }
+        if rate_ok {
+            let ldc = ldcdet::resolve();
+            if opts.lds_backend == LdsBackend::Ldc && ldc.is_none() {
+                return ChopResult {
+                    ok: false,
+                    exit_code: -1,
+                    stderr: "raw 8-bit: GPU (ld-compress-ng) conversion requested but the executable was not found — place ld-compress-ng(.exe) beside the app or on PATH (FLAC_CHOP_LDC overrides)".to_string(),
+                };
+            }
+            if let Some(ldc_program) = &ldc {
+                let tmp = raw_lds_temp_path(out_path);
+                let _guard = TempFileGuard(tmp.clone());
+                let mut gpu_result: Option<ChopResult> = None;
+                match pack_raw8_to_lds(Path::new(in_path), in_fmt, &tmp) {
+                    Ok(()) => match run_ldc_compress(
+                        ldc_program,
+                        &tmp.to_string_lossy(),
+                        out_path,
+                        cancel,
+                    ) {
+                        Ok(mut res) => {
+                            if res.ok {
+                                if let Err(msg) = validate_cut_output(out_path, &res.stderr) {
+                                    res.ok = false;
+                                    res.exit_code = -1;
+                                    res.stderr = msg;
+                                }
+                            }
+                            if res.ok {
+                                rewrite_tags_after_cut(
+                                    out_path,
+                                    opts.is_rf,
+                                    extra_comments,
+                                    &mut res,
+                                );
+                            }
+                            gpu_result = Some(res);
+                        }
+                        Err(failure) => {
+                            if opts.lds_backend == LdsBackend::Ldc {
+                                return failure; // required: no fallback
+                            }
+                            let reason = failure.stderr.lines().next().unwrap_or("");
+                            gpu_fallback_note = format!(
+                                "note: GPU (ld-compress-ng) conversion failed ({reason}); fell back to the SoX path"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        if opts.lds_backend == LdsBackend::Ldc {
+                            return ChopResult {
+                                ok: false,
+                                exit_code: -1,
+                                stderr: format!("raw 8-bit: pack to .lds failed: {e}"),
+                            };
+                        }
+                        gpu_fallback_note =
+                            format!("note: raw pack to .lds failed ({e}); fell back to the SoX path");
+                    }
+                }
+                if let Some(mut res) = gpu_result {
+                    let note = format!(
+                        "note: raw 8-bit input — packed exactly onto the .lds 10-bit grid ((b\u{b1}128)\u{d7}256) and converted via the GPU ld-compress-ng path"
+                    );
+                    res.stderr = if res.stderr.is_empty() {
+                        note
+                    } else {
+                        format!("{note}\n{}", res.stderr)
+                    };
+                    return res;
+                }
+            }
+        }
+    }
     let (in_args, sox_input, stdin_feed) = match ext_feed {
         // A caller-provided stdin stream (the packed-.lds path): the input is
         // stdin ("-") with the caller's raw-s16 input args.
@@ -876,7 +1180,7 @@ fn chop_native_input_ex(
         cmd.arg("vol").arg("0.25");
     }
 
-    let (status, stderr) = match run_sox_child(cmd, stdin_feed, cancel) {
+    let (status, stderr) = match run_sox_child(cmd, stdin_feed, cancel, parse_sox_overall_progress) {
         Ok(v) => v,
         Err(cancelled) => {
             // Clean up the partial pass-1 temp file on failure/cancel.
@@ -903,7 +1207,7 @@ fn chop_native_input_ex(
         cmd2.arg("-b").arg("8");
         cmd2.arg(out_path);
         cmd2.arg("vol").arg("4");
-        match run_sox_child(cmd2, None, cancel) {
+        match run_sox_child(cmd2, None, cancel, parse_sox_overall_progress) {
             Ok((st, _se)) => {
                 if !st.success() {
                     r.ok = false;
@@ -947,10 +1251,92 @@ fn chop_native_input_ex(
             format!("{si_note}\n{}", r.stderr)
         };
     }
+    // The GPU raw path declined mid-flight (Auto): say why the SoX path ran.
+    if !gpu_fallback_note.is_empty() {
+        r.stderr = if r.stderr.is_empty() {
+            gpu_fallback_note
+        } else {
+            format!("{gpu_fallback_note}\n{}", r.stderr)
+        };
+    }
     if r.ok {
         rewrite_tags_after_cut(out_path, opts.is_rf, extra_comments, &mut r);
     }
     r
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Where to put the temp .lds for a GPU raw-8-bit conversion: beside the
+/// OUTPUT file (the user already needs space there), falling back to the
+/// system temp dir.
+fn raw_lds_temp_path(out_path: &str) -> PathBuf {
+    let name = format!(".flac-chop-rawsrc-{tag}.tmp.lds", tag = temp_tag());
+    if let Some(dir) = Path::new(out_path).parent() {
+        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+        let cand = dir.join(&name);
+        if std::fs::File::create(&cand).is_ok() {
+            return cand;
+        }
+    }
+    std::env::temp_dir().join(name)
+}
+
+#[cfg(not(feature = "static-sox"))]
+/// Pack a whole RAW 8-bit capture (u8/s8, mono) into a .lds for the GPU path.
+/// u8 sample = (b - 128) * 256, s8 sample = s * 256 — always multiples of
+/// 256, hence exactly on the .lds 64-grid, so [`crate::lds::pack_group`]
+/// quantizes with zero loss and the ld-compress-ng output decodes to
+/// exactly the scaled samples. The caller guarantees whole-file + size % 4 == 0.
+fn pack_raw8_to_lds(in_path: &Path, fmt: InputFormat, out_lds: &Path) -> Result<(), String> {
+    use std::io::{BufReader, BufWriter, Read, Write};
+    let mut src = BufReader::with_capacity(
+        1 << 20,
+        std::fs::File::open(in_path).map_err(|e| format!("open failed: {e}"))?,
+    );
+    let mut out = BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(out_lds).map_err(|e| format!("create failed: {e}"))?,
+    );
+    let scale = |b: u8| -> i16 {
+        match fmt {
+            InputFormat::U8 => ((i32::from(b) - 128) * 256) as i16,
+            InputFormat::S8 => (i32::from(b as i8) * 256) as i16,
+            _ => 0,
+        }
+    };
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 1 << 16];
+    let mut s16 = [0i16; 4];
+    let mut group = [0u8; 5];
+    loop {
+        let n = src.read(&mut buf).map_err(|e| format!("read failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let base = (carry.len() / 4) * 4;
+        let mut i = 0;
+        while i < base {
+            for j in 0..4 {
+                s16[j] = scale(carry[i + j]);
+            }
+            group = crate::lds::pack_group(&s16);
+            out.write_all(&group)
+                .map_err(|e| format!("write failed: {e}"))?;
+            i += 4;
+        }
+        carry.drain(..base);
+    }
+    // The caller guarantees a group-aligned size; a stray tail must be an
+    // error, not a silently dropped partial group.
+    if !carry.is_empty() {
+        return Err(format!(
+            "raw input has a {}-byte tail that cannot form a .lds packing group",
+            carry.len()
+        ));
+    }
+    out.flush().map_err(|e| format!("flush failed: {e}"))?;
+    Ok(())
 }
 
 #[cfg(not(feature = "static-sox"))]
@@ -1580,7 +1966,92 @@ fn chop_lds_input(
     let (first_sample, samples, mut r);
     #[cfg(not(feature = "static-sox"))]
     {
-        // Streaming path: unpack straight into SoX's stdin — no temp s16.
+        // (1) PLAIN whole-file + ld-compress-ng resolvable: run the GPU-
+        // accelerated native-FLAC conversion (Metal/Vulkan/OpenCL frame
+        // analysis + a frame-threaded writer). Validated on real captures:
+        // ~4x faster and ~4% smaller than the SoX streaming path, decoding
+        // byte-exact. PLAIN only: ld-compress-ng compresses the .lds as-is
+        // (16-bit at the /1000-convention header rate) — a rate/bit-depth/
+        // filter conversion cannot be expressed, so processed cuts always
+        // take the SoX path. LdsBackend::Sox skips it, Ldc requires it, Auto
+        // falls back to the SoX path below when it is not found or fails.
+        let ldc = if opts.lds_backend == LdsBackend::Sox {
+            None
+        } else {
+            ldcdet::resolve()
+        };
+        if opts.lds_backend == LdsBackend::Ldc && ldc.is_none() {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: "packed .lds: GPU (ld-compress-ng) conversion requested but the executable was not found — place ld-compress-ng(.exe) beside the app or on PATH (FLAC_CHOP_LDC overrides)".to_string(),
+            };
+        }
+        // ld-compress-ng writes a FIXED 40 kHz FLAC header (the .lds format
+        // convention — `compress` has no rate option): only exactly-40-MSPS
+        // captures can take the GPU path, or the output would be mislabeled
+        // (a 20 MSPS capture would present as 40 MSPS with a halved duration).
+        let rate_ok = (p.real_rate_hz - 40_000_000.0).abs() < 1.0;
+        let whole_file = start_samples == 0
+            && length_samples >= p.total_samples
+            && opts.output_rate_hz.is_none()
+            && opts.output_bits.is_none();
+        // The rate guard applies only where the GPU path would engage
+        // (whole-file + plain): partial cuts and processed conversions run
+        // SoX regardless of the preference, so they must not error out.
+        if whole_file && opts.lds_backend == LdsBackend::Ldc && !rate_ok {
+            return ChopResult {
+                ok: false,
+                exit_code: -1,
+                stderr: format!(
+                    "packed .lds: the GPU (ld-compress-ng) path writes the fixed .lds-format 40 kHz header — only exactly-40-MSPS captures can use it; this one probes as {:.0} MSPS (use SoX)",
+                    p.real_rate_hz / 1_000_000.0
+                ),
+            };
+        }
+        let whole_file = whole_file && rate_ok;
+        let mut ldc_result: Option<ChopResult> = None;
+        let mut ldc_note = String::new();
+        if whole_file {
+            if let Some(ldc_program) = &ldc {
+                match run_ldc_compress(ldc_program, in_path, out_path, cancel) {
+                    Ok(mut res) => {
+                        if res.ok {
+                            if let Err(msg) = validate_cut_output(out_path, &res.stderr) {
+                                res.ok = false;
+                                res.exit_code = -1;
+                                res.stderr = msg;
+                            }
+                        }
+                        if res.ok {
+                            rewrite_tags_after_cut(
+                                out_path,
+                                opts.is_rf,
+                                pending_extra,
+                                &mut res,
+                            );
+                        }
+                        ldc_result = Some(res);
+                    }
+                    Err(failure) => {
+                        if opts.lds_backend == LdsBackend::Ldc {
+                            return failure; // required: no fallback
+                        }
+                        // Auto: report and fall through to the SoX path.
+                        let reason = failure.stderr.lines().next().unwrap_or("");
+                        ldc_note = format!(
+                            "note: ld-compress-ng conversion failed ({reason}); fell back to the SoX path"
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(res) = ldc_result {
+            r = res;
+            first_sample = 0;
+            samples = p.total_samples;
+        } else {
+        // (2) Streaming path: unpack straight into SoX's stdin — no temp s16.
         let (feed, plan) = match make_lds_s16_feed(in_path, start_samples, length_samples) {
             Ok(v) => v,
             Err(e) => {
@@ -1622,6 +2093,14 @@ fn chop_lds_input(
         );
         first_sample = plan.first_sample;
         samples = plan.samples;
+        if !ldc_note.is_empty() {
+            r.stderr = if r.stderr.is_empty() {
+                ldc_note
+            } else {
+                format!("{ldc_note}\n{}", r.stderr)
+            };
+        }
+        }
     }
     #[cfg(feature = "static-sox")]
     {
@@ -1770,11 +2249,17 @@ pub fn chop_with_options_and_cancel(
         Ok(f) => f,
         Err(e) => return fail(e),
     };
-    if fmt != InputFormat::OggFlac {
+    // Whether the conversion processes the samples (rate/bit-depth change)
+    // and the RF flag — read before `opts` is consumed by the dispatch
+    // below. Only a PLAIN conversion can be bit-perfect (the verify pass
+    // depends on this); is_rf drives the post-completion tag pass.
+    let processed = opts.output_rate_hz.is_some() || opts.output_bits.is_some();
+    let is_rf = opts.is_rf;
+    let mut r = if fmt != InputFormat::OggFlac {
         // Packed .lds (DdD 10-bit): unpack the cut window to a temp s16 first,
         // then run the normal pipeline on that (chop_lds_input).
         if fmt == InputFormat::Lds {
-            return chop_lds_input(
+            chop_lds_input(
                 in_path,
                 out_path,
                 start_samples,
@@ -1782,54 +2267,123 @@ pub fn chop_with_options_and_cancel(
                 opts,
                 cancel,
                 &pending_extra,
-            );
+            )
+        } else {
+            chop_native_input(
+                in_path,
+                out_path,
+                start_samples,
+                length_samples,
+                opts,
+                cancel,
+                &pending_extra,
+            )
         }
-        return chop_native_input(
-            in_path,
-            out_path,
+    } else {
+        let tmp = ogg_window_temp_path(out_path);
+        let _guard = TempFileGuard(tmp.clone());
+        let win = match crate::ogg::remux_window(
+            Path::new(in_path),
+            &tmp,
             start_samples,
             length_samples,
-            opts,
+            &|| cancel.requested(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                if e.contains("cancelled") {
+                    cancel.consume(); // consume the flag
+                }
+                return fail(format!("Ogg FLAC: {e}"));
+            }
+        };
+        let mut inner = opts;
+        inner.input_format = Some(InputFormat::Flac);
+        let mut r = chop_native_input(
+            &tmp.to_string_lossy(),
+            out_path,
+            start_samples - win.first_sample,
+            length_samples,
+            inner,
             cancel,
             &pending_extra,
         );
-    }
-
-    let tmp = ogg_window_temp_path(out_path);
-    let _guard = TempFileGuard(tmp.clone());
-    let win = match crate::ogg::remux_window(
-        Path::new(in_path),
-        &tmp,
-        start_samples,
-        length_samples,
-        &|| cancel.requested(),
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            if e.contains("cancelled") {
-                cancel.consume(); // consume the flag
-            }
-            return fail(format!("Ogg FLAC: {e}"));
-        }
+        let note = format!(
+            "note: Ogg FLAC input — cut from a lossless native-FLAC remux of samples {}..{} ({} frames)",
+            win.first_sample,
+            win.first_sample + win.samples,
+            win.frames
+        );
+        r.stderr = if r.stderr.is_empty() { note } else { format!("{note}\n{}", r.stderr) };
+        r
     };
-    let mut inner = opts;
-    inner.input_format = Some(InputFormat::Flac);
-    let mut r = chop_native_input(
-        &tmp.to_string_lossy(),
-        out_path,
-        start_samples - win.first_sample,
-        length_samples,
-        inner,
-        cancel,
-        &pending_extra,
-    );
-    let note = format!(
-        "note: Ogg FLAC input — cut from a lossless native-FLAC remux of samples {}..{} ({} frames)",
-        win.first_sample,
-        win.first_sample + win.samples,
-        win.frames
-    );
-    r.stderr = if r.stderr.is_empty() { note } else { format!("{note}\n{}", r.stderr) };
+    // Bit-perfect output verification (the pre-deletion safety net): plain
+    // non-FLAC conversions prove the output decodes back to the source
+    // before the user deletes it; processed conversions report an explicit
+    // skip; FLAC/Ogg sources are lossless by construction (no note).
+    if r.ok && VERIFY_OUTPUT.load(Ordering::Relaxed) {
+        verify_after_conversion(
+            in_path,
+            out_path,
+            fmt,
+            start_samples,
+            length_samples,
+            processed,
+            &mut r,
+        );
+    }
+    // Post-completion provenance, part 1: the SOURCE file's whole-byte
+    // SHA-256 embedded in the output's Vorbis tags (SOURCE_SHA256) — the
+    // permanent record of exactly which source bytes produced this output,
+    // surviving the source's deletion (a later decompression of the output
+    // can be byte-compared against it). Conversions only — a FLAC-family
+    // source is a cut of a kept file, not a replaced one. The output's own
+    // whole-file checksum cannot be embedded in itself (writing the tag
+    // changes the bytes); FLAC's STREAMINFO md5 remains the format's own
+    // decoded-audio integrity record.
+    if r.ok
+        && matches!(
+            fmt,
+            InputFormat::Lds
+                | InputFormat::Wav
+                | InputFormat::U8
+                | InputFormat::S8
+                | InputFormat::U16
+                | InputFormat::S16
+        )
+    {
+        match crate::sha256::file_sha256(Path::new(in_path)) {
+            Ok(hex) => {
+                let extra = vec![format!("SOURCE_SHA256={hex}")];
+                if let Err(e) =
+                    crate::tags::rewrite_cut_tags(Path::new(out_path), is_rf, &extra)
+                {
+                    append_note(
+                        &mut r,
+                        &format!("warning: SOURCE_SHA256 tag embed failed: {e}"),
+                    );
+                }
+            }
+            Err(e) => append_note(
+                &mut r,
+                &format!("warning: source checksum could not be computed: {e}"),
+            ),
+        }
+    }
+    // Part 2, LAST (after every tag write, so it matches the FINAL file
+    // bytes): the completed OUTPUT's whole-file SHA-256 as a note — the
+    // same value `sha256sum <file>` / `certutil -hashfile <file> SHA256`
+    // reports, for re-checking the file at any time after the source is
+    // deleted.
+    if r.ok {
+        match crate::sha256::file_sha256(Path::new(out_path)) {
+            Ok(hex) => append_note(&mut r, &format!("sha256(output): {hex}")),
+            Err(e) => append_note(
+                &mut r,
+                &format!("warning: output checksum could not be computed: {e}"),
+            ),
+        }
+    }
     r
 }
 
@@ -1998,6 +2552,86 @@ fn rewrite_tags_after_cut(
     }
 }
 
+/// Append a note to a chop result's stderr (the notes channel the GUI/CLI
+/// surface; a "warning:" prefix makes the GUI pop a message box).
+fn append_note(r: &mut ChopResult, note: &str) {
+    if r.stderr.is_empty() {
+        r.stderr = note.to_string();
+    } else {
+        r.stderr.push('\n');
+        r.stderr.push_str(note);
+    }
+}
+
+/// Bit-perfect output verification after a successful conversion (see the
+/// `verify` module — the pre-deletion safety net). Plain non-FLAC
+/// conversions decode the output and compare every sample of the cut window
+/// against the native source read; processed conversions (rate/bit-depth)
+/// report an explicit skip (the samples are intentionally transformed — the
+/// output is NOT a proven replacement, keep the source); FLAC/Ogg sources
+/// are lossless cuts by construction and get no note at all.
+fn verify_after_conversion(
+    in_path: &str,
+    out_path: &str,
+    fmt: InputFormat,
+    start_samples: u64,
+    length_samples: u64,
+    processed: bool,
+    r: &mut ChopResult,
+) {
+    use crate::verify::VerifyOutcome;
+    match fmt {
+        InputFormat::Flac | InputFormat::OggFlac => {} // lossless: no note
+        InputFormat::Lds
+        | InputFormat::Wav
+        | InputFormat::U8
+        | InputFormat::S8
+        | InputFormat::U16
+        | InputFormat::S16 => {
+            if processed {
+                append_note(
+                    r,
+                    "verify: skipped — output processing (rate/bit-depth) transforms the samples, so bit-perfection is undefined; the output is NOT a proven replacement — keep the source",
+                );
+                return;
+            }
+            let outcome = crate::verify::verify_conversion(
+                Path::new(in_path),
+                Path::new(out_path),
+                fmt,
+                start_samples,
+                length_samples,
+            );
+            match outcome {
+                Ok(VerifyOutcome::Pass { samples }) => append_note(
+                    r,
+                    &format!(
+                        "verify: PASS ({samples} samples, bit-perfect) — safe to delete the source"
+                    ),
+                ),
+                Ok(VerifyOutcome::Fail { samples, reason }) => append_note(
+                    r,
+                    &format!(
+                        "warning: verify: FAILED after {samples} samples: {reason} — do NOT delete the source"
+                    ),
+                ),
+                Ok(VerifyOutcome::Unsupported(reason)) => append_note(
+                    r,
+                    &format!(
+                        "verify: skipped — {reason}; the output is NOT a proven replacement — keep the source"
+                    ),
+                ),
+                Err(e) => append_note(
+                    r,
+                    &format!(
+                        "warning: verify: could not run: {e} — do not treat the output as verified"
+                    ),
+                ),
+            }
+        }
+    }
+}
+
 /// Request cancellation of the currently-running single cut (if any). Safe
 /// to call from the GUI thread while a `Cancel::Global` chop runs on a worker
 /// thread. Per-job (`Cancel::Job`) chops are cancelled by the caller's own
@@ -2055,6 +2689,33 @@ pub fn generate_output_path(in_path: &str, out_dir: &str, stem_override: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ldc_progress_extracts_last_percentage() {
+        // The --progress stderr line updates in place with \r; the parser
+        // must find the LAST "compressing: NN%" in a chunk stream.
+        assert_eq!(parse_ldc_progress("compressing: 0% (0 MiB/240 MiB)"), Some(0));
+        assert_eq!(
+            parse_ldc_progress("\rcompressing: 42% (100 MiB/240 MiB, 84 Msamples)"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_ldc_progress(
+                "compressing: 41% (99 MiB/240 MiB)\rcompressing: 99% (238 MiB/240 MiB)"
+            ),
+            Some(99)
+        );
+        // The final "complete" line still carries a percentage.
+        assert_eq!(
+            parse_ldc_progress(
+                "compressing: 100% (240 MiB/240 MiB, 201 Msamples), complete, average 15 MiB/s, elapsed 15s"
+            ),
+            Some(100)
+        );
+        // No marker, no progress.
+        assert_eq!(parse_ldc_progress("average 15 MiB/s"), None);
+        assert_eq!(parse_ldc_progress(""), None);
+    }
 
     #[test]
     fn output_path_appends_cut() {

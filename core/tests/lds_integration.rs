@@ -110,7 +110,11 @@ fn lds_full_cut_roundtrips_the_reference_scaling() {
     }
     let samples = ramp(20_000);
     let in_path = write_lds("fc_lds_full_20msps.lds", &samples);
-    let (r, out) = cut(&in_path, "fc_lds_full_out.flac", 0, 20_000, opts_rf());
+    // Force SoX (a deterministic engine regardless of the environment; the
+    // accelerated whole-file path has its own dedicated test).
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Sox;
+    let (r, out) = cut(&in_path, "fc_lds_full_out.flac", 0, 20_000, o);
     assert!(r.ok, "{}", r.stderr);
     assert!(r.stderr.contains("packed .lds input"), "{}", r.stderr);
 
@@ -187,6 +191,254 @@ fn lds_cut_to_true_12bit_flac_is_exact() {
 }
 
 #[test]
+fn lds_whole_file_cut_can_use_accelerated_ldc_backend() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // The GPU-accelerated whole-file path: when the ld-compress-ng CLI is
+    // resolvable (beside the app, PATH, or FLAC_CHOP_LDC), a WHOLE-FILE cut
+    // with lds_backend=Ldc runs it; the output must decode byte-exact, carry
+    // the embedded tags, and the verify pass must PASS. Without the CLI the
+    // Ldc preference must fail with the clear not-found error.
+    let samples = ramp(20_000);
+    // 40 MSPS (the ld-compress-ng .lds convention): the GPU path writes a
+    // fixed 40 kHz header, so only exactly-40-MSPS captures qualify.
+    let in_path = write_lds("fc_lds_ldc_40msps.lds", &samples);
+    let dir = temp("fc_lds_it_ldc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("fc_lds_ldc_out.flac");
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Ldc;
+    let cancel = std::sync::atomic::AtomicI32::new(0);
+    let r = chop_with_options_and_cancel(
+        &in_path.to_string_lossy(),
+        &out.to_string_lossy(),
+        0,
+        20_000,
+        o,
+        Some(&cancel),
+    );
+    if !flac_chop_core::chop::ldc_available() {
+        // The required backend is missing: a clear error, no fallback, and
+        // no output file.
+        assert!(!r.ok, "expected failure without ld-compress-ng");
+        assert!(
+            r.stderr.contains("ld-compress-ng"),
+            "error should name ld-compress-ng: {}",
+            r.stderr
+        );
+        assert!(!out.exists(), "no partial output on a failed run");
+        eprintln!("skipping the accelerated assertions: ld-compress-ng not available");
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(r.ok, "{}", r.stderr);
+    // Byte-exact decode (the same guarantee as the SoX path).
+    let (_, got) = read_flac(&out);
+    assert_eq!(got.len(), samples.len());
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(*g, i32::from(samples[i]), "sample {i}");
+    }
+    // The tag machinery ran on the accelerated output too.
+    let (_, comments) = flac_chop_core::tags::read_all_comments(&out).unwrap();
+    let has = |k: &str| {
+        comments
+            .iter()
+            .any(|(ck, _)| ck.eq_ignore_ascii_case(k))
+    };
+    assert!(has("RF_TOTAL_SAMPLES"));
+    assert!(has("RF_SAMPLE_RATE"));
+    // The bit-perfect verification pass reported PASS.
+    assert!(
+        r.stderr.contains("verify: PASS"),
+        "verify pass must report PASS: {}",
+        r.stderr
+    );
+    // The completed-output checksum note + the embedded source provenance.
+    assert!(
+        r.stderr.contains("sha256(output): "),
+        "the finish notes must carry the output checksum: {}",
+        r.stderr
+    );
+    assert!(has("SOURCE_SHA256"), "SOURCE_SHA256 must be embedded");
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn raw_u8_whole_file_cut_can_use_accelerated_ldc_backend() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // The GLOBAL engine: whole-file raw u8 (40 MSPS, mono, group-aligned)
+    // packs exactly onto the .lds 10-bit grid — (b-128)*256 is a multiple of
+    // 256, hence of 64 — and converts via ld-compress-ng as 16-bit native
+    // FLAC holding exactly (b-128)*256. Without the CLI the Ldc preference
+    // fails with the clear not-found error.
+    let bytes: Vec<u8> = (0..20_000u32).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+    let in_path = temp("fc_raw_u8_40msps.u8");
+    std::fs::write(&in_path, &bytes).unwrap();
+    let dir = temp("fc_raw_it_ldc");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("fc_raw_u8_out.flac");
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Ldc;
+    let cancel = std::sync::atomic::AtomicI32::new(0);
+    let r = chop_with_options_and_cancel(
+        &in_path.to_string_lossy(),
+        &out.to_string_lossy(),
+        0,
+        20_000,
+        o,
+        Some(&cancel),
+    );
+    if !flac_chop_core::chop::ldc_available() {
+        assert!(!r.ok, "expected failure without ld-compress-ng");
+        assert!(
+            r.stderr.contains("ld-compress-ng"),
+            "error should name ld-compress-ng: {}",
+            r.stderr
+        );
+        assert!(!out.exists(), "no partial output on a failed run");
+        eprintln!("skipping the accelerated assertions: ld-compress-ng not available");
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(r.ok, "{}", r.stderr);
+    let (si, got) = read_flac(&out);
+    assert_eq!((si.channels, si.bits_per_sample), (1, 16));
+    assert_eq!(got.len(), bytes.len());
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(*g, (i32::from(bytes[i]) - 128) * 256, "sample {i}");
+    }
+    // The tag machinery + verify + checksums ran on the GPU output.
+    let (_, comments) = flac_chop_core::tags::read_all_comments(&out).unwrap();
+    let has = |k: &str| comments.iter().any(|(ck, _)| ck.eq_ignore_ascii_case(k));
+    assert!(has("RF_TOTAL_SAMPLES"));
+    assert!(has("SOURCE_SHA256"));
+    assert!(
+        r.stderr.contains("verify: PASS"),
+        "verify must report PASS: {}",
+        r.stderr
+    );
+    assert!(
+        r.stderr.contains("sha256(output): "),
+        "finish notes must carry the output checksum: {}",
+        r.stderr
+    );
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn raw_u8_gpu_rejected_for_non_40msps_rate() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // A 10 MSPS raw u8 with Ldc: the GPU path writes the fixed 40 kHz header,
+    // so it must refuse (a clear error) instead of producing a mislabeled
+    // file. Auto (the default) silently uses the SoX path.
+    let bytes: Vec<u8> = (0..8_192u32).map(|i| ((i * 29 + 7) & 0xff) as u8).collect();
+    let in_path = temp("fc_raw_u8_10msps.u8");
+    std::fs::write(&in_path, &bytes).unwrap();
+    let dir = temp("fc_raw_it_rate");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("fc_raw_u8_out.flac");
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Ldc;
+    let cancel = std::sync::atomic::AtomicI32::new(0);
+    let r = chop_with_options_and_cancel(
+        &in_path.to_string_lossy(),
+        &out.to_string_lossy(),
+        0,
+        8_192,
+        o,
+        Some(&cancel),
+    );
+    assert!(!r.ok, "expected the rate guard to refuse");
+    assert!(
+        r.stderr.contains("40") && r.stderr.contains("MSPS"),
+        "error should explain the 40 MSPS constraint: {}",
+        r.stderr
+    );
+    assert!(!out.exists(), "no output on a refused GPU run");
+    // Auto (the default) silently falls back to the SoX path and succeeds.
+    let o2 = opts_rf(); // lds_backend = Auto
+    let r2 = chop_with_options_and_cancel(
+        &in_path.to_string_lossy(),
+        &out.to_string_lossy(),
+        0,
+        8_192,
+        o2,
+        Some(&cancel),
+    );
+    assert!(r2.ok, "{}", r2.stderr);
+    let (si, got) = read_flac(&out);
+    assert_eq!(si.bits_per_sample, 8, "the SoX path writes native 8-bit");
+    assert_eq!(got.len(), 8_192);
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(*g, i32::from(bytes[i]) - 128, "sample {i}");
+    }
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lds_gpu_rejected_for_non_40msps_lds() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // A 10 MSPS .lds (msps hint) with Ldc: same rate guard — refuse instead
+    // of writing a mislabeled 40 kHz file.
+    let samples = ramp(20_000);
+    let in_path = write_lds("fc_lds_10msps.lds", &samples);
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Ldc;
+    let (r, out) = cut(&in_path, "fc_lds_rate_out.flac", 0, 20_000, o);
+    assert!(!r.ok, "expected the rate guard to refuse");
+    assert!(
+        r.stderr.contains("40") && r.stderr.contains("MSPS"),
+        "error should explain the 40 MSPS constraint: {}",
+        r.stderr
+    );
+    assert!(!out.exists(), "no output on a refused GPU run");
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn lds_partial_cut_stays_on_sox_even_with_ldc_backend() {
+    if !sox_available() {
+        eprintln!("skipping: sox not available (cut requires it)");
+        return;
+    }
+    // ld-compress-ng is whole-file only: a PARTIAL cut with lds_backend=Ldc
+    // must still run the SoX streaming path (no error, no accelerated run).
+    let samples = ramp(20_000);
+    let in_path = write_lds("fc_lds_ldc_part_20msps.lds", &samples);
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Ldc;
+    let (r, out) = cut(&in_path, "fc_lds_ldc_part_out.flac", 5001, 3777, o);
+    assert!(r.ok, "{}", r.stderr);
+    let (_, got) = read_flac(&out);
+    assert_eq!(got.len(), 3777);
+    for (i, g) in got.iter().enumerate() {
+        assert_eq!(*g, i32::from(samples[5001 + i]), "sample {i}");
+    }
+    let _ = std::fs::remove_file(&in_path);
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn lds_cut_embeds_pending_output_comments() {
     if !sox_available() {
         eprintln!("skipping: sox not available (cut requires it)");
@@ -210,12 +462,16 @@ fn lds_cut_embeds_pending_output_comments() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let out = dir.join("fc_lds_meta_out.flac");
+    // Force SoX for determinism (the accelerated path also threads the
+    // pending rows, but keep this test engine-stable).
+    let mut o = opts_rf();
+    o.lds_backend = flac_chop_core::chop::LdsBackend::Sox;
     let r = chop_with_options(
         &in_path.to_string_lossy(),
         &out.to_string_lossy(),
         0,
         20_000,
-        opts_rf(),
+        o,
     );
     assert!(r.ok, "{}", r.stderr);
     let (_, comments) = flac_chop_core::tags::read_all_comments(&out).unwrap();

@@ -74,6 +74,22 @@ int fc_sox_available(void);
 void fc_chop_cancel(void);
 uint32_t fc_chop_get_progress(void); // 0-100 = running; 101 = idle
 
+// Set the engine for whole-file `.lds` → FLAC conversions: 0 = auto (the GPU
+// ld-compress-ng when resolvable beside the app or on PATH, the SoX streaming
+// path as fallback), 1 = require GPU, 2 = SoX. Applies to every subsequent
+// chop (partial .lds cuts always use SoX — ld-compress-ng is whole-file only).
+void fc_set_lds_backend(uint32_t pref);
+// 1 when the GPU-accelerated ld-compress-ng CLI is resolvable (beside the app
+// exe, then PATH; FLAC_CHOP_LDC overrides).
+int32_t fc_ldc_available(void);
+// Enable/disable the bit-perfect output verification for non-FLAC
+// conversions (default: enabled). After a plain conversion the output is
+// decoded and compared against the source sample-for-sample; a PASS verdict
+// (surfaced in the chop notes) means the output is a proven bit-perfect
+// replacement — safe to delete the source. Processed conversions (rate/
+// bit-depth changes) report an explicit skip (keep the source).
+void fc_set_verify_output(int32_t on);
+
 // Set the Vorbis comments embedded into the NEXT cut's output FLAC (the
 // GUI's pre-conversion metadata editor rows for raw/packed sources, which
 // cannot carry tags themselves). `comments` = n NUL-terminated "KEY=value"

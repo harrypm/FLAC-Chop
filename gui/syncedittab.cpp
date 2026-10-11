@@ -23,6 +23,7 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QSet>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QTableWidget>
 #include <QTableWidgetItem>
@@ -45,6 +46,7 @@ struct SyncResult {
     bool cancelled = false;
     QString message;
     qint64 elapsedMSecs = 0; // wall-clock processing time of the job
+    QString verify; // the "verify: …" verdict line from the notes, if any
 };
 
 QString normalizeInputPath(const QString& raw)
@@ -134,6 +136,12 @@ SyncEditTab::SyncEditTab(QWidget* parent)
 {
     buildUi();
     refreshOutDirPlaceholder();
+    // Restore the persisted verify preference (default on — data-handling
+    // safety net for the sync-cut workflow).
+    {
+        QSettings s;
+        m_verifyCheck->setChecked(s.value(QStringLiteral("sync/verify"), true).toBool());
+    }
     if (!fc_sox_available())
         m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — processing will fail."));
 }
@@ -515,6 +523,10 @@ void SyncEditTab::processQueue()
         }
     }
 
+    // Apply the bit-perfect verify preference before any job launches (the
+    // core reads the global flag per chop).
+    fc_set_verify_output(m_verifyCheck->isChecked() ? 1 : 0);
+
     // --- Run (the Batch tab's sliding-window pump loop model) ---
     m_running = true;
     const qint64 runStartMSecs = QDateTime::currentMSecsSinceEpoch();
@@ -562,6 +574,13 @@ void SyncEditTab::processQueue()
             SyncResult res;
             res.ok = r.ok != 0;
             res.message = QString::fromUtf8(r.stderr_buf);
+            // Surface the bit-perfect verify verdict (data-handling safety,
+            // the same note the Chop tab shows).
+            for (const QString& line : res.message.split('\n')) {
+                const QString t = line.trimmed();
+                if (t.startsWith(QLatin1String("verify:")))
+                    res.verify = t;
+            }
             res.elapsedMSecs = QDateTime::currentMSecsSinceEpoch() - t0;
             if (cancelFlag->load() != 0)
                 res.cancelled = true;
@@ -574,9 +593,10 @@ void SyncEditTab::processQueue()
     auto* pumpTimer = new QTimer(this);
     pumpTimer->setInterval(0);
     int joined = 0, done = 0, failed = 0, cancelledCount = 0;
+    int verifiedPassed = 0, verifyFlagged = 0;
     connect(pumpTimer, &QTimer::timeout, this, [this, pumpTimer, &futures,
             &joined, &done, &failed, &cancelledCount, totalJobs, &jobs,
-            &runStartMSecs]() {
+            &runStartMSecs, &verifiedPassed, &verifyFlagged]() {
         // Stop requested: cancel any not-yet-joined jobs.
         if (m_stopRequested.load()) {
             for (size_t i = joined; i < m_cancelFlags.size(); ++i)
@@ -595,10 +615,19 @@ void SyncEditTab::processQueue()
                              QStringLiteral("#b8860b"));
                 ++cancelledCount;
             } else if (res.ok) {
-                setRowStatus(job.row, tr("Done in %1 — %2").arg(
+                if (res.verify.startsWith(QLatin1String("verify: PASS")))
+                    ++verifiedPassed;
+                else if (!res.verify.isEmpty())
+                    ++verifyFlagged;
+                QString text = tr("Done in %1 — %2").arg(
                     formatElapsedMSecs(res.elapsedMSecs),
-                    QDir::toNativeSeparators(job.output)),
-                    QStringLiteral("#2d8a4e"));
+                    QDir::toNativeSeparators(job.output));
+                if (!res.verify.isEmpty())
+                    text += QLatin1Char('\n') + res.verify;
+                setRowStatus(job.row, text,
+                    res.verify.startsWith(QLatin1String("verify: FAILED"))
+                        ? QStringLiteral("#b8860b")
+                        : QStringLiteral("#2d8a4e"));
                 ++done;
             } else {
                 setRowStatus(job.row, tr("Failed (after %1) — %2").arg(
@@ -617,10 +646,14 @@ void SyncEditTab::processQueue()
             m_stopRequested.store(false);
             m_stopBtn->setEnabled(false);
             setControlsEnabled(true);
-            m_statusLabel->setText(tr("Sync edit done: %1 ok, %2 failed, %3 cancelled. Total time: %4.")
+            QString summary = tr("Sync edit done: %1 ok, %2 failed, %3 cancelled. Total time: %4.")
                 .arg(done).arg(failed).arg(cancelledCount)
                 .arg(formatElapsedMSecs(
-                    QDateTime::currentMSecsSinceEpoch() - runStartMSecs)));
+                    QDateTime::currentMSecsSinceEpoch() - runStartMSecs));
+            if (verifiedPassed > 0 || verifyFlagged > 0)
+                summary += tr(" Verified: %1 passed, %2 flagged.")
+                               .arg(verifiedPassed).arg(verifyFlagged);
+            m_statusLabel->setText(summary);
         }
     });
     pumpTimer->start();
@@ -742,8 +775,12 @@ void SyncEditTab::buildUi()
         .arg(std::max(1, QThread::idealThreadCount())));
     m_overwriteCheck = new QCheckBox(tr("Overwrite existing outputs"), optBox);
     m_overwriteCheck->setToolTip(tr("Unchecked: a file whose output already exists is skipped. Checked: the existing output is replaced."));
+    m_verifyCheck = new QCheckBox(tr("Verify output (bit-perfect, before deleting sources)"), optBox);
+    m_verifyCheck->setChecked(true);
+    m_verifyCheck->setToolTip(tr("After each PLAIN cut, decode the output and compare every sample against the source. PASS proves the output is a bit-perfect replacement — safe to delete the source file. Processed conversions (rate/bit-depth changed) report a skip instead — keep the source."));
     optLay->addRow(QString(), m_parallelCheck);
     optLay->addRow(QString(), m_overwriteCheck);
+    optLay->addRow(QString(), m_verifyCheck);
     lay->addWidget(optBox);
 
     // --- Process + progress + status ---
@@ -842,6 +879,7 @@ void SyncEditTab::setControlsEnabled(bool enabled)
     m_filterCheck->setEnabled(enabled);
     m_inEdit->setEnabled(enabled);
     m_outEdit->setEnabled(enabled);
+    m_verifyCheck->setEnabled(enabled);
 }
 
 void SyncEditTab::browseOutDir()

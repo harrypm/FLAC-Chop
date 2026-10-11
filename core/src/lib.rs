@@ -23,9 +23,11 @@ pub mod msps;
 pub mod ogg;
 pub mod probe;
 pub mod rate;
+pub mod sha256;
 pub mod streaminfo;
 pub mod vorbis;
 pub mod tags;
+pub mod verify;
 
 #[cfg(feature = "static-sox")]
 pub mod sox_ffi;

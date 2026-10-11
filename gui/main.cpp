@@ -254,9 +254,29 @@ static int runCli(int argc, char* argv[])
         // positional start/len are parsed.
         quint64 outRateHz = 0; uint outBits = 0; bool basicFilter = true;
         bool samplesUnits = false; // default: seconds (back-compat)
+        uint ldsBackend = 0;      // 0=auto (GPU ld-compress-ng when available)
+        bool verifyOutput = true; // bit-perfect conversion verify, default ON
         for (int i = 5; i < args.size(); ++i) {
             if (args[i] == QStringLiteral("--rate") && i + 1 < args.size())
                 outRateHz = args[++i].toULongLong();
+            else if ((args[i] == QStringLiteral("--encoder") || args[i] == QStringLiteral("--lds-backend"))
+                     && i + 1 < args.size()) {
+                const QString b = args[++i];
+                if (b == QStringLiteral("auto")) {
+                    ldsBackend = 0;
+                } else if (b == QStringLiteral("gpu") || b == QStringLiteral("ldc")) {
+                    ldsBackend = 1;
+                } else if (b == QStringLiteral("sox")) {
+                    ldsBackend = 2;
+                } else {
+                    std::fprintf(stderr, "--encoder must be auto, gpu, or sox\n");
+                    return 2;
+                }
+            }
+            else if (args[i] == QStringLiteral("--verify"))
+                verifyOutput = true;
+            else if (args[i] == QStringLiteral("--no-verify"))
+                verifyOutput = false;
             else if (args[i] == QStringLiteral("--bits") && i + 1 < args.size()) {
                 outBits = args[++i].toUInt();
                 if (outBits != 8 && outBits != 12 && outBits != 6) {
@@ -356,6 +376,10 @@ static int runCli(int argc, char* argv[])
                      (unsigned long long)plan.length_samples,
                      samplesUnits ? QStringLiteral(" (exact, --units samples)").toUtf8().constData() : "",
                      (unsigned long long)p.header_sample_rate, p.is_rf, qPrintable(outPath));
+        // Engine preference + the bit-perfect verify toggle (both fold into
+        // the core's per-chop options).
+        fc_set_lds_backend(ldsBackend);
+        fc_set_verify_output(verifyOutput ? 1 : 0);
         // chop (blocking) — reuses the GUI's fc_chop (tag rewrite + rename)
         FcChopResult r{};
         const QByteArray outB = outPath.toUtf8();
@@ -380,17 +404,24 @@ static int runCli(int argc, char* argv[])
 "
         "                 [--units samples|seconds]\n\n"
         "CLI:\n"
-        "  flac-chop <in.flac> <out.flac|dir> <start> <len>\
-"
+        "  flac-chop <in.flac> <out.flac|dir> <start> <len>\n"
         "          [--units samples|seconds] [--rate 10000|16000|20000|24000|28600]\n"
         "          [--bits 8|12|6] [--no-filter]\n"
+        "          [--encoder auto|gpu|sox] [--verify|--no-verify]\n"
         "  flac-chop --probe <in.flac> [--json]\n"
         "  flac-chop --version\n\n"
-        "Units: --units seconds (default) takes start/len as real seconds;\
-"
-        "       --units samples takes them as exact real RF sample counts (the\
-"
-        "       same units as vhs-decode metadata fileLoc).\n\n"
+        "Units: --units seconds (default) takes start/len as real seconds;\n"
+        "       --units samples takes them as exact real RF sample counts (the\n"
+        "       same units as vhs-decode metadata fileLoc).\n"
+        "Enc:   --encoder auto (default) uses the GPU-accelerated ld-compress-ng\n"
+        "       for WHOLE-FILE .lds AND 8-bit raw (u8/s8) conversions when its CLI\n"
+        "       is found (beside the app or on PATH; ~4x faster than SoX); gpu\n"
+        "       requires it; sox always streams. Partial cuts, rate/bit-depth\n"
+        "       conversions, WAV, 16-bit raw, and non-40-MSPS captures use SoX.\n"
+        "Verify: plain non-FLAC conversions (keep source rate+depth) decode the\n"
+        "       output and compare every sample against the source — PASS proves\n"
+        "       a bit-perfect replacement (safe to delete the source). On by\n"
+        "       default; --no-verify skips it.\n\n"
         "Exit codes: 0 = ok, 1 = pipeline error (reason on stderr), 2 = usage error.\n",
         FLAC_CHOP_VERSION);
     return args.size() == 1 ? 0 : 2;

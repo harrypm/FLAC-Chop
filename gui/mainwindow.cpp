@@ -50,6 +50,9 @@
 #include <QRegularExpression>
 #include <QRegularExpressionMatch>
 #include <QNetworkAccessManager>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QTextBrowser>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <cmath>
@@ -181,6 +184,9 @@ MainWindow::MainWindow(QWidget* parent)
         if (!QDesktopServices::openUrl(docsUrl))
             m_statusLabel->setText(tr("Unable to open documentation URL."));
     });
+    // About (the tbc-tools ld-analyse pattern: Help → About → dialog).
+    QAction* aboutAct = helpMenu->addAction(tr("&About FLAC-Chop"));
+    connect(aboutAct, &QAction::triggered, this, &MainWindow::showAboutDialog);
 
     // --- Input file ---
     // Read-only QLineEdit (not a flat QLabel) so the input path sits in the
@@ -295,10 +301,35 @@ MainWindow::MainWindow(QWidget* parent)
     m_filterProfileLabel = new QLabel(QStringLiteral("—"), outBox);
     m_filterProfileLabel->setWordWrap(true);
     m_filterProfileLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    // LDS conversion engine: whole-file .lds → FLAC conversions can run the
+    // GPU-accelerated ld-compress-ng (Metal/Vulkan/OpenCL frame analysis;
+    // ~4x faster and ~4% smaller than SoX on real captures, validated
+    // byte-exact) when its CLI sits beside the app or on PATH. Partial cuts
+    // always use SoX (ld-compress-ng is whole-file only).
+    m_ldsEngineCombo = new QComboBox(outBox);
+#if defined(Q_OS_MAC)
+    m_ldsEngineCombo->addItem(tr("Auto (Metal/CPU)"), uint(0));
+    m_ldsEngineCombo->addItem(tr("Metal"), uint(1));
+#else
+    m_ldsEngineCombo->addItem(tr("Auto (GPU/CPU)"), uint(0));
+    m_ldsEngineCombo->addItem(tr("GPU"), uint(1));
+#endif
+    m_ldsEngineCombo->addItem(tr("SoX (classic streaming)"), uint(2));
+    m_ldsEngineCombo->setToolTip(tr("Engine for WHOLE-FILE capture conversions. Auto uses the accelerated encoder when available (Metal on macOS, GPU on Windows/Linux) and falls back to SoX; the middle option requires it; SoX always streams. Partial cuts, rate/bit-depth conversions, WAV, 16-bit raw, and captures that are not exactly 40 MSPS always use SoX."));
+    // Bit-perfect output verification (the pre-deletion safety net): after a
+    // plain non-FLAC conversion the output is decoded and compared against
+    // the source sample-for-sample; PASS (surfaced in the finish notes)
+    // proves the output is a bit-perfect replacement — safe to delete the
+    // source. Processed conversions (rate/bit-depth) report a skip instead.
+    m_verifyCheck = new QCheckBox(tr("Verify output (bit-perfect, before deleting the source)"), outBox);
+    m_verifyCheck->setChecked(true);
+    m_verifyCheck->setToolTip(tr("After a PLAIN conversion (keep source rate + depth) from .lds/WAV/raw, decode the output and compare every sample against the source. PASS proves the output is a bit-perfect replacement — safe to delete the source. Processed conversions (rate/bit-depth changed) cannot be bit-perfect and report a skip — keep the source."));
     outLay->addRow(tr("Output mode:"), m_outputModeCombo);
     outLay->addRow(tr("Bit-depth:"), m_outputBitsCombo);
     outLay->addRow(QString(), m_basicFilterCheck);
     outLay->addRow(tr("Filter profile:"), m_filterProfileLabel);
+    outLay->addRow(tr("Encoder:"), m_ldsEngineCombo);
+    outLay->addRow(QString(), m_verifyCheck);
     chopLay->addWidget(outBox);
 
     // --- Preview ---
@@ -337,6 +368,15 @@ MainWindow::MainWindow(QWidget* parent)
     m_progress->setFormat(tr("%p%"));
     m_statusLabel = new QLabel(tr("Ready — select a FLAC file."), chopPage);
     m_statusLabel->setWordWrap(true);
+    // A long word-wrapped status must NEVER grow the window: cap the label
+    // at ~5 text lines (excess is clipped; the full text lives in the
+    // tooltip). Without the cap the size hint of a multi-line finish
+    // summary expands the whole window after every conversion. The steady
+    // state after a conversion is 4 SHORT lines (Done / verify / sha256 /
+    // probe status) — the 5th line is wrap margin so neither the verify
+    // verdict nor the checksum can be the clipped line.
+    m_statusLabel->setMaximumHeight(
+        m_statusLabel->fontMetrics().height() * 5 + 8);
     chopLay->addLayout(actionLay);
     chopLay->addWidget(m_progress);
     chopLay->addWidget(m_statusLabel);
@@ -461,6 +501,17 @@ MainWindow::MainWindow(QWidget* parent)
     // Browse: pick the output folder for the current name (the browsed path
     // becomes the user's custom choice via textChanged).
     connect(m_outPathBrowseBtn, &QPushButton::clicked, this, &MainWindow::browseOutputFile);
+    // Persist the LDS engine preference + the verify-output default.
+    connect(m_ldsEngineCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int) {
+                QSettings s;
+                s.setValue(QStringLiteral("engine/choice"),
+                           m_ldsEngineCombo->currentData().toUInt());
+            });
+    connect(m_verifyCheck, &QCheckBox::toggled, this, [this](bool on) {
+        QSettings s;
+        s.setValue(QStringLiteral("lds/verify"), on);
+    });
     // Any user edit of the Output file box marks the path as custom (kept
     // until the box is cleared — which restores the auto path — or a new
     // load/finished conversion resets it); the plan recomputes live.
@@ -479,6 +530,19 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_metaAddFieldBtn, &QPushButton::clicked, this, &MainWindow::addFieldFromBox);
     connect(m_metaFieldCombo->lineEdit(), &QLineEdit::returnPressed,
             this, &MainWindow::addFieldFromBox);
+
+    // Restore the persisted engine preference + the verify-output default
+    // (both live in the Output Processing box). "engine/choice" is the
+    // current key; "lds/engine" is read as a fallback (the setting predates
+    // the global raw coverage).
+    {
+        QSettings s;
+        const uint engine = s.value(QStringLiteral("engine/choice"),
+                                     s.value(QStringLiteral("lds/engine"), 0)).toUInt();
+        const int idx = m_ldsEngineCombo->findData(engine);
+        m_ldsEngineCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+        m_verifyCheck->setChecked(s.value(QStringLiteral("lds/verify"), true).toBool());
+    }
 
     // Drag & drop: the window accepts file drops, and NO child may swallow
     // them. QLineEdits accept file drops by default (they insert the path as
@@ -507,6 +571,35 @@ MainWindow::MainWindow(QWidget* parent)
     if (!fc_sox_available()) {
         m_statusLabel->setText(tr("WARNING: SoX not found (bundled or PATH) — cutting will fail."));
     }
+
+    // Dev-note tooling (docs/DEV_NOTE_native_file_dialogs.md): open a file
+    // dialog automatically at startup so its window classes can be
+    // enumerated from outside the process while it is open (the only
+    // reliable way to tell modern IFileDialog from the legacy dialog).
+    //   FLAC_CHOP_AUTO_BROWSE=open  -> single-file open (Chop tab Browse)
+    //                            dir   -> folder picker (Output File Browse)
+    //                            multi -> multi-select add (Batch/Sync tabs)
+    // Off unless the variable is set.
+    {
+        const QByteArray autoBrowse = qgetenv("FLAC_CHOP_AUTO_BROWSE");
+        if (!autoBrowse.isEmpty()) {
+            QTimer::singleShot(1500, this, [this, autoBrowse]() {
+                if (autoBrowse == QByteArrayLiteral("dir")) {
+                    QFileDialog::getExistingDirectory(
+                        this, tr("Select output directory"), QDir::homePath());
+                } else if (autoBrowse == QByteArrayLiteral("multi")) {
+                    QFileDialog::getOpenFileNames(
+                        this, tr("Add capture files to the queue"), QDir::homePath(),
+                        tr("RF captures (*.flac *.ldf *.oga *.ogg *.wav *.u8 *.u16 *.s8 *.s16 "
+                           "*.r8 *.r16 *.8u *.8s *.16u *.16s *.raw *.bin *.pcm *.lds)"
+                           ";;FLAC / Ogg FLAC files (*.flac *.ldf *.oga *.ogg);;All files (*)"));
+                } else {
+                    browse();
+                }
+            });
+        }
+    }
+
     maybeCheckForUpdates();
 }
 
@@ -526,6 +619,62 @@ void MainWindow::applyThemeChoice(bool dark)
     s.setValue(QStringLiteral("mode"),
                dark ? QStringLiteral("dark") : QStringLiteral("light"));
     s.endGroup();
+}
+
+// The tbc-tools ld-analyse About pattern (Help → About → dialog): a
+// fixed-size dialog with the app icon left, a linked-HTML text browser right
+// (app name, one-line description, per-contributor copyright lines, license
+// line), a "· Version" label bottom-left and an OK box bottom-right.
+void MainWindow::showAboutDialog()
+{
+    QDialog dlg(this);
+    dlg.setWindowTitle(tr("About FLAC-Chop"));
+    QIcon appIcon = QIcon(QStringLiteral(":/icons/flac-chop-icon.ico"));
+    if (appIcon.isNull() || appIcon.availableSizes().isEmpty())
+        appIcon = QIcon(QStringLiteral(":/icons/flac-chop-icon-128.png"));
+    dlg.setWindowIcon(appIcon);
+
+    auto* iconLabel = new QLabel(&dlg);
+    iconLabel->setPixmap(appIcon.pixmap(128, 128));
+    iconLabel->setAlignment(Qt::AlignCenter);
+
+    auto* text = new QTextBrowser(&dlg);
+    text->setOpenExternalLinks(true);
+    text->setFrameShape(QFrame::NoFrame);
+    text->setHtml(tr(
+        "<p style=\"margin:0;\"><span style=\"font-size:16pt; font-weight:600;\">FLAC Chop</span></p>"
+        "<p style=\"margin:0;\"><span style=\"font-size:10pt;\">The Universal FM RF Archival editing tool.</span></p>"
+        "<p style=\"margin:0;\"><br/></p>"
+        "<p style=\"margin:0;\"><span style=\"font-size:10pt;\">&copy; 2026 "
+        "<a href=\"https://github.com/harrypm\">Harry Munday</a></span></p>"
+        "<p style=\"margin:0;\"><span style=\"font-size:10pt;\">&copy; 2026 "
+        "<a href=\"https://github.com/JoeyLemur\">Joey Lemur</a></span></p>"));
+
+    auto* versionLabel = new QLabel(
+        tr("FLAC-Chop &middot; Version %1").arg(QStringLiteral(FLAC_CHOP_VERSION)), &dlg);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, Qt::Horizontal, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+
+    auto* topLay = new QHBoxLayout();
+    topLay->setContentsMargins(0, 0, 0, 0);
+    topLay->setSpacing(12);
+    topLay->addWidget(iconLabel);
+    topLay->addWidget(text, 1);
+
+    auto* bottomLay = new QHBoxLayout();
+    bottomLay->setContentsMargins(0, 0, 0, 0);
+    bottomLay->addWidget(versionLabel, 1);
+    bottomLay->addWidget(buttons);
+
+    auto* lay = new QVBoxLayout(&dlg);
+    lay->setContentsMargins(12, 12, 12, 12);
+    lay->setSpacing(10);
+    lay->addLayout(topLay);
+    lay->addLayout(bottomLay);
+
+    dlg.setFixedSize(530, 260);
+    dlg.exec();
 }
 
 void MainWindow::setControlsEnabled(bool enabled)
@@ -829,10 +978,20 @@ void MainWindow::onProbeFinished()
         // Echo non-fatal probe warnings in the status line too, so they're
         // visible without hovering the total label. Cleared on the next action.
         const QString warnings = QString::fromUtf8(m_probe.warnings).trimmed();
+        QString probeStatus;
         if (!warnings.isEmpty())
-            m_statusLabel->setText(tr("Probed OK (⚠ warnings): %1 — type a time + Set IN/OUT, then Process.").arg(warnings));
+            probeStatus = tr("Probed OK (⚠ warnings): %1 — type a time + Set IN/OUT, then Process.").arg(warnings);
         else
-            m_statusLabel->setText(tr("Probed OK. Type a time + Set IN/OUT, or drag the slider, then Process."));
+            probeStatus = tr("Probed OK. Type a time + Set IN/OUT, or drag the slider, then Process.");
+        // A conversion just auto-loaded its output: the probe status replaced
+        // the "Done in …" summary — re-display it ABOVE the probe status so
+        // the completed time (and the verify verdict) is actually seen.
+        if (!m_lastCutSummary.isEmpty()) {
+            m_statusLabel->setText(m_lastCutSummary + QLatin1Char('\n') + probeStatus);
+            m_lastCutSummary.clear();
+        } else {
+            m_statusLabel->setText(probeStatus);
+        }
     }
     setControlsEnabled(true);
     setMetaStreamInfo();
@@ -1296,6 +1455,11 @@ void MainWindow::process()
         fc_set_output_comments(nullptr, 0); // nothing pending for a FLAC cut
     }
 
+    // Apply the engine preference + the verify-output default before the
+    // cut (both are folded into the core's per-chop options).
+    fc_set_lds_backend(m_ldsEngineCombo->currentData().toUInt());
+    fc_set_verify_output(m_verifyCheck->isChecked() ? 1 : 0);
+
     setControlsEnabled(false);
     // Wall-clock the run for the finished-time status.
     m_cutStartMSecs = QDateTime::currentMSecsSinceEpoch();
@@ -1373,9 +1537,59 @@ void MainWindow::onChopFinished()
         if (notes.contains(QLatin1String("warning:")))
             QMessageBox::warning(this, tr("Cut finished with a warning"),
                 tr("The cut itself succeeded:\n%1\n\n%2").arg(m_outPath, notes));
-        m_statusLabel->setText(notes.isEmpty()
-            ? tr("Done in %1. Output: %2").arg(elapsed, m_outPath)
-            : tr("Done in %1. Output: %2\n%3").arg(elapsed, m_outPath, notes));
+        // Compact finish status: the completed time + output FILE NAME on
+        // line 1, the verify verdict (the safety-critical bit) on line 2. The
+        // full path and the detailed notes (provenance, engine summary) are
+        // tooltip material — inline they just wrap into window-growing
+        // noise (the reported bug).
+        QString verifyLine;
+        for (const QString& line : notes.split(QLatin1Char('\n'))) {
+            const QString t = line.trimmed();
+            if (t.startsWith(QLatin1String("verify:")))
+                verifyLine = t;
+        }
+        // The BRIEF verdict — short enough to never wrap (the full verify
+        // line with the sample count lives in the tooltip notes). A wrapping
+        // verify line pushed it past the label's height cap and it was the
+        // clipped line (the reported "verify info is missing").
+        QString verifyBrief;
+        if (verifyLine.startsWith(QLatin1String("verify: PASS")))
+            verifyBrief = tr("verify: PASS — bit-perfect, safe to delete the source");
+        else if (verifyLine.startsWith(QLatin1String("verify: skipped")))
+            verifyBrief = tr("verify: skipped — not bit-perfect, keep the source");
+        else if (verifyLine.startsWith(QLatin1String("verify: FAILED")))
+            verifyBrief = tr("verify: FAILED — do NOT delete the source");
+        else if (!verifyLine.isEmpty())
+            verifyBrief = verifyLine; // "warning: verify: could not run…"
+        // The completed output's checksum — a short fingerprint inline (the
+        // full 64-char hex is in the tooltip notes; it matches sha256sum /
+        // certutil -hashfile SHA256).
+        QString shaLine;
+        for (const QString& line : notes.split(QLatin1Char('\n'))) {
+            const QString t = line.trimmed();
+            if (t.startsWith(QLatin1String("sha256(output):")))
+                shaLine = t;
+        }
+        QString shaBrief;
+        if (!shaLine.isEmpty()) {
+            static const QString kShaPrefix = QStringLiteral("sha256(output): ");
+            const QString hex = shaLine.mid(kShaPrefix.size()).trimmed();
+            if (hex.size() > 24)
+                shaBrief = tr("sha256: %1…%2").arg(hex.left(16), hex.right(8));
+            else
+                shaBrief = tr("sha256: %1").arg(hex);
+        }
+        QString summary = tr("Done in %1. Output: %2")
+            .arg(elapsed, QFileInfo(m_outPath).fileName());
+        if (!verifyBrief.isEmpty())
+            summary += QLatin1Char('\n') + verifyBrief;
+        if (!shaBrief.isEmpty())
+            summary += QLatin1Char('\n') + shaBrief;
+        m_lastCutSummary = summary;
+        m_statusLabel->setText(summary);
+        m_statusLabel->setToolTip(notes.isEmpty()
+            ? m_outPath
+            : tr("%1\n\n%2").arg(m_outPath, notes));
         // Non-FLAC input (WAV / raw PCM / packed .lds / Ogg .ldf): the cut
         // output is a freshly converted native FLAC. Load it so the Metadata
         // Editor can tag the output right away (the raw/packed source's tags

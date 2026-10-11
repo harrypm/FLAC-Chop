@@ -1,6 +1,6 @@
-# Qt6 / CMake build output
+# Qt6 / CMake build output (build-gha, build-vfix, build-local, ...)
 /build/
-/build-gha/
+/build-*/
 
 # Rust / cargo build output
 /core/target/
@@ -8,6 +8,8 @@
 # CI / AppImage packaging scratch (produced by .github/workflows/build.yml)
 /AppDir/
 /dist/
+/dist-*/
+/artifact-inspect-*/
 /dmg-stage/
 /stage-*/
 /*.AppImage

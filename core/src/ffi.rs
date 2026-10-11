@@ -478,6 +478,9 @@ fn fc_chop_impl(
             input_format: None,
             input_rate_hz: None,
             input_channels: None,
+            // LDS engine preference (the GUI/CLI set it via
+            // fc_set_lds_backend; auto by default).
+            lds_backend: lds_backend_pref(),
         };
         // NULL keeps the legacy global-cancel semantics; a non-null flag is
         // the C++ caller's per-job std::atomic<int> (nonzero = cancel).
@@ -556,6 +559,46 @@ pub extern "C" fn fc_sox_available() -> i32 {
     } else {
         0
     }
+}
+
+// LDS engine preference (0 = auto, 1 = GPU/ld-compress-ng, 2 = SoX), set
+// via fc_set_lds_backend and folded into every chop's options at entry.
+static LDS_BACKEND_PREF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn lds_backend_pref() -> chop::LdsBackend {
+    match LDS_BACKEND_PREF.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => chop::LdsBackend::Ldc,
+        2 => chop::LdsBackend::Sox,
+        _ => chop::LdsBackend::Auto,
+    }
+}
+
+/// Set the engine for whole-file `.lds` → FLAC conversions: 0 = auto (GPU
+/// ld-compress-ng when resolvable, SoX fallback), 1 = require GPU, 2 = SoX.
+#[no_mangle]
+pub extern "C" fn fc_set_lds_backend(pref: u32) {
+    LDS_BACKEND_PREF.store(pref.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 1 when the GPU-accelerated ld-compress-ng CLI is resolvable (beside the
+/// app exe, then PATH; FLAC_CHOP_LDC overrides). Whole-file `.lds`
+/// conversions use it automatically (0 = auto preference) when available.
+#[no_mangle]
+pub extern "C" fn fc_ldc_available() -> i32 {
+    if chop::ldc_available() {
+        1
+    } else {
+        0
+    }
+}
+
+/// Enable/disable the bit-perfect output verification for non-FLAC
+/// conversions (default: enabled — see the `verify` module). A PASS verdict
+/// is the green light that the output decodes back to the source exactly,
+/// so the source file is safe to delete.
+#[no_mangle]
+pub extern "C" fn fc_set_verify_output(on: i32) {
+    chop::set_verify_output(on != 0);
 }
 
 /// Request cancellation of the in-flight single cut (if any). Called from

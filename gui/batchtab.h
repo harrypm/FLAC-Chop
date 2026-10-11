@@ -99,6 +99,7 @@ private:
     QCheckBox* m_filterCheck = nullptr;
     QCheckBox* m_parallelCheck = nullptr;
     QCheckBox* m_overwriteCheck = nullptr;
+    QCheckBox* m_verifyCheck = nullptr;   // bit-perfect output verification
     QPushButton* m_addBtn = nullptr;
     QPushButton* m_removeBtn = nullptr;
     QPushButton* m_clearBtn = nullptr;

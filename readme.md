@@ -136,6 +136,35 @@ A Rust core reads the file metadata directly (no `soxi`/`ffprobe` shell-out) and
   touches the rest of the file. Output conversions (8/12-bit, resampling)
   work as on any input.
 
+- **GPU-accelerated whole-file conversions** (`.lds` and 8-bit raw u8/s8) via
+  [ld-compress-ng](https://github.com/JoeyLemur/ld-compress-ng) (Vulkan / OpenCL /
+  Metal frame analysis, a frame-threaded writer): ~4× faster than the SoX path
+  on a real capture (15.97 s vs 63.97 s for a 251 MB `.lds`) and ~4% smaller,
+  decoding byte-exact. Automatic when the `ld-compress-ng` CLI sits beside the
+  app (or on PATH — `FLAC_CHOP_LDC` overrides); the Encoder chooser (Auto /
+  GPU / SoX) is in the Output Processing box, the CLI takes
+  `--encoder auto|gpu|sox` (`--lds-backend` still works). PLAIN whole-file,
+  mono, exactly-40-MSPS conversions only — partial cuts, rate/bit-depth
+  conversions, WAV, 16-bit raw, and other rates always use SoX (a required-GPU
+  preference that cannot engage gets a clear error). On any ld-compress-ng
+  failure Auto falls back to SoX and says so in the notes. Every GPU raw
+  conversion is bit-perfect verified against its source at the output's
+  depth (the ×256 10-bit-grid scaling is exact).
+
+- **Bit-perfect output verification (on by default)** — the pre-deletion
+  safety net: after a PLAIN conversion from a tag-less source (`.lds`, WAV,
+  raw PCM), the output FLAC is decoded and compared against the source
+  sample-for-sample. `verify: PASS (N samples, bit-perfect) — safe to delete
+  the source` in the finish notes is the green light that the output is a
+  proven bit-perfect replacement. A mismatch is a loud warning (do NOT
+  delete the source). Processed conversions (rate/bit-depth changed)
+  intentionally transform the samples and report a skip instead — keep the
+  source. FLAC-Chop itself never deletes sources. GUI checkbox in the
+  Output Processing box; the Batch and Sync Edit tabs carry their own verify
+  checkboxes — each job's verdict shows under its "Done in …" row status
+  (failed verdicts flagged) and the run summary appends
+  "Verified: N passed, M flagged."; CLI `--verify` / `--no-verify`.
+
 - **Lite/Dark theme** (Theme menu at the top, the tbc-tools model): Dark uses
   the ld-analyse-style dark Fusion palette, Light the default; with no saved
   choice the default follows your OS theme, and the choice is remembered.

@@ -60,6 +60,8 @@ fn main() {
         input_format: None,
         input_rate_hz: None,
         input_channels: None,
+        // LDS engine: auto (GPU ld-compress-ng when resolvable, SoX otherwise).
+        lds_backend: Default::default(),
     };
     let r = flac_chop_core::chop::chop_with_options(
         in_path,
