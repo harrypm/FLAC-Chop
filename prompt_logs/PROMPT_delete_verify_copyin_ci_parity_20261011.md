@@ -125,3 +125,15 @@ Verified locally BOTH ways: lds_integration 11/11 with sox only (the exact
 CI mode) and 11/11 with the GPU path. The 9cc7055 runs still carry the old
 code (their real-world job will fail; the packaging jobs still validate the
 copy-in per platform).
+
+### Phase 3 addendum 2 — libFLAC version on the Linux runners
+
+The 9cc7055 "Cargo tests" preflight failed compiling the copy-in CLI:
+ubuntu-22.04 apt libflac-dev is 1.3.4; flac_codec.cpp uses the 1.5
+chained-stream APIs (FLAC__STREAM_DECODER_END_OF_LINK,
+FLAC__stream_decoder_set_decode_chained_stream). MSYS2 + Homebrew ship 1.5
+(the local/macOS/Windows builds were fine). Fix: scripts/ci_build_flac.sh
+builds libFLAC 1.5.0 into /usr/local (cmake + ldconfig + PKG_CONFIG_PATH via
+GITHUB_ENV); the three Linux CI locations call it instead of libflac-dev.
+In-flight 3507935 runs cancelled (they carry the old yml); re-pushed +
+re-dispatched.

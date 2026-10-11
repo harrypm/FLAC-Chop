@@ -142,8 +142,11 @@ toolchain BINDIR only).
 real-pipeline tests run instead of skipping, and the Linux job builds the
 copy-in CLI + exports `FLAC_CHOP_LDC` (GPU-less: the required-backend tests
 assert the clean no-device failure via `ldc_device_present()` and skip the
-byte-exact assertions). `build.yml` builds the subproject in every packaging
-job and bundles the CLI beside flac-chop: Linux AppImage (linuxdeploy -e),
+byte-exact assertions). Linux runners build libFLAC 1.5.x from source first
+(`scripts/ci_build_flac.sh`) — apt's 1.3.4 lacks the 1.5 chained-stream
+decoder APIs the CLI uses (MSYS2/Homebrew ship 1.5 already).
+`build.yml` builds the subproject in every packaging job and bundles the
+CLI beside flac-chop: Linux AppImage (linuxdeploy -e),
 Windows x86_64 (full Vulkan/OpenCL toolchain; the ldd fixpoint bundles its
 DLLs), Windows arm64 (CPU-libFLAC backend — CLANGARM64 has no
 Vulkan/OpenCL/glslang packages), macOS (Metal; brew flac/libogg dylibs into

@@ -64,8 +64,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           set -eux
-          sudo apt-get install -y cmake ninja-build pkg-config libflac-dev \
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config curl \
             libogg-dev glslang-tools libvulkan-dev ocl-icd-opencl-dev
+          # libFLAC 1.5.x from source: apt's 1.3.4 lacks the chained-stream
+          # decoder APIs the copy-in CLI uses (MSYS2/Homebrew ship 1.5).
+          scripts/ci_build_flac.sh
           cmake -S ld-compress-ng -B build-ldc -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build build-ldc
           ./build-ldc/ld-compress-ng --version
