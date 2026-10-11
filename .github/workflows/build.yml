@@ -1165,8 +1165,11 @@ jobs:
           DMG_NAME="macos_FLAC-Chop_${BUILD_VERSION}_universal.dmg"
           # Retry hdiutil: "Resource busy" is a transient runner issue (a
           # volume stuck from a previous step — observed on the first
-          # v1.0.9 tag run).
-          for dmg_attempt in 1 2 3; do
+          # v1.0.9 tag run AND on the 2026-10-11 copy-in run, where three
+          # fast attempts were not enough). Detach any stuck volume first,
+          # then back off: 5 attempts, 15 s apart.
+          hdiutil detach "/Volumes/FLAC-Chop" 2>/dev/null || true
+          for dmg_attempt in 1 2 3 4 5; do
             if hdiutil create \
               -volname "FLAC-Chop" \
               -srcfolder "$DMG_STAGE_DIR" \
@@ -1175,14 +1178,14 @@ jobs:
               "$DMG_NAME"; then
               break
             fi
-            echo "hdiutil attempt $dmg_attempt failed; retrying..."
+            echo "hdiutil attempt $dmg_attempt failed; retrying after detach + 15s..."
             rm -f "$DMG_NAME"
             hdiutil detach "/Volumes/FLAC-Chop" 2>/dev/null || true
-            sleep 5
-            if [ "$dmg_attempt" = 3 ]; then
-              echo "::error::hdiutil create failed after 3 attempts"
+            if [ "$dmg_attempt" = 5 ]; then
+              echo "::error::hdiutil create failed after 5 attempts"
               exit 1
             fi
+            sleep 15
           done
           test -f "$DMG_NAME"
 

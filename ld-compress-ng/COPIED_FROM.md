@@ -17,6 +17,9 @@ the whole accelerated-conversion stack from one repo — including CI.
     is gated non-Windows.
   - `CMakeLists.txt`: `test_cli` (fork/wait supervision) gated to
     non-Windows.
+  - `src/main.cpp`: explicit `#include <algorithm>` for `std::sort`
+    (LLVM-mingw/CLANGARM64 does not supply it transitively the way GCC
+    toolchains do — the Windows arm64 CI build failed without it).
 - **Not copied**: upstream `.git`, build dirs, `AGENTS.md`.
 - Licenses preserved verbatim: `LICENSE` (GPL), `LICENSES/`,
   `THIRD_PARTY_NOTICES.md` stay in place in this tree.

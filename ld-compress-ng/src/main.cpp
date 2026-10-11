@@ -9,6 +9,7 @@
 #include "vulkan_backend.h"
 #include "vulkan_devices.h"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>

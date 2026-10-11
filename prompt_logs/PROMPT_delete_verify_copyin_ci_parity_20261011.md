@@ -202,3 +202,17 @@ GUI automation (the MISRC model):
    unfit). tests.yml Windows leg now uses MSYS2 MinGW64 sox via
    setup-msys2 + FLAC_CHOP_SOX=cygpath -w /mingw64/bin/sox.exe — the exact
    build the Windows artifacts bundle.
+
+### Phase 3/4 addendum — the e20d520 Build run (two fixes)
+
+Tests workflow FULLY GREEN on all three OSes (first ever run of the real
+suite with sox everywhere + the copy-in ldc on Linux). Build run: Cargo
+tests preflight, Linux AppImage x86_64+arm64, Windows x86_64, macOS arm64 +
+x86_64, Real-world data tests ALL GREEN (the copy-in builds + bundles on
+every platform). Two failures:
+1. Windows arm64: "no member named 'sort' in namespace 'std'" — LLVM-mingw
+   does not supply <algorithm> transitively (GCC does). Fix: explicit
+   #include <algorithm> in the copy-in src/main.cpp + COPIED_FROM.md delta.
+2. macOS universal DMG: the documented transient hdiutil "Resource busy"
+   flake — three fast retries were not enough this time. Fix: pre-detach +
+   5 attempts 15 s apart.
