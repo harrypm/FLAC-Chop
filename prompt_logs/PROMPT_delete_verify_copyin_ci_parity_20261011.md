@@ -228,3 +228,19 @@ step pre-signs sox for exactly that reason but not the newly-bundled
 ld-compress-ng. Fix: the explicit pre-sign now covers ld-compress-ng too.
 (The e20d520 universal failure was the genuine hdiutil "Resource busy"
 flake; the 5x15s retry hardening got this run past it.)
+
+## FINAL — CI fully green on 59e8a65 (2026-10-11)
+
+Tests workflow: success on all three OSes (real SoX everywhere, the copy-in
+ldc CLI on the Linux leg, the CLI<->GUI parity gate green). Build workflow:
+SUCCESS — Cargo tests preflight, Linux AppImage x86_64 + arm64, Windows
+x86_64 + arm64, macOS arm64 + x86_64 + universal DMG, and the Real-world
+data tests all green; the copy-in ld-compress-ng builds and bundles beside
+flac-chop in EVERY artifact. Publish release assets correctly skipped (no
+tag). Commits this session: e39960e, 9cc7055, 3507935, 6517565, 7de93f3,
+5168e6f, e20d520, fa52a6b, 59e8a65 (HEAD).
+
+Still awaiting the user's on-screen confirmation: the Batch delete-after-
+PASS-verify checkbox (running build dev-20261011-ldc) — the restore-point
+zip + note is created once confirmed. dist-vfix holds the pre-phase-4 exe;
+refresh it from build-vfix/gui if the newest CLI surface is wanted locally.
